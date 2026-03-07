@@ -33,7 +33,7 @@ pub struct CacheState {
 
 impl CacheState {
     pub fn new(ttl_ms: u64, buffer_size: usize) -> Self {
-        // Buffer for 1024 events; if the buffer is full, old events will be dropped.
+        // Buffer for buffer_size events; if the buffer is full, old events will be dropped.
         let (event_tx, _) = broadcast::channel::<CacheEvent>(buffer_size);
         
         Self {
