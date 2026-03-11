@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
             _ => unreachable!(),
         };
 
-        router = router.add_route(Route::new(msg_type, &schema_path, v)?);
+        router = router.add_route(Route::new(msg_type, schema_path, v)?);
 
         info!(message_type=%message_type, topic=%v, schema=%schema_path, "configured route for MQTT topic with schema validation");
     }
