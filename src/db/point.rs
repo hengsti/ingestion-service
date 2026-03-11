@@ -1,5 +1,6 @@
 use std::fmt;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum FieldValue {
     Float(f64),
@@ -96,6 +97,7 @@ impl PointBuilder {
         self
     }
 
+    #[allow(dead_code)]
     pub fn field_u64(mut self, key: &str, value: u64) -> Self {
         self.fields.push((key.to_string(), FieldValue::UInt(value)));
         self
