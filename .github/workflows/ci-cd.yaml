@@ -20,6 +20,7 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/ingestion-service
   DEPLOY_PATH: /opt/smarthome-stack
   SERVICE_NAME: ingest
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   test:
@@ -37,7 +38,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.8.1
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -51,7 +52,7 @@ jobs:
   build_and_push:
     name: Build and push Docker image
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.vars.outputs.image_tag }}
@@ -86,7 +87,7 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ env.IMAGE_NAME }}:main
+            ${{ env.IMAGE_NAME }}:master
             ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -97,7 +98,7 @@ jobs:
   deploy:
     name: Deploy ingest service
     needs: build_and_push
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     runs-on: [self-hosted, linux, ARM64]
     permissions:
       contents: read
@@ -125,11 +126,11 @@ jobs:
 
       - name: Pull new image
         working-directory: ${{ env.DEPLOY_PATH }}
-        run: docker compose -f compose.yaml -f compose.production.yaml pull ${{ env.SERVICE_NAME }}
+        run: docker compose pull ${{ env.SERVICE_NAME }}
 
       - name: Recreate ingest only
         working-directory: ${{ env.DEPLOY_PATH }}
-        run: docker compose -f compose.yaml -f compose.production.yaml up -d --no-deps ${{ env.SERVICE_NAME }}
+        run: docker compose up -d --no-deps ${{ env.SERVICE_NAME }}
 
       - name: Prune dangling images
         run: docker image prune -f
