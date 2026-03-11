@@ -1,11 +1,5 @@
 use anyhow::{Context, Result};
-use axum::{
-    extract::State,
-    http::header,
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
+use axum::{Router, extract::State, http::header, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::{net::SocketAddr, time::Duration};
 use tokio::task::JoinHandle;
@@ -19,12 +13,13 @@ use tracing::{error, info};
 pub struct MetricsServer {
     _http_task: JoinHandle<()>,
     _upkeep_task: JoinHandle<()>,
-} 
-
+}
 
 impl MetricsServer {
     pub async fn start(bind: &str) -> Result<Self> {
-        let handle:  PrometheusHandle = PrometheusBuilder::new().install_recorder().context("failed to build Prometheus recorder")?;
+        let handle: PrometheusHandle = PrometheusBuilder::new()
+            .install_recorder()
+            .context("failed to build Prometheus recorder")?;
 
         let upkeep_handle = handle.clone();
         let upkeep_task = tokio::spawn(async move {
@@ -35,11 +30,17 @@ impl MetricsServer {
             }
         });
 
-        let app = Router::new().route("/metrics", get(metrics_handler)).with_state(handle);
+        let app = Router::new()
+            .route("/metrics", get(metrics_handler))
+            .with_state(handle);
 
-        let address: SocketAddr = bind.parse().context("METRICS_BIND must be a socket address like 0.0.0.0:9090")?;
+        let address: SocketAddr = bind
+            .parse()
+            .context("METRICS_BIND must be a socket address like 0.0.0.0:9090")?;
 
-        let listener = tokio::net::TcpListener::bind(address).await.with_context(|| format!("failed to bind metrics server to {}", address))?;
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .with_context(|| format!("failed to bind metrics server to {}", address))?;
 
         info!(%address, "metrics endpoint listening");
         let http_task = tokio::spawn(async move {

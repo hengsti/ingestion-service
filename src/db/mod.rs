@@ -1,2 +1,2 @@
-pub mod point;
 pub mod influx;
+pub mod point;

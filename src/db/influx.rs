@@ -1,7 +1,7 @@
-use crate::model::{sensor_msg::SensorMessage, status_msg::StatusMessage};
 use super::point::Point;
-use metrics::{counter, histogram};
+use crate::model::{sensor_msg::SensorMessage, status_msg::StatusMessage};
 use anyhow::{Context, Result};
+use metrics::{counter, histogram};
 use reqwest::Client;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -78,8 +78,9 @@ impl InfluxWriter {
         buf.clear();
 
         let start = Instant::now();
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&self.write_url)
             .header("Authorization", format!("Token {}", self.token))
             .header("Content-Type", "text/plain; charset=utf-8")

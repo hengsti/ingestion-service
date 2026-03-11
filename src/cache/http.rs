@@ -1,16 +1,22 @@
 use std::convert::Infallible;
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::{{sse::{Event, KeepAlive, Sse}}, IntoResponse},
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::get,
-    Json, Router,
 };
 use serde::Serialize;
-use tokio_stream::{wrappers::{errors::BroadcastStreamRecvError, BroadcastStream}, StreamExt};
+use tokio_stream::{
+    StreamExt,
+    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
+};
 
-use super::state::{CacheState, CacheEvent};
+use super::state::{CacheEvent, CacheState};
 use crate::model::sensor_msg::SensorData;
 
 pub fn router(state: CacheState) -> Router {
@@ -61,10 +67,7 @@ async fn list_state(State(cache_state): State<CacheState>) -> impl IntoResponse 
         })
         .collect();
 
-    Json(SensorStateResponse {
-        ttl_ms,
-        sensors,
-    })
+    Json(SensorStateResponse { ttl_ms, sensors })
 }
 
 #[derive(Serialize)]
@@ -81,13 +84,18 @@ struct DeviceStateResponse {
     sensor: Option<SensorDtoNoId>,
 }
 
-async fn get_state(Path(device_id): Path<String>, State(cache_state): State<CacheState>) -> impl IntoResponse {
+async fn get_state(
+    Path(device_id): Path<String>,
+    State(cache_state): State<CacheState>,
+) -> impl IntoResponse {
     let ttl_ms = cache_state.ttl_ms();
-    let sensor = cache_state.snapshot_sensor(&device_id).map(|(state, stale)| SensorDtoNoId {
-        stale,
-        last_seen_ms: state.last_seen_ms,
-        value: state.value,
-    });
+    let sensor = cache_state
+        .snapshot_sensor(&device_id)
+        .map(|(state, stale)| SensorDtoNoId {
+            stale,
+            last_seen_ms: state.last_seen_ms,
+            value: state.value,
+        });
 
     Json(DeviceStateResponse {
         ttl_ms,
@@ -96,15 +104,17 @@ async fn get_state(Path(device_id): Path<String>, State(cache_state): State<Cach
     })
 }
 
-async fn stream_updates(State(cache_state): State<CacheState>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+async fn stream_updates(
+    State(cache_state): State<CacheState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = cache_state.subscribe_events();
-    
+
     let stream = BroadcastStream::new(rx).filter_map(|msg| {
         match msg {
-            Ok(CacheEvent::Sensor { 
+            Ok(CacheEvent::Sensor {
                 device_id,
                 last_seen_ms,
-                value 
+                value,
             }) => {
                 // Event-type for SSE-Clients
                 let payload = SseSensorEvent {
@@ -125,7 +135,9 @@ async fn stream_updates(State(cache_state): State<CacheState>) -> Sse<impl tokio
             // Receiver war zu langsam -> Events wurden gedropped
             Err(BroadcastStreamRecvError::Lagged(_)) => {
                 // Optional: Client kann dann einmal /v1/state pollen
-                Some(Ok(Event::default().event("lagged").data("{\"hint\":\"poll /v1/state\"}")))
+                Some(Ok(Event::default()
+                    .event("lagged")
+                    .data("{\"hint\":\"poll /v1/state\"}")))
             }
         }
     });

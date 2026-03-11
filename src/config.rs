@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
-use std::env;
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
+use std::env;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -13,7 +13,7 @@ pub struct Config {
     pub mqtt_topics: HashMap<String, String>, // {"TOPIC NAME": "TOPIC STRING"}, e.g. {"MQTT_TOPIC_SENSOR": "home/sensor/+"}
 
     // InfluxDB v2 Write API
-    pub influx_url: String,   // e.g. http://influxdb:8086
+    pub influx_url: String, // e.g. http://influxdb:8086
     pub influx_org: String,
     pub influx_bucket: String,
     pub influx_token: String,
@@ -45,8 +45,7 @@ impl Config {
         let mqtt_username = env_var("MQTT_USERNAME");
         let mqtt_password = env_var("MQTT_PASSWORD");
 
-        let mut mqtt_client_id = env_var("MQTT_CLIENT_ID")
-            .context("MQTT_CLIENT_ID must be set")?;
+        let mut mqtt_client_id = env_var("MQTT_CLIENT_ID").context("MQTT_CLIENT_ID must be set")?;
         mqtt_client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
 
         let mut mqtt_topics = HashMap::new();
@@ -61,7 +60,8 @@ impl Config {
         let influx_url = env_var("INFLUX_URL").context("INFLUX_URL must be set")?;
         let influx_org = env_var("INFLUX_ORG").context("INFLUX_ORG must be set")?;
         let influx_bucket = env_var("INFLUX_BUCKET").context("INFLUX_BUCKET must be set")?;
-        let influx_token = env_var("INFLUX_TOKEN").context("INFLUX_TOKEN must be set (for InfluxDB v2 write API)")?;
+        let influx_token = env_var("INFLUX_TOKEN")
+            .context("INFLUX_TOKEN must be set (for InfluxDB v2 write API)")?;
 
         let batch_size = env_var("BATCH_SIZE")
             .context("BATCH_SIZE must be set")?
@@ -115,7 +115,8 @@ impl Config {
 }
 
 fn env_var(k: &str) -> Option<String> {
-    env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    env::var(k)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
-
-

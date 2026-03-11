@@ -86,7 +86,8 @@ impl PointBuilder {
     }
 
     pub fn field_f64(mut self, key: &str, value: f64) -> Self {
-        self.fields.push((key.to_string(), FieldValue::Float(value)));
+        self.fields
+            .push((key.to_string(), FieldValue::Float(value)));
         self
     }
 
@@ -106,7 +107,8 @@ impl PointBuilder {
     }
 
     pub fn field_str(mut self, key: &str, value: &str) -> Self {
-        self.fields.push((key.to_string(), FieldValue::Str(value.to_string())));
+        self.fields
+            .push((key.to_string(), FieldValue::Str(value.to_string())));
         self
     }
 
@@ -129,7 +131,9 @@ impl PointBuilder {
 // ---------- Escaping helpers (Influx line protocol) ----------
 
 fn esc_measurement(s: &str) -> String {
-    s.replace('\\', "\\\\").replace(',', "\\,").replace(' ', "\\ ")
+    s.replace('\\', "\\\\")
+        .replace(',', "\\,")
+        .replace(' ', "\\ ")
 }
 
 fn esc_tag_key(s: &str) -> String {
@@ -161,7 +165,11 @@ fn format_field_value(v: &FieldValue) -> String {
         FieldValue::Int(x) => format!("{}i", x),
         FieldValue::UInt(x) => format!("{}u", x),
         FieldValue::Bool(b) => {
-            if *b { "true".to_string() } else { "false".to_string() }
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
         }
         FieldValue::Str(s) => format!("\"{}\"", esc_string_field(s)),
     }

@@ -1,12 +1,12 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::DateTime;
 use serde_json::Value;
 
-use crate::model::sensor_msg::SensorMessage;
-use crate::model::status_msg::StatusMessage;
 use super::message::{HandledMessage, MessageType};
 use super::schema::JsonSchema;
 use super::topic::MqttTopicPattern;
+use crate::model::sensor_msg::SensorMessage;
+use crate::model::status_msg::StatusMessage;
 
 /// A single route combining pattern matching, schema validation, and expected message type.
 pub struct Route {
@@ -28,13 +28,20 @@ impl Route {
         self.pattern.matches(topic)
     }
 
-    pub fn process(&self, topic: &str, payload: Value, enforce_topic_device_match: bool) -> Result<HandledMessage> {
+    pub fn process(
+        &self,
+        topic: &str,
+        payload: Value,
+        enforce_topic_device_match: bool,
+    ) -> Result<HandledMessage> {
         // 1. Validate JSON schema
-        self.schema.validate(&payload).context("schema validation failed")?;
+        self.schema
+            .validate(&payload)
+            .context("schema validation failed")?;
 
         // 2. Validate common data requirements
         self.validate_time_iso_rfc3339(&payload)?;
-        
+
         if enforce_topic_device_match {
             self.enforce_topic_payload_device_match(topic, &payload)?;
         }
@@ -64,14 +71,22 @@ impl Route {
     }
 
     fn enforce_topic_payload_device_match(&self, topic: &str, payload: &Value) -> Result<()> {
-        let topic_dev = self.pattern.device_id_from_topic(topic)
+        let topic_dev = self
+            .pattern
+            .device_id_from_topic(topic)
             .context("Failed to extract device_id from topic")?;
-        
-        let payload_dev = payload.get("device_id").and_then(|x| x.as_str())
+
+        let payload_dev = payload
+            .get("device_id")
+            .and_then(|x| x.as_str())
             .context("Failed to extract device_id from payload")?;
 
         if topic_dev != payload_dev {
-            bail!("device_id mismatch: topic has '{}', payload has '{}'", topic_dev, payload_dev);
+            bail!(
+                "device_id mismatch: topic has '{}', payload has '{}'",
+                topic_dev,
+                payload_dev
+            );
         }
         Ok(())
     }
@@ -104,15 +119,24 @@ impl Router {
     }
 
     /// Processes an incoming MQTT message
-    pub fn process(&self, topic: &str, payload: Value, enforce_topic_device_match: bool) -> Result<Option<HandledMessage>> {
+    pub fn process(
+        &self,
+        topic: &str,
+        payload: Value,
+        enforce_topic_device_match: bool,
+    ) -> Result<Option<HandledMessage>> {
         if let Some(route) = self.routes.iter().find(|r| r.matches(topic)) {
-            return Ok(Some(route.process(topic, payload, enforce_topic_device_match)?));
+            return Ok(Some(route.process(
+                topic,
+                payload,
+                enforce_topic_device_match,
+            )?));
         }
 
         if self.strict {
             bail!("No route registered for topic: {}", topic);
         }
-        
+
         Ok(None)
     }
 }

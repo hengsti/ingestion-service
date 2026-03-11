@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// MQTT topic filter that supports `+` (single level) and `#` (multi level) wildcards.
 #[derive(Debug, Clone)]

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use jsonschema::Validator as JsonSchemaValidator;
 use serde_json::Value;
 
@@ -9,8 +9,8 @@ pub struct JsonSchema {
 
 impl JsonSchema {
     pub fn new(schema: &str) -> Result<Self> {
-        let schema_json: Value = serde_json::from_str(schema)
-            .context("Failed to parse embedded JSON schema")?;
+        let schema_json: Value =
+            serde_json::from_str(schema).context("Failed to parse embedded JSON schema")?;
 
         let compiled = jsonschema::draft7::options()
             .build(&schema_json)

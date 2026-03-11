@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{RwLock, Arc};
-use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
@@ -35,7 +35,7 @@ impl CacheState {
     pub fn new(ttl_ms: u64, buffer_size: usize) -> Self {
         // Buffer for buffer_size events; if the buffer is full, old events will be dropped.
         let (event_tx, _) = broadcast::channel::<CacheEvent>(buffer_size);
-        
+
         Self {
             sensors: Arc::new(RwLock::new(HashMap::new())),
             ttl_ms,
@@ -56,7 +56,7 @@ impl CacheState {
             HandledMessage::Sensor(sensor_msg) => {
                 let device_id = normalize_device_id(&sensor_msg.device_id);
                 let last_seen_ms = now_ms();
-                
+
                 let state = SensorState {
                     last_seen_ms,
                     value: sensor_msg.data.clone(),
@@ -66,7 +66,7 @@ impl CacheState {
                     let mut map = self.sensors.write().expect("sensors lock poisoned");
                     map.insert(device_id.clone(), state);
                 }
-                
+
                 let _ = self.event_tx.send(CacheEvent::Sensor {
                     device_id,
                     last_seen_ms,
@@ -103,7 +103,6 @@ impl CacheState {
         Some((val, stale))
     }
 }
-
 
 fn now_ms() -> u64 {
     SystemTime::now()
