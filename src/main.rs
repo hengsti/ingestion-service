@@ -23,7 +23,7 @@ use pipeline::{
 };
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use tokio::{
-    sync::{mpsc, Mutex, watch},
+    sync::{Mutex, mpsc, watch},
     task::JoinSet,
 };
 use tracing::{error, info, warn};
@@ -125,7 +125,10 @@ async fn main() -> Result<()> {
     let flush_interval_ms = cfg.flush_interval_ms;
 
     let _influx_task = tokio::spawn(async move {
-        if let Err(err) = influx.run_batcher(influx_rx, batch_size, flush_interval_ms).await {
+        if let Err(err) = influx
+            .run_batcher(influx_rx, batch_size, flush_interval_ms)
+            .await
+        {
             error!(error = %err, "influx batcher failed");
         }
     });
@@ -144,10 +147,7 @@ async fn main() -> Result<()> {
             .add_stage(CacheUpdateStage::new(app_state.clone()))
             .add_stage(PersistStage::new(influx_tx.clone()))
             .add_stage(ObserveStage::new())
-            .with_failure_stage(DlqPublishStage::new(
-                mqtt_client.clone(),
-                dlq_topic.clone(),
-            )),
+            .with_failure_stage(DlqPublishStage::new(mqtt_client.clone(), dlq_topic.clone())),
     );
 
     info!("pipeline initialized");
