@@ -17,7 +17,7 @@ use tokio_stream::{
 };
 
 use super::state::{CacheEvent, CacheState};
-use crate::model::sensor_msg::SensorData;
+use crate::model::messages::sensor::SensorData;
 
 pub fn router(state: CacheState) -> Router {
     Router::new()

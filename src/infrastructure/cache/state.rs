@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
-use crate::model::sensor_msg::SensorData;
-use crate::validate::HandledMessage;
+use crate::model::messages::message::HandledMessage;
+use crate::model::messages::sensor::SensorData;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SensorState {

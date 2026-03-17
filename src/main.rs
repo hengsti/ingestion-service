@@ -1,20 +1,47 @@
-mod cache;
 mod config;
-mod db;
-mod dlq;
+mod infrastructure;
 mod model;
-mod observation;
-mod validate;
+mod pipeline;
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use cache::state::CacheState;
 use config::Config;
-use db::influx::{InfluxWriter, sensor_to_point, status_to_point};
-use observation::prometheus::MetricsServer;
+use infrastructure::cache::{http, state::CacheState};
+use infrastructure::database::influx::InfluxWriter;
+use infrastructure::prometheus::MetricsServer;
+use infrastructure::router::{Route, Router};
+use model::messages::message::MessageType;
+use pipeline::{
+    context::PipelineContext,
+    runner::PipelineRunner,
+    stages::{
+        cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
+        observe::ObserveStage, persist::PersistStage, transform::TransformStage,
+        validate::ValidateStage,
+    },
+};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, Mutex, watch},
+    task::JoinSet,
+};
 use tracing::{error, info, warn};
-use validate::{HandledMessage, MessageType, Route, Router};
+
+const EVENT_QUEUE_CAPACITY: usize = 16_384;
+const INFLUX_QUEUE_CAPACITY: usize = 10_000;
+
+#[derive(Debug)]
+struct IngestJob {
+    topic: String,
+    payload: Vec<u8>,
+}
+
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,82 +53,66 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     info!(?cfg, "starting smarthome-ingest");
 
-    // Cache
+    // ------------------------------------------------------------
+    // Cache / HTTP state
+    // ------------------------------------------------------------
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
 
     let http_state = app_state.clone();
+    let cache_bind = cfg.cache_bind.clone();
 
     let _http_task = tokio::spawn(async move {
-        let app = cache::http::router(http_state);
-        let listener = tokio::net::TcpListener::bind(&cfg.cache_bind)
+        let app = http::router(http_state);
+        let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
+
         axum::serve(listener, app)
             .await
             .expect("HTTP server failed");
     });
 
-    // Prometheus metrics server
+    // ------------------------------------------------------------
+    // Metrics server
+    // ------------------------------------------------------------
     let _metrics_server = MetricsServer::start(&cfg.metrics_bind).await?;
 
-    // Routes for MQTT topics with JSON schema validation
-    let mut router = Router::new().strict(true);
+    // ------------------------------------------------------------
+    // Router / schema routes
+    // ------------------------------------------------------------
+    let router = Arc::new(build_router(&cfg)?);
 
-    for (k, v) in cfg
-        .mqtt_topics
-        .iter()
-        .filter(|(k, _)| k.starts_with("MQTT_TOPIC_"))
-    {
-        let message_type = k
-            .strip_prefix("MQTT_TOPIC_")
-            .unwrap()
-            .to_string()
-            .to_uppercase();
-        let msg_type = match message_type.as_str() {
-            "SENSOR" => MessageType::Sensor,
-            "STATUS" => MessageType::Status,
-            "DLQ" => continue, // skip DLQ topic
-            _ => {
-                warn!(topic=%k, "unknown MQTT topic config key; skipping");
-                continue;
-            }
-        };
-
-        let schema_path = match message_type.as_str() {
-            "SENSOR" => include_str!("../schema/sensor.schema.json"),
-            "STATUS" => include_str!("../schema/status.schema.json"),
-            _ => unreachable!(),
-        };
-
-        router = router.add_route(Route::new(msg_type, schema_path, v)?);
-
-        info!(message_type=%message_type, topic=%v, schema=%schema_path, "configured route for MQTT topic with schema validation");
-    }
-
+    // ------------------------------------------------------------
+    // DLQ topic
+    // ------------------------------------------------------------
     let dlq_topic = cfg
         .mqtt_topics
         .iter()
         .find(|(k, _)| k.ends_with("DLQ"))
-        .map(|(_, v)| v.as_str())
+        .map(|(_, v)| v.clone())
         .context("MQTT_TOPIC_DLQ not configured")?;
 
+    // ------------------------------------------------------------
     // MQTT
+    // ------------------------------------------------------------
     let mut mqttoptions = MqttOptions::new(&cfg.mqtt_client_id, &cfg.mqtt_host, cfg.mqtt_port);
     mqttoptions.set_keep_alive(std::time::Duration::from_secs(30));
 
-    if let (Some(u), Some(p)) = (&cfg.mqtt_username, &cfg.mqtt_password) {
-        mqttoptions.set_credentials(u, p);
+    if let (Some(username), Some(password)) = (&cfg.mqtt_username, &cfg.mqtt_password) {
+        mqttoptions.set_credentials(username, password);
     }
 
     let (mqtt_client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
 
-    for (_, v) in cfg.mqtt_topics.iter().filter(|(k, _)| !k.ends_with("DLQ")) {
-        mqtt_client.subscribe(v, QoS::AtLeastOnce).await?;
-        info!(topic=%v, "subscribed to MQTT topic");
+    for (_, topic) in cfg.mqtt_topics.iter().filter(|(k, _)| !k.ends_with("DLQ")) {
+        mqtt_client.subscribe(topic, QoS::AtLeastOnce).await?;
+        info!(topic = %topic, "subscribed to MQTT topic");
     }
 
-    // Influx batch channel
-    let (tx, rx) = mpsc::channel::<String>(10_000);
+    // ------------------------------------------------------------
+    // Influx batcher
+    // ------------------------------------------------------------
+    let (influx_tx, influx_rx) = mpsc::channel::<String>(INFLUX_QUEUE_CAPACITY);
 
     let influx = InfluxWriter::new(
         &cfg.influx_url,
@@ -114,162 +125,167 @@ async fn main() -> Result<()> {
     let flush_interval_ms = cfg.flush_interval_ms;
 
     let _influx_task = tokio::spawn(async move {
-        if let Err(e) = influx.run_batcher(rx, batch_size, flush_interval_ms).await {
-            error!(error=%e, "influx batcher failed");
+        if let Err(err) = influx.run_batcher(influx_rx, batch_size, flush_interval_ms).await {
+            error!(error = %err, "influx batcher failed");
         }
     });
 
-    // Main consume loop
-    loop {
-        let event = eventloop.poll().await.context("MQTT poll failed")?;
-        if let Event::Incoming(Incoming::Publish(p)) = event {
-            metrics::counter!("mqtt_messages_received_total").increment(1);
+    // ------------------------------------------------------------
+    // Pipeline
+    // ------------------------------------------------------------
+    let pipeline = Arc::new(
+        PipelineRunner::new()
+            .add_stage(DecodeStage::new())
+            .add_stage(ValidateStage::new(
+                router.clone(),
+                cfg.enforce_topic_device_match,
+            ))
+            .add_stage(TransformStage::new())
+            .add_stage(CacheUpdateStage::new(app_state.clone()))
+            .add_stage(PersistStage::new(influx_tx.clone()))
+            .add_stage(ObserveStage::new())
+            .with_failure_stage(DlqPublishStage::new(
+                mqtt_client.clone(),
+                dlq_topic.clone(),
+            )),
+    );
 
-            let topic = p.topic;
+    info!("pipeline initialized");
 
-            // Handle non-UTF8 payloads immediately with DLQ
-            let payload_str = match std::str::from_utf8(&p.payload) {
-                Ok(s) => s,
-                Err(e) => {
-                    metrics::counter!("ingest_incoming_non_utf8_total").increment(1);
-                    warn!(topic=%topic, error=%e, "payload not utf8; sending to DLQ");
+    // ------------------------------------------------------------
+    // Worker queue
+    // ------------------------------------------------------------
+    let (job_tx, job_rx) = mpsc::channel::<IngestJob>(EVENT_QUEUE_CAPACITY);
+    let shared_job_rx = Arc::new(Mutex::new(job_rx));
 
-                    if let Err(e) = dlq::publish_dlq(
-                        &mqtt_client,
-                        dlq_topic,
-                        &topic,
-                        "<non-utf8>",
-                        "payload not utf8",
-                    )
-                    .await
-                    {
-                        metrics::counter!("dlq_publish_errors_total").increment(1);
-                        warn!(topic=%topic, error=%e, "failed to publish to DLQ");
-                    } else {
-                        metrics::counter!("dlq_messages_published_total").increment(1);
+    let worker_total = worker_count();
+    info!(workers = worker_total, "starting pipeline workers");
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut workers = JoinSet::new();
+
+    for worker_id in 0..worker_total {
+        let pipeline = pipeline.clone();
+        let shared_job_rx = shared_job_rx.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+
+        workers.spawn(async move {
+            info!(worker_id, "pipeline worker started");
+
+            loop {
+                let next_job = tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        break;
                     }
-
-                    continue;
-                }
-            };
-
-            // Parse JSON
-            let payload_value: serde_json::Value = match serde_json::from_str(payload_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    metrics::counter!("ingest_incoming_invalid_json_total").increment(1);
-                    warn!(topic=%topic, error=%e, "invalid JSON; sending to DLQ");
-
-                    if let Err(e) = dlq::publish_dlq(
-                        &mqtt_client,
-                        dlq_topic,
-                        &topic,
-                        payload_str,
-                        &format!("invalid JSON: {}", e),
-                    )
-                    .await
-                    {
-                        metrics::counter!("dlq_publish_errors_total").increment(1);
-                        warn!(topic=%topic, error=%e, "failed to publish to DLQ");
-                    } else {
-                        metrics::counter!("dlq_messages_published_total").increment(1);
-                    }
-
-                    continue;
-                }
-            };
-
-            // JSON Schema validation
-            let handled =
-                match router.process(&topic, payload_value, cfg.enforce_topic_device_match) {
-                    Ok(Some(h)) => h,
-                    Ok(None) => continue, // No matching route, but router is in non-strict mode
-                    Err(e) => {
-                        metrics::counter!("ingest_validation_failed_total").increment(1);
-                        warn!(topic=%topic, error=%e, "validation failed; sending to DLQ");
-
-                        if let Err(e2) = dlq::publish_dlq(
-                            &mqtt_client,
-                            dlq_topic,
-                            &topic,
-                            payload_str,
-                            &format!("validation failed: {}", e),
-                        )
-                        .await
-                        {
-                            metrics::counter!("dlq_publish_errors_total").increment(1);
-                            warn!(topic=%topic, error=%e2, "failed to publish to DLQ");
-                        } else {
-                            metrics::counter!("dlq_messages_published_total").increment(1);
-                        }
-
-                        continue;
-                    }
+                    job = recv_job(shared_job_rx.clone()) => job,
                 };
 
-            // Update in-memory cache state
-            app_state.update(&handled);
+                let Some(job) = next_job else {
+                    break;
+                };
 
-            match handled {
-                HandledMessage::Sensor(_sensor_msg) => {
-                    let point = sensor_to_point(&_sensor_msg);
-                    let line = point.to_line_protocol();
+                let mut ctx = PipelineContext::new(job.topic.clone(), job.payload);
+                pipeline.run(&mut ctx).await;
 
-                    if let Err(e) = tx.try_send(line) {
-                        metrics::counter!("ingest_queue_full_total").increment(1);
-                        warn!(topic=%topic, error=%e, "ingest queue full; sending to DLQ");
-
-                        if let Err(e2) = dlq::publish_dlq(
-                            &mqtt_client,
-                            dlq_topic,
-                            &topic,
-                            payload_str,
-                            "ingest queue full",
-                        )
-                        .await
-                        {
-                            metrics::counter!("dlq_publish_errors_total").increment(1);
-                            warn!(topic=%topic, error=%e2, "failed to publish to DLQ");
-                        } else {
-                            metrics::counter!("dlq_messages_published_total").increment(1);
-                        }
-                    } else {
-                        metrics::counter!("ingest_messages_enqueued_total").increment(1);
-                    }
+                if let Some(reason) = ctx.ignored_reason() {
+                    info!(worker_id, topic = %job.topic, reason = %reason, "message ignored by pipeline");
                 }
-                HandledMessage::Status(_status_msg) => {
-                    let point = status_to_point(&_status_msg);
-                    let line = point.to_line_protocol();
+            }
 
-                    if let Err(e) = tx.try_send(line) {
-                        metrics::counter!("ingest_queue_full_total").increment(1);
-                        warn!(topic=%topic, error=%e, "ingest queue full; sending to DLQ");
+            info!(worker_id, "pipeline worker stopped");
+            Ok::<(), anyhow::Error>(())
+        });
+    }
 
-                        if let Err(e2) = dlq::publish_dlq(
-                            &mqtt_client,
-                            dlq_topic,
-                            &topic,
-                            payload_str,
-                            "ingest queue full",
-                        )
-                        .await
-                        {
-                            metrics::counter!("dlq_publish_errors_total").increment(1);
-                            warn!(topic=%topic, error=%e2, "failed to publish to DLQ");
-                        } else {
-                            metrics::counter!("dlq_messages_published_total").increment(1);
-                        }
-                    } else {
-                        metrics::counter!("ingest_messages_enqueued_total").increment(1);
+    // ------------------------------------------------------------
+    // Main consume loop
+    // ------------------------------------------------------------
+    loop {
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                match res {
+                    Ok(()) => info!("shutdown signal received"),
+                    Err(err) => error!(error = %err, "failed to listen for ctrl-c"),
+                }
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+
+            event = eventloop.poll() => {
+                let event = event.context("MQTT poll failed")?;
+
+                if let Event::Incoming(Incoming::Publish(publish)) = event {
+                    let job = IngestJob {
+                        topic: publish.topic,
+                        payload: publish.payload.to_vec(),
+                    };
+
+                    if let Err(err) = job_tx.try_send(job) {
+                        metrics::counter!("ingest_event_queue_full_total").increment(1);
+                        warn!(error = %err, "event queue full; dropping incoming MQTT message before pipeline");
                     }
                 }
             }
         }
     }
 
-    #[allow(unreachable_code)]
-    {
-        _influx_task.await.ok();
-        Ok(())
+    drop(job_tx);
+
+    while let Some(res) = workers.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => error!(error = %err, "worker failed during shutdown"),
+            Err(err) => error!(error = %err, "worker join failed during shutdown"),
+        }
     }
+
+    info!("smarthome-ingest stopped");
+    Ok(())
+}
+
+async fn recv_job(shared_rx: Arc<Mutex<mpsc::Receiver<IngestJob>>>) -> Option<IngestJob> {
+    let mut rx = shared_rx.lock().await;
+    rx.recv().await
+}
+
+fn build_router(cfg: &Config) -> Result<Router> {
+    let mut router = Router::new().strict(true);
+
+    for (key, topic) in cfg
+        .mqtt_topics
+        .iter()
+        .filter(|(k, _)| k.starts_with("MQTT_TOPIC_"))
+    {
+        let message_type_name = key
+            .strip_prefix("MQTT_TOPIC_")
+            .expect("prefix already filtered")
+            .to_uppercase();
+
+        let message_type = match message_type_name.as_str() {
+            "SENSOR" => MessageType::Sensor,
+            "STATUS" => MessageType::Status,
+            "DLQ" => continue,
+            other => {
+                warn!(config_key = %key, message_type = %other, "unknown MQTT topic config key; skipping");
+                continue;
+            }
+        };
+
+        let schema = match message_type_name.as_str() {
+            "SENSOR" => include_str!("../schema/sensor.schema.json"),
+            "STATUS" => include_str!("../schema/status.schema.json"),
+            _ => unreachable!(),
+        };
+
+        router = router.add_route(Route::new(message_type, schema, topic)?);
+
+        info!(
+            config_key = %key,
+            message_type = %message_type_name,
+            topic = %topic,
+            "configured route for MQTT topic"
+        );
+    }
+
+    Ok(router)
 }

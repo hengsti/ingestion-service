@@ -2,11 +2,11 @@ use anyhow::{Context, Result, bail};
 use chrono::DateTime;
 use serde_json::Value;
 
-use super::message::{HandledMessage, MessageType};
-use super::schema::JsonSchema;
-use super::topic::MqttTopicPattern;
-use crate::model::sensor_msg::SensorMessage;
-use crate::model::status_msg::StatusMessage;
+use crate::infrastructure::schema::JsonSchema;
+use crate::model::messages::message::{HandledMessage, MessageType};
+use crate::model::messages::sensor::SensorMessage;
+use crate::model::messages::status::StatusMessage;
+use crate::model::topic::MqttTopicPattern;
 
 /// A single route combining pattern matching, schema validation, and expected message type.
 pub struct Route {

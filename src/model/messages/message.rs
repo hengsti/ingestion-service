@@ -1,5 +1,5 @@
-use crate::model::sensor_msg::SensorMessage;
-use crate::model::status_msg::StatusMessage;
+use crate::model::messages::sensor::SensorMessage;
+use crate::model::messages::status::StatusMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {

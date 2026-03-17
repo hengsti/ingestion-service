@@ -1,5 +1,5 @@
 use super::point::Point;
-use crate::model::{sensor_msg::SensorMessage, status_msg::StatusMessage};
+use crate::model::messages::{sensor::SensorMessage, status::StatusMessage};
 use anyhow::{Context, Result};
 use metrics::{counter, histogram};
 use reqwest::Client;
