@@ -49,6 +49,7 @@ impl PipelineContext {
         self.payload_utf8 = Some(payload);
     }
 
+    #[allow(dead_code)]
     pub fn payload_utf8(&self) -> Result<&str> {
         self.payload_utf8
             .as_deref()
@@ -79,6 +80,7 @@ impl PipelineContext {
         self.line_protocol = Some(line);
     }
 
+    #[allow(dead_code)]
     pub fn line_protocol(&self) -> Option<&str> {
         self.line_protocol.as_deref()
     }
