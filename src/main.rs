@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    info!(?cfg, "starting smarthome-ingest");
+    info!(?cfg, "starting ingestion service");
 
     // ------------------------------------------------------------
     // Cache / HTTP state
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("smarthome-ingest stopped");
+    info!("ingestion service stopped");
     Ok(())
 }
 
