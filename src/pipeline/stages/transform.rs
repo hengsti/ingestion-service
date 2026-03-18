@@ -1,5 +1,6 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Instant};
 
+use metrics::histogram;
 use tracing::debug;
 
 use crate::pipeline::{
@@ -26,6 +27,8 @@ impl PipelineStage for TransformStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
+            let start = Instant::now();
+
             let _msg = ctx.handled_message()?;
 
             debug!(
@@ -39,6 +42,7 @@ impl PipelineStage for TransformStage {
             // - map future message versions to canonical internal models
             // - prepare alternative storage representations
 
+            histogram!("ingest_transform_duration_seconds").record(start.elapsed().as_secs_f64());
             Ok(StageFlow::Continue)
         })
     }

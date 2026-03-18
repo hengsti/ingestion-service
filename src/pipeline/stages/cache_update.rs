@@ -1,4 +1,6 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Instant};
+
+use metrics::histogram;
 
 use crate::{
     infrastructure::cache::state::CacheState,
@@ -29,8 +31,11 @@ impl PipelineStage for CacheUpdateStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
+            let start = Instant::now();
             let msg = ctx.handled_message()?;
             self.cache_state.update(msg);
+            histogram!("ingest_cache_update_duration_seconds")
+                .record(start.elapsed().as_secs_f64());
             Ok(StageFlow::Continue)
         })
     }

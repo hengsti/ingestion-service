@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Instant};
 
 use serde_json::Value;
 use tracing::warn;
@@ -7,6 +7,8 @@ use crate::pipeline::{
     context::PipelineContext,
     stage::{PipelineStage, StageFlow, StageResult},
 };
+
+use metrics::histogram;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DecodeStage;
@@ -19,7 +21,7 @@ impl DecodeStage {
 
 impl PipelineStage for DecodeStage {
     fn name(&self) -> &'static str {
-        "DecodeStage"
+        "decode"
     }
 
     fn run<'a>(
@@ -29,6 +31,7 @@ impl PipelineStage for DecodeStage {
         Box::pin(async move {
             metrics::counter!("mqtt_messages_received_total").increment(1);
 
+            let start = Instant::now();
             let payload_str = match std::str::from_utf8(ctx.raw_payload()) {
                 Ok(s) => s.to_string(),
                 Err(err) => {
@@ -53,6 +56,7 @@ impl PipelineStage for DecodeStage {
             ctx.set_payload_utf8(payload_str);
             ctx.set_payload_json(payload_json);
 
+            histogram!("ingest_decode_duration_seconds").record(start.elapsed().as_secs_f64());
             Ok(StageFlow::Continue)
         })
     }

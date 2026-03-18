@@ -26,7 +26,7 @@ impl ValidateStage {
 
 impl PipelineStage for ValidateStage {
     fn name(&self) -> &'static str {
-        "ValidateStage"
+        "validate"
     }
 
     fn run<'a>(
