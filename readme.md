@@ -14,7 +14,7 @@ A high-performance Rust microservice to ingest smarthome telemetry and device st
 
 Incoming messages are routed and validated based on their topic.
 
-- `schema/bme680.schema.json` - Describes the payload structure for BME680 sensor telemetry.
+- `schema/sensor.schema.json` - Describes the payload structure for sensor telemetry (e.g., BME680).
 - `schema/status.schema.json` - Describes the payload structure for general device status updates.
 
 If `ENFORCE_TOPIC_DEVICE_MATCH` is set to `true`, the ingestion service ensures that the `{device_id}` included in the JSON payload matches the MQTT topic it arrived on.
@@ -85,8 +85,47 @@ docker run -d \
 
 ## Architecture
 
-1. **Reception**: Data flows in from the rumqttc `AsyncClient` loop.
-2. **Validation (`src/validate.rs`)**: Payloads are matched against compiled JSON Schemas based on their respective topics.
-3. **Rejection (`src/dlq.rs`)**: Failures are republished with error context attached to the DLQ topic.
-4. **Transformation (`src/db/influx.rs`)**: Messages are reshaped into tagged `Point` instances.
-5. **Batching & Egress**: Points are channeled to a dedicated async batcher loop, writing flushed bodies to InfluxDB via `reqwest` at the configured interval or size threshold.
+The smarthome-ingest service uses a modular pipeline architecture to process incoming MQTT messages asynchronously. Messages are received from the MQTT broker and processed through a series of stages in a worker pool. Each stage performs a specific function, and failures are handled by diverting messages to a Dead Letter Queue (DLQ).
+
+### Pipeline Stages
+
+1. **Decode Stage (`src/pipeline/stages/decode.rs`)**: Converts the raw MQTT payload (bytes) into a UTF-8 string and parses it as JSON. If decoding fails (e.g., invalid UTF-8 or malformed JSON), the message is marked for DLQ.
+
+2. **Validate Stage (`src/pipeline/stages/validate.rs`)**: Validates the JSON payload against the appropriate JSON schema based on the message type (sensor or status). It also checks topic-device matching if enabled. Invalid payloads are marked for DLQ.
+
+3. **Transform Stage (`src/pipeline/stages/transform.rs`)**: Converts the validated JSON into InfluxDB Line Protocol format, preparing it for database insertion.
+
+4. **Cache Update Stage (`src/pipeline/stages/cache_update.rs`)**: Updates an in-memory cache with the latest device states for quick HTTP-based queries.
+
+5. **Persist Stage (`src/pipeline/stages/persist.rs`)**: Sends the transformed data points to the InfluxDB batcher for asynchronous writing to the database.
+
+6. **Observe Stage (`src/pipeline/stages/observe.rs`)**: Records metrics and logs for monitoring pipeline performance and throughput.
+
+### Failure Handling
+
+If any stage fails, the pipeline stops processing that message and marks it for DLQ. The DLQ Publish Stage (`src/pipeline/stages/dlq.rs`) then publishes the failed message with error context to the configured DLQ MQTT topic.
+
+### Asynchronous Processing
+
+- **Worker Pool**: Multiple worker tasks process messages concurrently from a shared queue.
+- **Batching**: Data points are batched before writing to InfluxDB to optimize throughput.
+- **Metrics**: Prometheus metrics are exposed for observability.
+
+### Architecture Diagram
+
+```mermaid
+graph TD
+    A[MQTT Message Received] --> B[Decode Stage]
+    B --> C{Decoded?}
+    C -->|Yes| D[Validate Stage]
+    C -->|No| F[Mark DLQ]
+    D --> E{Valid?}
+    E -->|Yes| G[Transform Stage]
+    E -->|No| F
+    G --> H[Cache Update Stage]
+    H --> I[Persist Stage]
+    I --> J[Observe Stage]
+    J --> K[Success]
+    F --> L[DlqPublishStage]
+    L --> M[Published to DLQ Topic]
+```
