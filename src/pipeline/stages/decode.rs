@@ -83,8 +83,6 @@ impl PipelineStage for DecodeStage {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +129,10 @@ mod tests {
         let result = DecodeStage::decode_payload(raw);
 
         match result {
-            Err(DecodeError::Json { payload_str, source: _ }) => {
+            Err(DecodeError::Json {
+                payload_str,
+                source: _,
+            }) => {
                 assert_eq!(payload_str, r#"{"device_id":"esp32-1""#);
             }
             Ok(value) => panic!("expected Json error, got Ok: {value:?}"),
@@ -182,7 +183,10 @@ mod tests {
         let result = DecodeStage::decode_payload(raw);
 
         match result {
-            Err(DecodeError::Json { payload_str, source: _ }) => {
+            Err(DecodeError::Json {
+                payload_str,
+                source: _,
+            }) => {
                 assert_eq!(payload_str, "");
             }
             Ok(value) => panic!("expected Json error, got Ok: {value:?}"),
