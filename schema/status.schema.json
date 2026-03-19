@@ -33,6 +33,18 @@
     "time_valid": {
       "type": "boolean",
       "description": "Indicates if the timestamp is valid and synchronized with real time"
+    },
+    "uptime": {
+      "type": "integer",
+      "description": "Device uptime in seconds"
+    },
+    "free_mem": {
+      "type": "integer",
+      "description": "Free memory in bytes"
+    },
+    "ssid": {
+      "type": "string",
+      "description": "Connected WiFi SSID"
     }
   },
   "required": [

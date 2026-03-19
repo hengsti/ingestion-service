@@ -49,22 +49,6 @@
           "type": "number",
           "description": "Gas resistance in Ohms"
         },
-        "iaq_score": {
-          "type": "number",
-          "description": "Indoor Air Quality index derived from gas_ohm"
-        },
-        "iaq_text": {
-          "type": "string",
-          "description": "Indoor Air Quality description"
-        },
-        "dew_point_c": {
-          "type": "number",
-          "description": "Dew point temperature in Celsius"
-        },
-        "heat_index_c": {
-          "type": "number",
-          "description": "Heat index temperature derived from temp_c and rel_hum_perc"
-        },
         "altitude_m": {
           "type": "number",
           "description": "Approximate altitude in meters"
@@ -75,38 +59,7 @@
         "rel_hum_perc",
         "pressure_hpa",
         "gas_ohm",
-        "iaq_score",
-        "iaq_text",
-        "dew_point_c",
-        "heat_index_c",
         "altitude_m"
-      ]
-    },
-    "status": {
-      "type": "object",
-      "properties": {
-        "uptime": {
-          "type": "integer",
-          "description": "Device uptime in seconds"
-        },
-        "free_mem": {
-          "type": "integer",
-          "description": "Free memory in bytes"
-        },
-        "rssi": {
-          "type": "integer",
-          "description": "WiFi signal strength in dBm"
-        },
-        "ssid": {
-          "type": "string",
-          "description": "Connected WiFi SSID"
-        }
-      },
-      "required": [
-        "uptime",
-        "free_mem",
-        "rssi",
-        "ssid"
       ]
     }
   },
@@ -118,7 +71,6 @@
     "time_ms",
     "time_iso",
     "time_valid",
-    "data",
-    "status"
+    "data"
   ]
 }
