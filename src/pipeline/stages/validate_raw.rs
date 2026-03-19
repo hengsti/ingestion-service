@@ -10,12 +10,12 @@ use crate::{
     },
 };
 
-pub struct ValidateStage {
+pub struct ValidateRawStage {
     router: Arc<Router>,
     enforce_topic_device_match: bool,
 }
 
-impl ValidateStage {
+impl ValidateRawStage {
     pub fn new(router: Arc<Router>, enforce_topic_device_match: bool) -> Self {
         Self {
             router,
@@ -24,9 +24,9 @@ impl ValidateStage {
     }
 }
 
-impl PipelineStage for ValidateStage {
+impl PipelineStage for ValidateRawStage {
     fn name(&self) -> &'static str {
-        "validate"
+        "validate_raw"
     }
 
     fn run<'a>(
@@ -34,25 +34,22 @@ impl PipelineStage for ValidateStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            let payload = ctx.payload_json()?.clone();
+            let payload = ctx.payload_json()?;
 
             match self
                 .router
-                .process(ctx.topic(), payload, self.enforce_topic_device_match)
+                .validate_raw(ctx.topic(), payload, self.enforce_topic_device_match)
             {
-                Ok(Some(msg)) => {
-                    ctx.set_handled_message(msg);
-                    Ok(StageFlow::Continue)
-                }
+                Ok(Some(_message_type)) => Ok(StageFlow::Continue),
                 Ok(None) => {
                     debug!(topic = %ctx.topic(), "no matching route; stopping pipeline without DLQ");
-                    ctx.mark_ignored("no matching route".to_string());
+                    ctx.mark_ignored("no matching route");
                     Ok(StageFlow::Stop)
                 }
                 Err(err) => {
-                    metrics::counter!("ingest_validation_failed_total").increment(1);
-                    warn!(topic = %ctx.topic(), error = %err, "validation failed; marking for DLQ");
-                    ctx.mark_dlq(format!("validation failed: {}", err));
+                    metrics::counter!("ingest_validate_raw_failed_total").increment(1);
+                    warn!(topic = %ctx.topic(), error = %err, "raw validation failed; marking for DLQ");
+                    ctx.mark_dlq(format!("raw validation failed: {}", err));
                     Ok(StageFlow::Stop)
                 }
             }
