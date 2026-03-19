@@ -28,25 +28,26 @@ impl Route {
         self.pattern.matches(topic)
     }
 
-    pub fn process(
+    pub fn validate_raw(
         &self,
         topic: &str,
-        payload: Value,
+        payload: &Value,
         enforce_topic_device_match: bool,
-    ) -> Result<HandledMessage> {
-        // 1. Validate JSON schema
+    ) -> Result<MessageType> {
         self.schema
-            .validate(&payload)
+            .validate(payload)
             .context("schema validation failed")?;
 
-        // 2. Validate common data requirements
-        self.validate_time_iso_rfc3339(&payload)?;
+        self.validate_time_iso_rfc3339(payload)?;
 
         if enforce_topic_device_match {
-            self.enforce_topic_payload_device_match(topic, &payload)?;
+            self.enforce_topic_payload_device_match(topic, payload)?;
         }
 
-        // 3. Deserialize based on the assigned message type
+        Ok(self.message_type)
+    }
+
+    pub fn deserialize(&self, topic: &str, payload: Value) -> Result<HandledMessage> {
         match self.message_type {
             MessageType::Sensor => {
                 let msg: SensorMessage = serde_json::from_value(payload)
@@ -61,7 +62,6 @@ impl Route {
         }
     }
 
-    // --- Helper validation methods ---
     fn validate_time_iso_rfc3339(&self, v: &Value) -> Result<()> {
         if let Some(s) = v.get("time_iso").and_then(|x| x.as_str()) {
             DateTime::parse_from_rfc3339(s)
@@ -88,6 +88,7 @@ impl Route {
                 payload_dev
             );
         }
+
         Ok(())
     }
 }
@@ -106,31 +107,48 @@ impl Router {
         }
     }
 
-    /// Fluent builder method to set strictness
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
     }
 
-    /// Fluent builder method to add a new route
     pub fn add_route(mut self, route: Route) -> Self {
         self.routes.push(route);
         self
     }
 
-    /// Processes an incoming MQTT message
-    pub fn process(
+    fn find_route(&self, topic: &str) -> Option<&Route> {
+        self.routes.iter().find(|r| r.matches(topic))
+    }
+
+    pub fn message_type_for_topic(&self, topic: &str) -> Option<MessageType> {
+        self.find_route(topic).map(|r| r.message_type)
+    }
+
+    pub fn validate_raw(
         &self,
         topic: &str,
-        payload: Value,
+        payload: &Value,
         enforce_topic_device_match: bool,
-    ) -> Result<Option<HandledMessage>> {
-        if let Some(route) = self.routes.iter().find(|r| r.matches(topic)) {
-            return Ok(Some(route.process(
+    ) -> Result<Option<MessageType>> {
+        if let Some(route) = self.find_route(topic) {
+            return Ok(Some(route.validate_raw(
                 topic,
                 payload,
                 enforce_topic_device_match,
             )?));
+        }
+
+        if self.strict {
+            bail!("No route registered for topic: {}", topic);
+        }
+
+        Ok(None)
+    }
+
+    pub fn deserialize(&self, topic: &str, payload: Value) -> Result<Option<HandledMessage>> {
+        if let Some(route) = self.find_route(topic) {
+            return Ok(Some(route.deserialize(topic, payload)?));
         }
 
         if self.strict {
