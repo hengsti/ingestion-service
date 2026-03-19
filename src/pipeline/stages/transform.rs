@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use anyhow::{Result, anyhow, bail};
-use metrics::histogram;
+use metrics::{counter, histogram};
 use serde_json::{Number, Value};
 use tracing::{debug, warn};
 
@@ -246,6 +246,8 @@ impl PipelineStage for TransformStage {
                 }
             };
 
+            counter!("ingest_transform_attempt_total").increment(1);
+
             let transform_result = {
                 let payload = ctx.payload_json_mut()?;
                 match message_type {
@@ -255,7 +257,7 @@ impl PipelineStage for TransformStage {
             };
 
             if let Err(err) = transform_result {
-                metrics::counter!("ingest_transform_failed_total").increment(1);
+                counter!("ingest_transform_failed_total").increment(1);
                 warn!(topic = %ctx.topic(), error = %err, "transform failed; marking for DLQ");
                 ctx.mark_dlq(format!("transform failed: {}", err));
                 histogram!("ingest_transform_duration_seconds")
@@ -275,7 +277,7 @@ impl PipelineStage for TransformStage {
                     return Ok(StageFlow::Stop);
                 }
                 Err(err) => {
-                    metrics::counter!("ingest_transform_deserialize_failed_total").increment(1);
+                    counter!("ingest_transform_deserialize_failed_total").increment(1);
                     warn!(topic = %ctx.topic(), error = %err, "post-transform deserialization failed; marking for DLQ");
                     ctx.mark_dlq(format!("post-transform deserialization failed: {}", err));
                     histogram!("ingest_transform_duration_seconds")
@@ -288,7 +290,7 @@ impl PipelineStage for TransformStage {
 
             debug!(topic = %ctx.topic(), "transform stage normalized payload and produced canonical message");
 
-            metrics::counter!("ingest_transform_success_total").increment(1);
+            counter!("ingest_transform_success_total").increment(1);
             histogram!("ingest_transform_duration_seconds").record(start.elapsed().as_secs_f64());
 
             Ok(StageFlow::Continue)
