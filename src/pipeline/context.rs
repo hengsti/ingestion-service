@@ -66,6 +66,12 @@ impl PipelineContext {
             .ok_or_else(|| anyhow!("payload_json missing in pipeline context"))
     }
 
+    pub fn payload_json_mut(&mut self) -> Result<&mut Value> {
+        self.payload_json
+            .as_mut()
+            .ok_or_else(|| anyhow!("payload_json missing in pipeline context"))
+    }
+
     pub fn set_handled_message(&mut self, msg: HandledMessage) {
         self.handled_message = Some(msg);
     }
