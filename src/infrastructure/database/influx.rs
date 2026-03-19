@@ -49,21 +49,30 @@ impl InfluxWriter {
             tokio::select! {
                 _ = ticker.tick() => {
                     if !buf.is_empty() {
-                        self.flush(&mut buf).await?;
+                        if let Err(err) = self.flush(&mut buf).await {
+                            counter!("influx_write_errors_total").increment(1);
+                            tracing::error!(error = %err, "influx flush failed; dropping batch and continuing");
+                        }
                     }
                 }
                 maybe = rx.recv() => {
                     match maybe {
                         None => {
                             if !buf.is_empty() {
-                                self.flush(&mut buf).await?;
+                                if let Err(err) = self.flush(&mut buf).await {
+                                    counter!("influx_write_errors_total").increment(1);
+                                    tracing::error!(error = %err, "final influx flush failed; dropping batch");
+                                }
                             }
                             return Ok(());
                         }
                         Some(line) => {
                             buf.push(line);
                             if buf.len() >= batch_size {
-                                self.flush(&mut buf).await?;
+                                if let Err(err) = self.flush(&mut buf).await {
+                                    counter!("influx_write_errors_total").increment(1);
+                                    tracing::error!(error = %err, "influx flush failed; dropping batch and continuing");
+                                }
                             }
                         }
                     }
