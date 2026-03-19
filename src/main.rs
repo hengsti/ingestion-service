@@ -18,7 +18,7 @@ use pipeline::{
     stages::{
         cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
         observe::ObserveStage, persist::PersistStage, transform::TransformStage,
-        validate::ValidateStage,
+        validate_business::ValidateBusinessStage, validate_raw::ValidateRawStage,
     },
 };
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
@@ -139,11 +139,12 @@ async fn main() -> Result<()> {
     let pipeline = Arc::new(
         PipelineRunner::new()
             .add_stage(DecodeStage::new())
-            .add_stage(ValidateStage::new(
+            .add_stage(ValidateRawStage::new(
                 router.clone(),
                 cfg.enforce_topic_device_match,
             ))
-            .add_stage(TransformStage::new())
+            .add_stage(TransformStage::new(router.clone()))
+            .add_stage(ValidateBusinessStage::new()?)
             .add_stage(CacheUpdateStage::new(app_state.clone()))
             .add_stage(PersistStage::new(influx_tx.clone()))
             .add_stage(ObserveStage::new())
