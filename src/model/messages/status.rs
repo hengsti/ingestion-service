@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StatusMessage {
     pub device_id: String,
     pub device_class: String,
@@ -10,4 +10,7 @@ pub struct StatusMessage {
     pub time_ms: i64,
     pub time_iso: String,
     pub time_valid: bool,
+    pub uptime: i64,
+    pub free_mem: i64,
+    pub ssid: String,
 }

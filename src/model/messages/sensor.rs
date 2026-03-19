@@ -10,7 +10,6 @@ pub struct SensorMessage {
     pub time_iso: String,
     pub time_valid: bool,
     pub data: SensorData,
-    pub status: SensorStatus,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -24,12 +23,4 @@ pub struct SensorData {
     pub dew_point_c: f64,
     pub heat_index_c: f64,
     pub altitude_m: f64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SensorStatus {
-    pub uptime: i64,
-    pub free_mem: i64,
-    pub rssi: i64,
-    pub ssid: String,
 }
