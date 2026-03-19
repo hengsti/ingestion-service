@@ -135,11 +135,11 @@ pub fn status_to_point(msg: &StatusMessage) -> Point {
         .tag("device_class", &msg.device_class)
         .tag("fw_version", &msg.fw_version)
         .tag("ip", &msg.ip)
-        .tag("ssid", &msg.ssid)
         .field_str("time_iso", &msg.time_iso)
         .field_bool("time_valid", msg.time_valid)
         .field_i64("uptime", msg.uptime)
         .field_i64("free_mem", msg.free_mem)
+        .field_str("ssid", &msg.ssid)
         .field_i64("rssi", msg.rssi);
 
     if msg.time_valid && msg.time_ms > 0 {
