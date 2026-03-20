@@ -1,7 +1,9 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Instant};
 
 use anyhow::{Context, Result};
 use tracing::warn;
+
+use metrics::{counter, histogram};
 
 use crate::{
     infrastructure::schema::JsonSchema,
@@ -69,16 +71,35 @@ impl PipelineStage for ValidateBusinessStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            match self.validate_handled_message(ctx.handled_message()?) {
-                Ok(()) => Ok(StageFlow::Continue),
+            let start = Instant::now();
+
+            let handled = ctx.handled_message()?;
+            let kind = match handled {
+                HandledMessage::Sensor(_) => "sensor",
+                HandledMessage::Status(_) => "status",
+            };
+
+            match self.validate_handled_message(handled) {
+                Ok(()) => {
+                    counter!("ingest_validate_business_success_total", "kind" => kind).increment(1);
+                    histogram!("ingest_validate_business_duration_seconds", "kind" => kind, "result" => "success")
+                        .record(start.elapsed().as_secs_f64());
+
+                    Ok(StageFlow::Continue)
+                }
                 Err(err) => {
-                    metrics::counter!("ingest_validate_business_failed_total").increment(1);
+                    counter!("ingest_validate_business_failed_total", "kind" => kind).increment(1);
                     warn!(
                         topic = %ctx.topic(),
                         error = %err,
                         "business validation failed; marking for DLQ"
                     );
+
                     ctx.mark_dlq(format!("business validation failed: {}", err));
+
+                    histogram!("ingest_validate_business_duration_seconds", "kind" => kind, "result" => "failed")
+                        .record(start.elapsed().as_secs_f64());
+
                     Ok(StageFlow::Stop)
                 }
             }

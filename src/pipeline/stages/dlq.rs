@@ -1,9 +1,11 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Instant};
 
 use anyhow::Result;
 use rumqttc::AsyncClient;
 use serde_json::json;
 use tracing::{info, warn};
+
+use metrics::{counter, histogram};
 
 use crate::pipeline::{
     context::PipelineContext,
@@ -63,6 +65,7 @@ impl PipelineStage for DlqPublishStage {
                 return Ok(StageFlow::Stop);
             };
 
+            let start = Instant::now();
             let payload = ctx.payload_for_dlq();
 
             if let Err(err) = publish_dlq(
@@ -74,10 +77,14 @@ impl PipelineStage for DlqPublishStage {
             )
             .await
             {
-                metrics::counter!("dlq_publish_errors_total").increment(1);
+                counter!("dlq_publish_errors_total").increment(1);
                 warn!(topic = %ctx.topic(), error = %err, "failed to publish to DLQ");
+                histogram!("ingest_dlq_publish_duration_seconds", "result" => "failed")
+                    .record(start.elapsed().as_secs_f64());
             } else {
-                metrics::counter!("dlq_messages_published_total").increment(1);
+                counter!("dlq_messages_published_total").increment(1);
+                histogram!("ingest_dlq_publish_duration_seconds", "result" => "success")
+                    .record(start.elapsed().as_secs_f64());
             }
 
             Ok(StageFlow::Stop)

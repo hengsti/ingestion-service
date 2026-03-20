@@ -1,7 +1,10 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Instant};
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
+
+use metrics::{counter, histogram};
 
 use crate::{
     infrastructure::database::influx::{sensor_to_point, status_to_point},
@@ -33,26 +36,46 @@ impl PipelineStage for PersistStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            let line = match ctx.handled_message()? {
+            let start = Instant::now();
+
+            let (line, kind) = match ctx.handled_message()? {
                 HandledMessage::Sensor(sensor_msg) => {
-                    sensor_to_point(sensor_msg).to_line_protocol()
+                    (sensor_to_point(sensor_msg).to_line_protocol(), "sensor")
                 }
                 HandledMessage::Status(status_msg) => {
-                    status_to_point(status_msg).to_line_protocol()
+                    (status_to_point(status_msg).to_line_protocol(), "status")
                 }
             };
 
             ctx.set_line_protocol(line.clone());
 
-            if let Err(err) = self.tx.try_send(line) {
-                metrics::counter!("ingest_queue_full_total").increment(1);
-                warn!(topic = %ctx.topic(), error = %err, "ingest queue full; marking for DLQ");
-                ctx.mark_dlq("ingest queue full");
-                return Ok(StageFlow::Stop);
-            }
+            match self.tx.try_send(line) {
+                Ok(()) => {
+                    counter!("ingest_messages_enqueued_total", "kind" => kind).increment(1);
+                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "success")
+                        .record(start.elapsed().as_secs_f64());
 
-            metrics::counter!("ingest_messages_enqueued_total").increment(1);
-            Ok(StageFlow::Continue)
+                    Ok(StageFlow::Continue)
+                }
+                Err(TrySendError::Full(_)) => {
+                    counter!("ingest_queue_full_total", "kind" => kind).increment(1);
+                    warn!(topic = %ctx.topic(), "ingest queue full; marking for DLQ");
+                    ctx.mark_dlq("ingest queue full");
+                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "queue_full")
+                        .record(start.elapsed().as_secs_f64());
+
+                    Ok(StageFlow::Stop)
+                }
+                Err(TrySendError::Closed(_)) => {
+                    counter!("ingest_queue_closed_total", "kind" => kind).increment(1);
+                    warn!(topic = %ctx.topic(), "ingest queue closed; marking for DLQ");
+                    ctx.mark_dlq("ingest queue closed");
+                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "queue_closed")
+                        .record(start.elapsed().as_secs_f64());
+
+                    Ok(StageFlow::Stop)
+                }
+            }
         })
     }
 }

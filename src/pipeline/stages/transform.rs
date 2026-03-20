@@ -241,7 +241,13 @@ impl PipelineStage for TransformStage {
             let message_type = match self.router.message_type_for_topic(ctx.topic()) {
                 Some(mt) => mt,
                 None => {
+                    counter!("ingest_transform_ignored_total").increment(1);
+
                     ctx.mark_ignored("no matching route");
+
+                    histogram!("ingest_transform_duration_seconds", "result" => "ignored")
+                        .record(start.elapsed().as_secs_f64());
+
                     return Ok(StageFlow::Stop);
                 }
             };
@@ -259,9 +265,12 @@ impl PipelineStage for TransformStage {
             if let Err(err) = transform_result {
                 counter!("ingest_transform_failed_total").increment(1);
                 warn!(topic = %ctx.topic(), error = %err, "transform failed; marking for DLQ");
+
                 ctx.mark_dlq(format!("transform failed: {}", err));
-                histogram!("ingest_transform_duration_seconds")
+
+                histogram!("ingest_transform_duration_seconds", "result" => "failed")
                     .record(start.elapsed().as_secs_f64());
+
                 return Ok(StageFlow::Stop);
             }
 
@@ -271,17 +280,24 @@ impl PipelineStage for TransformStage {
             {
                 Ok(Some(msg)) => msg,
                 Ok(None) => {
+                    counter!("ingest_transform_ignored_total").increment(1);
+
                     ctx.mark_ignored("no matching route");
-                    histogram!("ingest_transform_duration_seconds")
+
+                    histogram!("ingest_transform_duration_seconds", "result" => "ignored")
                         .record(start.elapsed().as_secs_f64());
+
                     return Ok(StageFlow::Stop);
                 }
                 Err(err) => {
                     counter!("ingest_transform_deserialize_failed_total").increment(1);
                     warn!(topic = %ctx.topic(), error = %err, "post-transform deserialization failed; marking for DLQ");
+
                     ctx.mark_dlq(format!("post-transform deserialization failed: {}", err));
-                    histogram!("ingest_transform_duration_seconds")
+
+                    histogram!("ingest_transform_duration_seconds", "result" => "failed")
                         .record(start.elapsed().as_secs_f64());
+
                     return Ok(StageFlow::Stop);
                 }
             };
@@ -291,7 +307,8 @@ impl PipelineStage for TransformStage {
             debug!(topic = %ctx.topic(), "transform stage normalized payload and produced canonical message");
 
             counter!("ingest_transform_success_total").increment(1);
-            histogram!("ingest_transform_duration_seconds").record(start.elapsed().as_secs_f64());
+            histogram!("ingest_transform_duration_seconds", "result" => "success")
+                .record(start.elapsed().as_secs_f64());
 
             Ok(StageFlow::Continue)
         })

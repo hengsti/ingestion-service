@@ -8,7 +8,7 @@ use crate::pipeline::{
     stage::{PipelineStage, StageFlow, StageResult},
 };
 
-use metrics::histogram;
+use metrics::{counter, histogram};
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -49,35 +49,46 @@ impl PipelineStage for DecodeStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            metrics::counter!("mqtt_messages_received_total").increment(1);
+            counter!("mqtt_messages_received_total").increment(1);
 
             let start = Instant::now();
+            let raw_payload = ctx.raw_payload();
 
-            let result = match Self::decode_payload(ctx.raw_payload()) {
+            histogram!("ingest_decode_payload_bytes").record(raw_payload.len() as f64);
+
+            let (result, result_label) = match Self::decode_payload(raw_payload) {
                 Ok((payload_str, payload_json)) => {
+                    counter!("ingest_decode_success_total").increment(1);
+
                     ctx.set_payload_utf8(payload_str);
                     ctx.set_payload_json(payload_json);
-                    StageFlow::Continue
+
+                    (StageFlow::Continue, "success")
                 }
                 Err(DecodeError::Utf8(e)) => {
-                    metrics::counter!("ingest_incoming_non_utf8_total").increment(1);
+                    counter!("ingest_incoming_non_utf8_total").increment(1);
                     warn!(topic = %ctx.topic(), error = %e, "payload not utf8; marking for DLQ");
+
                     ctx.mark_dlq("payload not utf8".to_string());
-                    StageFlow::Stop
+
+                    (StageFlow::Stop, "non_utf8")
                 }
                 Err(DecodeError::Json {
                     payload_str,
                     source,
                 }) => {
-                    metrics::counter!("ingest_incoming_invalid_json_total").increment(1);
+                    counter!("ingest_incoming_invalid_json_total").increment(1);
                     warn!(topic = %ctx.topic(), error = %source, "invalid JSON; marking for DLQ");
+
                     ctx.set_payload_utf8(payload_str);
                     ctx.mark_dlq("payload not valid JSON".to_string());
-                    StageFlow::Stop
+
+                    (StageFlow::Stop, "invalid_json")
                 }
             };
 
-            histogram!("ingest_decode_duration_seconds").record(start.elapsed().as_secs_f64());
+            histogram!("ingest_decode_duration_seconds", "result" => result_label)
+                .record(start.elapsed().as_secs_f64());
             Ok(result)
         })
     }
