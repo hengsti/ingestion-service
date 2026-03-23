@@ -314,3 +314,463 @@ impl PipelineStage for TransformStage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::{
+        infrastructure::router::{Route, Router},
+        model::messages::message::{HandledMessage, MessageType},
+        pipeline::{context::PipelineContext, stage::StageFlow},
+    };
+
+    const SENSOR_SCHEMA: &str = include_str!("../../../schema/sensor.schema.json");
+    const STATUS_SCHEMA: &str = include_str!("../../../schema/status.schema.json");
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn sensor_router() -> Arc<Router> {
+        let route = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
+        Arc::new(Router::new().add_route(route))
+    }
+
+    fn dual_router() -> Arc<Router> {
+        let sensor = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
+        let status = Route::new(MessageType::Status, STATUS_SCHEMA, "smarthome/+/status").unwrap();
+        Arc::new(Router::new().add_route(sensor).add_route(status))
+    }
+
+    fn valid_sensor_payload() -> Value {
+        json!({
+            "device_id": "esp32-1",
+            "room": "living_room",
+            "device_class": "esp32p4-bme680",
+            "fw_version": "1.0.0",
+            "time_ms": 1_700_000_000_000_i64,
+            "time_iso": "2023-11-14T22:13:20Z",
+            "time_valid": true,
+            "data": {
+                "temp_c": 22.5,
+                "rel_hum_perc": 45.0,
+                "pressure_hpa": 1013.25,
+                "gas_ohm": 50_000.0,
+                "altitude_m": 500.0
+            }
+        })
+    }
+
+    fn valid_status_payload() -> Value {
+        json!({
+            "device_id": "esp32-1",
+            "device_class": "esp32p4-bme680",
+            "fw_version": "1.0.0",
+            "ip": "192.168.1.42",
+            "rssi": -65_i64,
+            "time_ms": 1_700_000_000_000_i64,
+            "time_iso": "2023-11-14T22:13:20Z",
+            "time_valid": true,
+            "uptime": 3600_i64,
+            "free_mem": 200_000_i64,
+            "ssid": "HomeNet"
+        })
+    }
+
+    fn ctx_with_json(topic: &str, payload: Value) -> PipelineContext {
+        let mut ctx = PipelineContext::new(topic, vec![]);
+        ctx.set_payload_json(payload);
+        ctx
+    }
+
+    // ── calc_dew_point_c ──────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_dew_point_c_returns_expected_value_for_typical_conditions() {
+        // At 20 °C and 50 % RH the dew point is approximately 9.27 °C.
+        let result = TransformStage::calc_dew_point_c(20.0, 50.0);
+        assert!((result - 9.27).abs() < 0.05, "got {result}");
+    }
+
+    #[test]
+    fn calc_dew_point_c_equals_temp_at_100_percent_humidity() {
+        // At 100 % RH the dew point must equal the air temperature.
+        let temp = 25.0;
+        let result = TransformStage::calc_dew_point_c(temp, 100.0);
+        assert!((result - temp).abs() < 0.001, "got {result}");
+    }
+
+    // ── calc_heat_index_c ─────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_heat_index_c_uses_steadman_formula_below_80f() {
+        // 20 °C = 68 °F < 80 °F → Steadman path.
+        // Steadman: 0.5 * (68 + 61 + 0 + 50*0.094) = 66.85 °F ≈ 19.36 °C.
+        let result = TransformStage::calc_heat_index_c(20.0, 50.0);
+        assert!((result - 19.36).abs() < 0.05, "got {result}");
+    }
+
+    #[test]
+    fn calc_heat_index_c_uses_rothfusz_formula_above_80f() {
+        // 35 °C = 95 °F, 50 % RH → main Rothfusz path (humidity not in low/high correction bands).
+        let result = TransformStage::calc_heat_index_c(35.0, 50.0);
+        // Rothfusz at 95 °F / 50 % RH → ~105.2 °F → ~40.68 °C.
+        assert!((result - 40.68).abs() < 0.05, "got {result}");
+    }
+
+    #[test]
+    fn calc_heat_index_c_applies_low_humidity_adjustment_above_80f() {
+        // 33 °C ≈ 91.4 °F (in [80,112]), RH = 10 % (< 13) → Rothfusz minus adjustment.
+        let result = TransformStage::calc_heat_index_c(33.0, 10.0);
+        let without_adjustment = TransformStage::calc_heat_index_c(33.0, 15.0);
+        // Low humidity makes the apparent temp feel lower than the base Rothfusz.
+        assert!(result < without_adjustment, "got {result}");
+    }
+
+    #[test]
+    fn calc_heat_index_c_applies_high_humidity_adjustment_80_to_87f() {
+        // 29 °C ≈ 84.2 °F (in [80,87]), RH = 90 % (> 85) → Rothfusz plus adjustment.
+        let result = TransformStage::calc_heat_index_c(29.0, 90.0);
+        let without_adjustment = TransformStage::calc_heat_index_c(29.0, 84.0);
+        // High humidity in that band raises the apparent temperature.
+        assert!(result > without_adjustment, "got {result}");
+    }
+
+    // ── calc_iaq_score ────────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_iaq_score_is_100_at_optimal_humidity_and_max_gas() {
+        // Humidity in [38,42] → hum_score = 25; gas at upper limit → gas_score = 75.
+        let result = TransformStage::calc_iaq_score(50_000.0, 40.0);
+        assert!((result - 100.0).abs() < 0.001, "got {result}");
+    }
+
+    #[test]
+    fn calc_iaq_score_is_25_at_optimal_humidity_and_min_gas() {
+        // Gas at or below lower limit is clamped → gas_score = 0.
+        let result = TransformStage::calc_iaq_score(5_000.0, 40.0);
+        assert!((result - 25.0).abs() < 0.001, "got {result}");
+    }
+
+    #[test]
+    fn calc_iaq_score_hum_score_increases_linearly_below_38_percent() {
+        let low = TransformStage::calc_iaq_score(50_000.0, 20.0);
+        let mid = TransformStage::calc_iaq_score(50_000.0, 30.0);
+        assert!(
+            low < mid,
+            "hum score should increase as humidity rises toward 38 %"
+        );
+    }
+
+    #[test]
+    fn calc_iaq_score_hum_score_decreases_above_42_percent() {
+        let at_42 = TransformStage::calc_iaq_score(50_000.0, 42.0);
+        let at_80 = TransformStage::calc_iaq_score(50_000.0, 80.0);
+        assert!(
+            at_42 > at_80,
+            "hum score should decrease as humidity rises above 42 %"
+        );
+    }
+
+    // ── calc_iaq_text ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn calc_iaq_text_good_when_score_above_89_8() {
+        // score = (100 - 90) * 5 = 50 → "Good"
+        assert_eq!(TransformStage::calc_iaq_text(90.0), "Air quality is Good");
+    }
+
+    #[test]
+    fn calc_iaq_text_moderate_at_score_threshold_51() {
+        // (100 - x) * 5 = 51  → x = 89.8; use 89.7 to land just above 51.
+        assert_eq!(
+            TransformStage::calc_iaq_text(89.7),
+            "Air quality is Moderate"
+        );
+    }
+
+    #[test]
+    fn calc_iaq_text_unhealthy_for_sensitive_groups_at_threshold_151() {
+        // (100 - x) * 5 = 151 → x = 69.8; use 69.7 to land just above 151.
+        assert_eq!(
+            TransformStage::calc_iaq_text(69.7),
+            "Air quality is Unhealthy for Sensitive Groups"
+        );
+    }
+
+    #[test]
+    fn calc_iaq_text_unhealthy_at_threshold_176() {
+        // (100 - x) * 5 = 176 → x = 64.8; use 64.7.
+        assert_eq!(
+            TransformStage::calc_iaq_text(64.7),
+            "Air quality is Unhealthy"
+        );
+    }
+
+    #[test]
+    fn calc_iaq_text_very_unhealthy_at_threshold_201() {
+        // (100 - x) * 5 = 201 → x = 59.8; use 59.7.
+        assert_eq!(
+            TransformStage::calc_iaq_text(59.7),
+            "Air quality is Very Unhealthy"
+        );
+    }
+
+    #[test]
+    fn calc_iaq_text_hazardous_at_threshold_301() {
+        // (100 - x) * 5 = 301 → x = 39.8; use 39.7.
+        assert_eq!(
+            TransformStage::calc_iaq_text(39.7),
+            "Air quality is Hazardous"
+        );
+    }
+
+    // ── transform_sensor_payload: derived fields ──────────────────────────────
+
+    #[test]
+    fn transform_sensor_payload_adds_all_derived_fields() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+
+        stage.transform_sensor_payload(&mut payload).unwrap();
+
+        let data = payload["data"].as_object().unwrap();
+        assert!(data.contains_key("dew_point_c"), "dew_point_c missing");
+        assert!(data.contains_key("heat_index_c"), "heat_index_c missing");
+        assert!(data.contains_key("iaq_score"), "iaq_score missing");
+        assert!(data.contains_key("iaq_text"), "iaq_text missing");
+    }
+
+    #[test]
+    fn transform_sensor_payload_trims_whitespace_from_string_fields() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["device_id"] = json!("  esp32-1  ");
+        payload["room"] = json!("  living_room  ");
+
+        stage.transform_sensor_payload(&mut payload).unwrap();
+
+        assert_eq!(payload["device_id"], json!("esp32-1"));
+        assert_eq!(payload["room"], json!("living_room"));
+    }
+
+    // ── transform_sensor_payload: validation bounds ───────────────────────────
+
+    #[test]
+    fn transform_sensor_payload_returns_err_when_data_missing() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload.as_object_mut().unwrap().remove("data");
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_err());
+    }
+
+    #[test]
+    fn transform_sensor_payload_returns_err_when_required_field_missing() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"].as_object_mut().unwrap().remove("temp_c");
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_err());
+    }
+
+    #[test]
+    fn transform_sensor_payload_returns_err_when_rel_hum_is_zero() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["rel_hum_perc"] = json!(0.0);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_err());
+    }
+
+    #[test]
+    fn transform_sensor_payload_returns_err_when_rel_hum_exceeds_100() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["rel_hum_perc"] = json!(100.1);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_err());
+    }
+
+    #[test]
+    fn transform_sensor_payload_accepts_rel_hum_at_boundary_100() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["rel_hum_perc"] = json!(100.0);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_ok());
+    }
+
+    #[test]
+    fn transform_sensor_payload_returns_err_when_gas_ohm_is_zero() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["gas_ohm"] = json!(0.0);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_err());
+    }
+
+    #[test]
+    fn transform_sensor_payload_returns_err_when_pressure_below_300() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["pressure_hpa"] = json!(299.9);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_err());
+    }
+
+    #[test]
+    fn transform_sensor_payload_returns_err_when_pressure_above_1200() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["pressure_hpa"] = json!(1200.1);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_err());
+    }
+
+    #[test]
+    fn transform_sensor_payload_accepts_pressure_at_lower_boundary_300() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["pressure_hpa"] = json!(300.0);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_ok());
+    }
+
+    #[test]
+    fn transform_sensor_payload_accepts_pressure_at_upper_boundary_1200() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["pressure_hpa"] = json!(1200.0);
+
+        assert!(stage.transform_sensor_payload(&mut payload).is_ok());
+    }
+
+    // ── transform_status_payload ──────────────────────────────────────────────
+
+    #[test]
+    fn transform_status_payload_succeeds_on_valid_payload() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_status_payload();
+
+        assert!(stage.transform_status_payload(&mut payload).is_ok());
+    }
+
+    #[test]
+    fn transform_status_payload_trims_whitespace_from_string_fields() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_status_payload();
+        payload["device_id"] = json!("  esp32-1  ");
+        payload["ip"] = json!("  192.168.1.42  ");
+
+        stage.transform_status_payload(&mut payload).unwrap();
+
+        assert_eq!(payload["device_id"], json!("esp32-1"));
+        assert_eq!(payload["ip"], json!("192.168.1.42"));
+    }
+
+    #[test]
+    fn transform_status_payload_sets_defaults_for_missing_optional_fields() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_status_payload();
+        let obj = payload.as_object_mut().unwrap();
+        obj.remove("uptime");
+        obj.remove("free_mem");
+        obj.remove("ssid");
+
+        stage.transform_status_payload(&mut payload).unwrap();
+
+        assert_eq!(payload["uptime"], json!(0));
+        assert_eq!(payload["free_mem"], json!(0));
+        assert_eq!(payload["ssid"], json!(""));
+    }
+
+    #[test]
+    fn transform_status_payload_does_not_overwrite_existing_optional_fields() {
+        let stage = TransformStage::new(sensor_router());
+        let mut payload = valid_status_payload();
+
+        stage.transform_status_payload(&mut payload).unwrap();
+
+        assert_eq!(payload["uptime"], json!(3600_i64));
+        assert_eq!(payload["free_mem"], json!(200_000_i64));
+        assert_eq!(payload["ssid"], json!("HomeNet"));
+    }
+
+    // ── run(): stage-level behavior ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_on_valid_sensor_payload_sets_handled_message_and_returns_continue() {
+        let stage = TransformStage::new(dual_router());
+        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", valid_sensor_payload());
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Continue)));
+        assert!(!ctx.should_publish_dlq());
+        assert!(ctx.ignored_reason().is_none());
+        assert!(matches!(
+            ctx.handled_message().unwrap(),
+            HandledMessage::Sensor(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_on_valid_status_payload_sets_handled_message_and_returns_continue() {
+        let stage = TransformStage::new(dual_router());
+        let mut ctx = ctx_with_json("smarthome/esp32-1/status", valid_status_payload());
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Continue)));
+        assert!(!ctx.should_publish_dlq());
+        assert!(ctx.ignored_reason().is_none());
+        assert!(matches!(
+            ctx.handled_message().unwrap(),
+            HandledMessage::Status(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_on_unknown_topic_marks_ignored_and_stops() {
+        // strict=true (default) routes unknown topics to DLQ via Err, not ignore.
+        // Use strict=false router to exercise the ignored path.
+        let route = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
+        let router = Arc::new(Router::new().strict(false).add_route(route));
+        let stage = TransformStage::new(router);
+        let mut ctx = ctx_with_json("home/unknown/device", valid_sensor_payload());
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+        assert!(ctx.ignored_reason().is_some());
+        assert!(!ctx.should_publish_dlq());
+    }
+
+    #[tokio::test]
+    async fn run_on_invalid_sensor_bounds_marks_dlq_and_stops() {
+        let stage = TransformStage::new(dual_router());
+        let mut payload = valid_sensor_payload();
+        payload["data"]["rel_hum_perc"] = json!(0.0); // violates (0, 100] bound
+        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", payload);
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+        assert!(ctx.should_publish_dlq());
+        assert!(ctx.dlq_reason().unwrap().contains("transform failed"));
+    }
+
+    #[tokio::test]
+    async fn run_without_payload_json_in_context_returns_error() {
+        let stage = TransformStage::new(dual_router());
+        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(result.is_err());
+        assert!(!ctx.should_publish_dlq());
+    }
+}

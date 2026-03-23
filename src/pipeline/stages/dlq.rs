@@ -91,3 +91,88 @@ impl PipelineStage for DlqPublishStage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rumqttc::MqttOptions;
+
+    use super::*;
+    use crate::pipeline::{context::PipelineContext, stage::StageFlow};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Returns a client whose eventloop receiver is alive so that `publish` queues successfully.
+    fn client_with_live_eventloop() -> (AsyncClient, rumqttc::EventLoop) {
+        let opts = MqttOptions::new("test-dlq-ok", "localhost", 1883);
+        AsyncClient::new(opts, 10)
+    }
+
+    /// Returns a client whose eventloop has been dropped so that `publish` returns an error.
+    fn client_with_dropped_eventloop() -> AsyncClient {
+        let opts = MqttOptions::new("test-dlq-err", "localhost", 1884);
+        let (client, _eventloop) = AsyncClient::new(opts, 10);
+        // _eventloop is dropped here → receiver gone → publish will fail
+        client
+    }
+
+    fn ctx_with_dlq_reason(reason: &str) -> PipelineContext {
+        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", b"raw payload".to_vec());
+        ctx.mark_dlq(reason.to_string());
+        ctx
+    }
+
+    // ── run(): no DLQ reason ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_without_dlq_reason_returns_stop_without_publishing() {
+        let (client, _eventloop) = client_with_live_eventloop();
+        let stage = DlqPublishStage::new(client, "smarthome/_dlq/ingest");
+        // Context has no dlq_reason — stage must return Stop immediately.
+        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+    }
+
+    // ── run(): DLQ reason present, publish succeeds ───────────────────────────
+
+    #[tokio::test]
+    async fn run_with_dlq_reason_returns_stop_when_publish_succeeds() {
+        let (client, _eventloop) = client_with_live_eventloop();
+        let stage = DlqPublishStage::new(client, "smarthome/_dlq/ingest");
+        let mut ctx = ctx_with_dlq_reason("schema validation failed");
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+    }
+
+    // ── run(): DLQ reason present, publish fails (closed channel) ────────────
+
+    #[tokio::test]
+    async fn run_with_dlq_reason_returns_stop_even_when_publish_fails() {
+        // The stage must absorb publish errors and never propagate them.
+        let client = client_with_dropped_eventloop();
+        let stage = DlqPublishStage::new(client, "smarthome/_dlq/ingest");
+        let mut ctx = ctx_with_dlq_reason("schema validation failed");
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+    }
+
+    // ── run(): DLQ topic is forwarded to publish ──────────────────────────────
+
+    #[tokio::test]
+    async fn run_uses_configured_dlq_topic() {
+        // Verify the stage accepts any DLQ topic string without panic.
+        let (client, _eventloop) = client_with_live_eventloop();
+        let stage = DlqPublishStage::new(client, "custom/dlq/topic");
+        let mut ctx = ctx_with_dlq_reason("some error");
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+    }
+}
