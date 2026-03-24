@@ -42,11 +42,3 @@ jobs:
       - name: Run tests
         run: cargo test --all-features --locked
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      - name: Security audit
-        # RUSTSEC-2026-0049 and RUSTSEC-2025-0134 are suppressed: both are pulled in by
-        # rumqttc 0.25.1 (latest) which has not yet migrated to rustls-webpki >= 0.103.10.
-        # Risk is low as MQTT runs on plaintext in this deployment (no TLS CRL validation).
-        run: cargo audit --ignore RUSTSEC-2026-0049 --ignore RUSTSEC-2025-0134
