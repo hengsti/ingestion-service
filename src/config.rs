@@ -1,8 +1,9 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     // MQTT
     pub mqtt_host: String,
@@ -32,6 +33,31 @@ pub struct Config {
     pub cache_ttl_ms: u64,
     pub cache_bind: String,
     pub cache_buffer: usize,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("mqtt_host", &self.mqtt_host)
+            .field("mqtt_port", &self.mqtt_port)
+            .field("mqtt_client_id", &self.mqtt_client_id)
+            .field("mqtt_topics", &self.mqtt_topics)
+            .field("influx_url", &self.influx_url)
+            .field("influx_org", &self.influx_org)
+            .field("influx_bucket", &self.influx_bucket)
+            .field("influx_token", &"[REDACTED]")
+            .field("batch_size", &self.batch_size)
+            .field("flush_interval_ms", &self.flush_interval_ms)
+            .field(
+                "enforce_topic_device_match",
+                &self.enforce_topic_device_match,
+            )
+            .field("metrics_bind", &self.metrics_bind)
+            .field("cache_ttl_ms", &self.cache_ttl_ms)
+            .field("cache_bind", &self.cache_bind)
+            .field("cache_buffer", &self.cache_buffer)
+            .finish()
+    }
 }
 
 impl Config {
