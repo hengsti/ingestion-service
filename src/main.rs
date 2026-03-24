@@ -26,6 +26,7 @@ use pipeline::{
     },
 };
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+use secrecy::ExposeSecret;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinSet,
@@ -124,7 +125,7 @@ async fn main() -> Result<()> {
         &cfg.influx_url,
         &cfg.influx_org,
         &cfg.influx_bucket,
-        &cfg.influx_token,
+        cfg.influx_token.expose_secret(),
     )?;
 
     let batch_size = cfg.batch_size;

@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use secrecy::SecretString;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -17,7 +18,7 @@ pub struct Config {
     pub influx_url: String, // e.g. http://influxdb:8086
     pub influx_org: String,
     pub influx_bucket: String,
-    pub influx_token: String,
+    pub influx_token: SecretString,
 
     // batching
     pub batch_size: usize,
@@ -84,10 +85,18 @@ impl Config {
         }
 
         let influx_url = env_var("INFLUX_URL").context("INFLUX_URL must be set")?;
+        if !influx_url.starts_with("http://") && !influx_url.starts_with("https://") {
+            bail!(
+                "INFLUX_URL must start with http:// or https://, got: {}",
+                influx_url
+            );
+        }
         let influx_org = env_var("INFLUX_ORG").context("INFLUX_ORG must be set")?;
         let influx_bucket = env_var("INFLUX_BUCKET").context("INFLUX_BUCKET must be set")?;
-        let influx_token = env_var("INFLUX_TOKEN")
-            .context("INFLUX_TOKEN must be set (for InfluxDB v2 write API)")?;
+        let influx_token = SecretString::new(
+            env_var("INFLUX_TOKEN")
+                .context("INFLUX_TOKEN must be set (for InfluxDB v2 write API)")?,
+        );
 
         let batch_size = env_var("BATCH_SIZE")
             .context("BATCH_SIZE must be set")?
