@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use jsonschema::Validator as JsonSchemaValidator;
 use serde_json::Value;
 

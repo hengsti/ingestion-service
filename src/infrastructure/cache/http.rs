@@ -1,19 +1,19 @@
 use std::convert::Infallible;
 
 use axum::{
-    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{
-        IntoResponse,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse,
     },
     routing::get,
+    Json, Router,
 };
 use serde::Serialize;
 use tokio_stream::{
+    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
     StreamExt,
-    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
 };
 
 use super::state::{CacheEvent, CacheState};

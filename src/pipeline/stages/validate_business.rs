@@ -185,11 +185,9 @@ mod tests {
             unreachable!()
         };
         msg.device_id = String::new();
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_err());
     }
 
     #[test]
@@ -198,11 +196,9 @@ mod tests {
             unreachable!()
         };
         msg.time_ms = -1;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_err());
     }
 
     #[test]
@@ -212,11 +208,9 @@ mod tests {
             unreachable!()
         };
         msg.data.rel_hum_perc = 0.0;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_err());
     }
 
     #[test]
@@ -225,11 +219,9 @@ mod tests {
             unreachable!()
         };
         msg.data.rel_hum_perc = 100.1;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_err());
     }
 
     #[test]
@@ -239,11 +231,9 @@ mod tests {
             unreachable!()
         };
         msg.data.gas_ohm = 0.0;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_err());
     }
 
     #[test]
@@ -252,11 +242,9 @@ mod tests {
             unreachable!()
         };
         msg.data.iaq_score = 100.1;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_err());
     }
 
     #[test]
@@ -265,11 +253,9 @@ mod tests {
             unreachable!()
         };
         msg.data.iaq_text = String::new();
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_err());
     }
 
     // ── validate_handled_message: sensor boundaries (must pass) ──────────────
@@ -280,11 +266,9 @@ mod tests {
             unreachable!()
         };
         msg.data.rel_hum_perc = 100.0;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_ok()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_ok());
     }
 
     #[test]
@@ -293,11 +277,9 @@ mod tests {
             unreachable!()
         };
         msg.data.iaq_score = 0.0;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_ok()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_ok());
     }
 
     #[test]
@@ -306,11 +288,9 @@ mod tests {
             unreachable!()
         };
         msg.data.iaq_score = 100.0;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Sensor(msg))
-                .is_ok()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Sensor(msg))
+            .is_ok());
     }
 
     // ── validate_handled_message: status success ──────────────────────────────
@@ -328,11 +308,9 @@ mod tests {
             unreachable!()
         };
         msg.device_id = String::new();
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Status(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Status(msg))
+            .is_err());
     }
 
     #[test]
@@ -341,11 +319,9 @@ mod tests {
             unreachable!()
         };
         msg.ip = String::new();
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Status(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Status(msg))
+            .is_err());
     }
 
     #[test]
@@ -354,11 +330,9 @@ mod tests {
             unreachable!()
         };
         msg.uptime = -1;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Status(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Status(msg))
+            .is_err());
     }
 
     #[test]
@@ -367,11 +341,9 @@ mod tests {
             unreachable!()
         };
         msg.free_mem = -1;
-        assert!(
-            stage()
-                .validate_handled_message(&HandledMessage::Status(msg))
-                .is_err()
-        );
+        assert!(stage()
+            .validate_handled_message(&HandledMessage::Status(msg))
+            .is_err());
     }
 
     // ── run(): stage-level behavior ───────────────────────────────────────────
@@ -408,11 +380,10 @@ mod tests {
 
         assert!(matches!(result, Ok(StageFlow::Stop)));
         assert!(ctx.should_publish_dlq());
-        assert!(
-            ctx.dlq_reason()
-                .unwrap()
-                .contains("business validation failed")
-        );
+        assert!(ctx
+            .dlq_reason()
+            .unwrap()
+            .contains("business validation failed"));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use metrics::{counter, histogram};
 use serde_json::{Number, Value};
 use tracing::{debug, warn};
@@ -319,7 +319,7 @@ impl PipelineStage for TransformStage {
 mod tests {
     use std::sync::Arc;
 
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::{

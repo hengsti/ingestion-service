@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::{Router, extract::State, http::header, response::IntoResponse, routing::get};
+use axum::{extract::State, http::header, response::IntoResponse, routing::get, Router};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::{net::SocketAddr, time::Duration};
 use tokio::task::JoinHandle;

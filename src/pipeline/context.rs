@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 use crate::model::messages::message::HandledMessage;
