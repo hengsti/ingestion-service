@@ -20,3 +20,7 @@ tokio-stream = { version = "0.1.18", features = ["sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 urlencoding = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
