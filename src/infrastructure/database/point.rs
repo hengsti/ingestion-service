@@ -31,27 +31,22 @@ impl Point {
     pub fn to_line_protocol(&self) -> String {
         let measurement = esc_measurement(&self.measurement);
 
-        // tags are optional
         let tag_string = if self.tags.is_empty() {
             String::new()
         } else {
-            let mut tags = self.tags.clone();
-            tags.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            let joined = tags
-                .into_iter()
-                .map(|(k, v)| format!("{}={}", esc_tag_key(&k), esc_tag_value(&v)))
+            let joined = self
+                .tags
+                .iter()
+                .map(|(k, v)| format!("{}={}", esc_tag_key(k), esc_tag_value(v)))
                 .collect::<Vec<_>>()
                 .join(",");
             format!(",{}", joined)
         };
 
-        // fields must exist
-        let mut fields = self.fields.clone();
-        fields.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        let field_string = fields
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", esc_field_key(&k), format_field_value(&v)))
+        let field_string = self
+            .fields
+            .iter()
+            .map(|(k, v)| format!("{}={}", esc_field_key(k), format_field_value(v)))
             .collect::<Vec<_>>()
             .join(",");
 
@@ -121,10 +116,16 @@ impl PointBuilder {
     }
 
     pub fn build(self) -> Point {
+        let mut tags = self.tags;
+        let mut fields = self.fields;
+
+        tags.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        fields.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
         Point {
             measurement: self.measurement,
-            tags: self.tags,
-            fields: self.fields,
+            tags,
+            fields,
             timestamp_ms: self.timestamp_ms,
         }
     }
