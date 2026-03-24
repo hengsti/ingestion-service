@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::model::messages::message::HandledMessage;
@@ -8,7 +9,7 @@ use crate::model::messages::message::HandledMessage;
 #[derive(Debug)]
 pub struct PipelineContext {
     topic: String,
-    raw_payload: Vec<u8>,
+    raw_payload: Bytes,
     payload_utf8: Option<String>,
     payload_json: Option<Value>,
     handled_message: Option<HandledMessage>,
@@ -19,10 +20,10 @@ pub struct PipelineContext {
 }
 
 impl PipelineContext {
-    pub fn new(topic: impl Into<String>, raw_payload: Vec<u8>) -> Self {
+    pub fn new(topic: impl Into<String>, raw_payload: impl Into<Bytes>) -> Self {
         Self {
             topic: topic.into(),
-            raw_payload,
+            raw_payload: raw_payload.into(),
             payload_utf8: None,
             payload_json: None,
             handled_message: None,

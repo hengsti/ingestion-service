@@ -27,22 +27,17 @@ impl DecodeStage {
         Self
     }
 
-    pub fn decode_payload(payload: &[u8]) -> Result<(String, Value), DecodeError> {
+    pub fn decode_payload(payload: &[u8]) -> Result<Value, DecodeError> {
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(DecodeError::TooLarge(payload.len()));
         }
 
-        let payload_str = str::from_utf8(payload)
-            .map_err(DecodeError::Utf8)?
-            .to_owned();
+        let payload_str = str::from_utf8(payload).map_err(DecodeError::Utf8)?;
 
-        let payload_json =
-            serde_json::from_str(&payload_str).map_err(|source| DecodeError::Json {
-                payload_str: payload_str.clone(),
-                source,
-            })?;
-
-        Ok((payload_str, payload_json))
+        serde_json::from_str(payload_str).map_err(|source| DecodeError::Json {
+            payload_str: payload_str.to_owned(),
+            source,
+        })
     }
 }
 
@@ -64,10 +59,9 @@ impl PipelineStage for DecodeStage {
             histogram!("ingest_decode_payload_bytes").record(raw_payload.len() as f64);
 
             let (result, result_label) = match Self::decode_payload(raw_payload) {
-                Ok((payload_str, payload_json)) => {
+                Ok(payload_json) => {
                     counter!("ingest_decode_success_total").increment(1);
 
-                    ctx.set_payload_utf8(payload_str);
                     ctx.set_payload_json(payload_json);
 
                     (StageFlow::Continue, "success")
@@ -124,8 +118,7 @@ mod tests {
         let result = DecodeStage::decode_payload(raw);
 
         match result {
-            Ok((payload_str, payload_json)) => {
-                assert_eq!(payload_str, r#"{"device_id":"esp32-1","temp_c":22.4}"#);
+            Ok(payload_json) => {
                 assert_eq!(
                     payload_json,
                     json!({
@@ -145,8 +138,7 @@ mod tests {
         let result = DecodeStage::decode_payload(raw);
 
         match result {
-            Ok((payload_str, payload_json)) => {
-                assert_eq!(payload_str, r#"[{"sensor":"a"},{"sensor":"b"}]"#);
+            Ok(payload_json) => {
                 assert_eq!(
                     payload_json,
                     json!([
@@ -166,8 +158,7 @@ mod tests {
         let result = DecodeStage::decode_payload(raw);
 
         match result {
-            Ok((payload_str, payload_json)) => {
-                assert_eq!(payload_str, "42");
+            Ok(payload_json) => {
                 assert_eq!(payload_json, json!(42));
             }
             Err(err) => panic!("expected Ok, got Err: {err:?}"),
@@ -275,10 +266,6 @@ mod tests {
 
         assert!(matches!(result, Ok(StageFlow::Continue)));
         assert!(!ctx.should_publish_dlq());
-        assert_eq!(
-            ctx.payload_utf8().unwrap(),
-            r#"{"device_id":"esp32-1","temp_c":22.4}"#
-        );
         assert_eq!(
             ctx.payload_json().unwrap(),
             &json!({"device_id": "esp32-1", "temp_c": 22.4})

@@ -9,6 +9,7 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::database::influx::InfluxWriter;
@@ -37,7 +38,7 @@ const INFLUX_QUEUE_CAPACITY: usize = 10_000;
 #[derive(Debug)]
 struct IngestJob {
     topic: String,
-    payload: Vec<u8>,
+    payload: Bytes,
 }
 
 fn worker_count() -> usize {
@@ -248,7 +249,7 @@ async fn main() -> Result<()> {
                 if let Event::Incoming(Incoming::Publish(publish)) = event {
                     let job = IngestJob {
                         topic: publish.topic,
-                        payload: publish.payload.to_vec(),
+                        payload: publish.payload,
                     };
 
                     let idx = dispatch_idx % worker_total;
