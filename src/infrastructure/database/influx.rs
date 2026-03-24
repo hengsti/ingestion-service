@@ -87,29 +87,47 @@ impl InfluxWriter {
         buf.clear();
 
         let start = Instant::now();
+        let mut last_err = anyhow::anyhow!("no write attempts made");
 
-        let resp = self
-            .client
-            .post(&self.write_url)
-            .header("Authorization", format!("Token {}", self.token))
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .body(body)
-            .send()
-            .await
-            .context("Influx write request failed")?;
+        for attempt in 0u32..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1u64 << (attempt - 1))).await;
+                tracing::warn!(attempt, "retrying influx write");
+            }
 
-        histogram!("influx_write_duration_seconds").record(start.elapsed().as_secs_f64());
-        counter!("influx_lines_written_total").increment(lines as u64);
+            let send_result = self
+                .client
+                .post(&self.write_url)
+                .header("Authorization", format!("Token {}", self.token))
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(body.clone())
+                .send()
+                .await;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            counter!("influx_write_errors_total").increment(1);
-            anyhow::bail!("Influx write failed: status={} body={}", status, text);
+            match send_result {
+                Err(e) => {
+                    last_err = anyhow::anyhow!("Influx write request failed: {}", e);
+                    continue;
+                }
+                Ok(resp) if !resp.status().is_success() => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    last_err =
+                        anyhow::anyhow!("Influx write failed: status={} body={}", status, text);
+                    continue;
+                }
+                Ok(_) => {
+                    histogram!("influx_write_duration_seconds")
+                        .record(start.elapsed().as_secs_f64());
+                    counter!("influx_lines_written_total").increment(lines as u64);
+                    counter!("influx_write_success_total").increment(1);
+                    return Ok(());
+                }
+            }
         }
 
-        counter!("influx_write_success_total").increment(1);
-        Ok(())
+        counter!("influx_write_errors_total").increment(1);
+        Err(last_err)
     }
 }
 
