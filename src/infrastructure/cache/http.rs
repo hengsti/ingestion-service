@@ -1,4 +1,8 @@
 use std::convert::Infallible;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use axum::{
     extract::{Path, State},
@@ -8,7 +12,7 @@ use axum::{
         IntoResponse,
     },
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Serialize;
 use tokio_stream::{
@@ -19,17 +23,27 @@ use tokio_stream::{
 use super::state::{CacheEvent, CacheState};
 use crate::model::messages::sensor::SensorData;
 
-pub fn router(state: CacheState) -> Router {
+pub fn router(state: CacheState, mqtt_ready: Arc<AtomicBool>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/v1/state", get(list_state))
         .route("/v1/state/{device_id}", get(get_state))
         .route("/v1/stream", get(stream_updates))
         .with_state(state)
+        .layer(Extension(mqtt_ready))
 }
 
 async fn healthz() -> impl IntoResponse {
     StatusCode::OK
+}
+
+async fn readyz(Extension(mqtt_ready): Extension<Arc<AtomicBool>>) -> StatusCode {
+    if mqtt_ready.load(Ordering::Relaxed) {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 #[derive(Serialize)]

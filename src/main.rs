@@ -3,7 +3,10 @@ mod infrastructure;
 mod model;
 mod pipeline;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{Context, Result};
 use config::Config;
@@ -57,12 +60,14 @@ async fn main() -> Result<()> {
     // Cache / HTTP state
     // ------------------------------------------------------------
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
+    let mqtt_ready = Arc::new(AtomicBool::new(false));
 
     let http_state = app_state.clone();
     let cache_bind = cfg.cache_bind.clone();
+    let mqtt_ready_http = mqtt_ready.clone();
 
     let mut _http_task = tokio::spawn(async move {
-        let app = http::router(http_state);
+        let app = http::router(http_state, mqtt_ready_http);
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
@@ -222,7 +227,24 @@ async fn main() -> Result<()> {
             }
 
             event = eventloop.poll() => {
-                let event = event.context("MQTT poll failed")?;
+                let event = match event {
+                    Ok(ev) => ev,
+                    Err(err) => {
+                        mqtt_ready.store(false, Ordering::Relaxed);
+                        return Err(err).context("MQTT poll failed");
+                    }
+                };
+
+                match &event {
+                    Event::Incoming(Incoming::ConnAck(_)) => {
+                        mqtt_ready.store(true, Ordering::Relaxed);
+                        info!("MQTT connected");
+                    }
+                    Event::Incoming(Incoming::Disconnect) => {
+                        mqtt_ready.store(false, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
 
                 if let Event::Incoming(Incoming::Publish(publish)) = event {
                     let job = IngestJob {
