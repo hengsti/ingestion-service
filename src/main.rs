@@ -23,7 +23,7 @@ use pipeline::{
 };
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use tokio::{
-    sync::{Mutex, mpsc, watch},
+    sync::{mpsc, watch, Mutex},
     task::JoinSet,
 };
 use tracing::{error, info, warn};
@@ -61,15 +61,15 @@ async fn main() -> Result<()> {
     let http_state = app_state.clone();
     let cache_bind = cfg.cache_bind.clone();
 
-    let _http_task = tokio::spawn(async move {
+    let mut _http_task = tokio::spawn(async move {
         let app = http::router(http_state);
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
 
-        axum::serve(listener, app)
-            .await
-            .expect("HTTP server failed");
+        if let Err(err) = axum::serve(listener, app).await {
+            error!(error = %err, "HTTP server error");
+        }
     });
 
     // ------------------------------------------------------------
@@ -207,6 +207,15 @@ async fn main() -> Result<()> {
                 match res {
                     Ok(()) => info!("shutdown signal received"),
                     Err(err) => error!(error = %err, "failed to listen for ctrl-c"),
+                }
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+
+            res = &mut _http_task => {
+                match res {
+                    Ok(()) => error!("HTTP server stopped unexpectedly"),
+                    Err(err) => error!(error = %err, "HTTP server task panicked"),
                 }
                 let _ = shutdown_tx.send(true);
                 break;
