@@ -175,21 +175,3 @@ pub fn status_to_point(msg: &StatusMessage) -> Point {
 
     b.build()
 }
-
-// fn esc_measurement(s: &str) -> String {
-//     // measurement: escape commas and spaces
-//     s.replace(',', "\\,").replace(' ', "\\ ")
-// }
-
-// fn esc_tag(s: &str) -> String {
-//     // tags: escape commas, equals, spaces
-//     s.replace('\\', "\\\\")
-//         .replace(',', "\\,")
-//         .replace('=', "\\=")
-//         .replace(' ', "\\ ")
-// }
-
-// fn esc_string(s: &str) -> String {
-//     // field string: escape backslash and quotes
-//     s.replace('\\', "\\\\").replace('"', "\\\"")
-// }
