@@ -38,15 +38,10 @@ impl PipelineStage for CacheUpdateStage {
 
             let kind = match msg {
                 HandledMessage::Sensor(msg) => {
-                    self.cache_state
-                        .update(&HandledMessage::Sensor(msg.clone()));
+                    self.cache_state.update_sensor(msg);
                     "sensor"
                 }
-                HandledMessage::Status(msg) => {
-                    self.cache_state
-                        .update(&HandledMessage::Status(msg.clone()));
-                    "status"
-                }
+                HandledMessage::Status(_) => "status",
             };
 
             counter!("ingest_cache_updates_total", "kind" => kind).increment(1);

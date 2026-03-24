@@ -5,8 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
-use crate::model::messages::message::HandledMessage;
-use crate::model::messages::sensor::SensorData;
+use crate::model::messages::sensor::{SensorData, SensorMessage};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SensorState {
@@ -51,32 +50,26 @@ impl CacheState {
         self.event_tx.subscribe()
     }
 
-    pub fn update(&self, msg: &HandledMessage) {
-        match msg {
-            HandledMessage::Sensor(sensor_msg) => {
-                let device_id = normalize_device_id(&sensor_msg.device_id);
-                let last_seen_ms = now_ms();
+    pub fn update_sensor(&self, sensor_msg: &SensorMessage) {
+        let device_id = normalize_device_id(&sensor_msg.device_id);
+        let last_seen_ms = now_ms();
 
-                let state = SensorState {
+        {
+            let mut map = self.sensors.write().expect("sensors lock poisoned");
+            map.insert(
+                device_id.clone(),
+                SensorState {
                     last_seen_ms,
                     value: sensor_msg.data.clone(),
-                };
-
-                {
-                    let mut map = self.sensors.write().expect("sensors lock poisoned");
-                    map.insert(device_id.clone(), state);
-                }
-
-                let _ = self.event_tx.send(CacheEvent::Sensor {
-                    device_id,
-                    last_seen_ms,
-                    value: sensor_msg.data.clone(),
-                });
-            }
-            _ => {
-                // For now, we only cache sensor messages. Status messages could be cached similarly if needed.
-            }
+                },
+            );
         }
+
+        let _ = self.event_tx.send(CacheEvent::Sensor {
+            device_id,
+            last_seen_ms,
+            value: sensor_msg.data.clone(),
+        });
     }
 
     pub fn snapshot_all_sensors(&self) -> Vec<(String, SensorState, bool)> {
