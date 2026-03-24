@@ -26,7 +26,7 @@ use pipeline::{
 };
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use tokio::{
-    sync::{mpsc, watch, Mutex},
+    sync::{mpsc, watch},
     task::JoinSet,
 };
 use tracing::{error, info, warn};
@@ -159,35 +159,33 @@ async fn main() -> Result<()> {
     info!("pipeline initialized");
 
     // ------------------------------------------------------------
-    // Worker queue
+    // Worker queue — one channel per worker, round-robin dispatch
     // ------------------------------------------------------------
-    let (job_tx, job_rx) = mpsc::channel::<IngestJob>(EVENT_QUEUE_CAPACITY);
-    let shared_job_rx = Arc::new(Mutex::new(job_rx));
-
     let worker_total = worker_count();
+    let per_worker_cap = EVENT_QUEUE_CAPACITY / worker_total;
     info!(workers = worker_total, "starting pipeline workers");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
+    let mut job_txs: Vec<mpsc::Sender<IngestJob>> = Vec::with_capacity(worker_total);
 
     for worker_id in 0..worker_total {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(per_worker_cap);
+        job_txs.push(tx);
+
         let pipeline = pipeline.clone();
-        let shared_job_rx = shared_job_rx.clone();
         let mut shutdown_rx = shutdown_rx.clone();
 
         workers.spawn(async move {
             info!(worker_id, "pipeline worker started");
 
             loop {
-                let next_job = tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        break;
-                    }
-                    job = recv_job(shared_job_rx.clone()) => job,
-                };
-
-                let Some(job) = next_job else {
-                    break;
+                let job = tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    job = rx.recv() => match job {
+                        Some(j) => j,
+                        None => break,
+                    },
                 };
 
                 let mut ctx = PipelineContext::new(job.topic.clone(), job.payload);
@@ -206,6 +204,7 @@ async fn main() -> Result<()> {
     // ------------------------------------------------------------
     // Main consume loop
     // ------------------------------------------------------------
+    let mut dispatch_idx: usize = 0;
     loop {
         tokio::select! {
             res = tokio::signal::ctrl_c() => {
@@ -252,7 +251,9 @@ async fn main() -> Result<()> {
                         payload: publish.payload.to_vec(),
                     };
 
-                    if let Err(err) = job_tx.try_send(job) {
+                    let idx = dispatch_idx % worker_total;
+                    dispatch_idx = dispatch_idx.wrapping_add(1);
+                    if let Err(err) = job_txs[idx].try_send(job) {
                         metrics::counter!("ingest_event_queue_full_total").increment(1);
                         warn!(error = %err, "event queue full; dropping incoming MQTT message before pipeline");
                     }
@@ -261,7 +262,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    drop(job_tx);
+    drop(job_txs);
 
     while let Some(res) = workers.join_next().await {
         match res {
@@ -273,11 +274,6 @@ async fn main() -> Result<()> {
 
     info!("ingestion service stopped");
     Ok(())
-}
-
-async fn recv_job(shared_rx: Arc<Mutex<mpsc::Receiver<IngestJob>>>) -> Option<IngestJob> {
-    let mut rx = shared_rx.lock().await;
-    rx.recv().await
 }
 
 fn build_router(cfg: &Config) -> Result<Router> {
