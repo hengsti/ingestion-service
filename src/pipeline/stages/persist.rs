@@ -47,10 +47,9 @@ impl PipelineStage for PersistStage {
                 }
             };
 
-            ctx.set_line_protocol(line.clone());
-
-            match self.tx.try_send(line) {
+            match self.tx.try_send(line.clone()) {
                 Ok(()) => {
+                    ctx.set_line_protocol(line);
                     counter!("ingest_messages_enqueued_total", "kind" => kind).increment(1);
                     histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "success")
                         .record(start.elapsed().as_secs_f64());
