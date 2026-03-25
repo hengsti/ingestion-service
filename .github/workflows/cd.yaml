@@ -22,7 +22,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/ingestion-service
-  DEPLOY_PATH: /opt/smarthome-stack
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
   SERVICE_NAME: ingest
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -30,7 +30,7 @@ jobs:
   build_and_push:
     name: Build and push Docker image
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.image_tag == '')
-    runs-on: [self-hosted, linux, ARM64, smarthome]
+    runs-on: [self-hosted, linux, ARM64, ingestion]
     outputs:
       image_tag: ${{ steps.vars.outputs.image_tag }}
 
@@ -76,7 +76,7 @@ jobs:
     name: Deploy ingest service
     needs: build_and_push
     if: always() && (needs.build_and_push.result == 'success' || needs.build_and_push.result == 'skipped')
-    runs-on: [self-hosted, linux, ARM64, smarthome]
+    runs-on: [self-hosted, linux, ARM64, ingestion]
     permissions:
       contents: read
       packages: read
@@ -90,7 +90,7 @@ jobs:
             --password-stdin
 
       - name: Update deploy tag
-        working-directory: /opt/smarthome-stack
+        working-directory: ${{ vars.DEPLOY_PATH }}
         env:
           IMAGE_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || needs.build_and_push.outputs.image_tag }}
         shell: bash
@@ -102,11 +102,11 @@ jobs:
           fi
 
       - name: Pull new image
-        working-directory: /opt/smarthome-stack
+        working-directory: ${{ vars.DEPLOY_PATH }}
         run: docker compose pull ingest
 
       - name: Recreate ingest only
-        working-directory: /opt/smarthome-stack
+        working-directory: ${{ vars.DEPLOY_PATH }}
         run: docker compose up -d --no-deps ingest
 
       - name: Prune dangling images
