@@ -2,7 +2,9 @@
 
 High-performance Rust microservice that ingests smart home telemetry from MQTT, validates it, and batch-writes it to InfluxDB v2. Invalid messages are routed to a Dead Letter Queue.
 
-![CI](https://github.com/HengstbergerFabian/smarthome-ingest/actions/workflows/ci-cd.yaml/badge.svg)
+![CI](https://github.com/hengsti/ingestion-service/actions/workflows/ci.yaml/badge.svg)
+![CD](https://github.com/hengsti/ingestion-service/actions/workflows/cd.yaml/badge.svg)
+![Sec](https://github.com/hengsti/ingestion-service/actions/workflows/security-audit.yaml/badge.svg)
 ![Rust](https://img.shields.io/badge/rust-1.87.0-orange)
 
 ---
