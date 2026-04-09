@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://smarthome-ingest/base.schema.json",
+  "title": "Base Device Message",
+  "type": "object",
+  "properties": {
+    "device_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique identifier for the device"
+    },
+    "device_class": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Device class or model"
+    },
+    "fw_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Firmware version running on the device"
+    },
+    "time_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Timestamp in milliseconds"
+    },
+    "time_iso": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Timestamp in ISO 8601 format"
+    },
+    "time_valid": {
+      "type": "boolean",
+      "description": "Indicates if the timestamp is valid and synchronized with real time"
+    }
+  },
+  "required": [
+    "device_id",
+    "device_class",
+    "fw_version",
+    "time_ms",
+    "time_iso",
+    "time_valid"
+  ]
+}
