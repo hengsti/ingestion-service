@@ -1,3 +1,7 @@
 /target
 *.zip
 /.idea
+/.github/*.md
+/.github/*.json
+plan.md
+TODO.md
