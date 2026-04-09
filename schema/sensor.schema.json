@@ -1,76 +1,52 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "properties": {
-    "device_id": {
-      "type": "string",
-      "description": "Unique identifier for the device"
-    },
-    "room": {
-      "type": "string",
-      "description": "Room where the device is located"
-    },
-    "device_class": {
-      "type": "string",
-      "description": "Device class or model"
-    },
-    "fw_version": {
-      "type": "string",
-      "description": "Firmware version running on the device"
-    },
-    "time_ms": {
-      "type": "integer",
-      "description": "Timestamp in milliseconds"
-    },
-    "time_iso": {
-      "type": "string",
-      "description": "Timestamp in ISO 8601 format"
-    },
-    "time_valid": {
-      "type": "boolean",
-      "description": "Indicates if the timestamp is valid and synchronized with real time"
-    },
-    "data": {
+  "title": "Sensor Message",
+  "allOf": [
+    { "$ref": "https://smarthome-ingest/base.schema.json" },
+    {
       "type": "object",
       "properties": {
-        "temp_c": {
-          "type": "number",
-          "description": "Temperature in Celsius"
+        "room": {
+          "type": "string",
+          "description": "Room where the device is located"
         },
-        "rel_hum_perc": {
-          "type": "number",
-          "description": "Relative Humidity in percent"
-        },
-        "pressure_hpa": {
-          "type": "number",
-          "description": "Atmospheric pressure in hPa"
-        },
-        "gas_ohm": {
-          "type": "number",
-          "description": "Gas resistance in Ohms"
-        },
-        "altitude_m": {
-          "type": "number",
-          "description": "Approximate altitude in meters"
+        "data": {
+          "type": "object",
+          "properties": {
+            "temp_c": {
+              "type": "number",
+              "description": "Temperature in Celsius"
+            },
+            "rel_hum_perc": {
+              "type": "number",
+              "description": "Relative Humidity in percent"
+            },
+            "pressure_hpa": {
+              "type": "number",
+              "description": "Atmospheric pressure in hPa"
+            },
+            "gas_ohm": {
+              "type": "number",
+              "description": "Gas resistance in Ohms"
+            },
+            "altitude_m": {
+              "type": "number",
+              "description": "Approximate altitude in meters"
+            }
+          },
+          "required": [
+            "temp_c",
+            "rel_hum_perc",
+            "pressure_hpa",
+            "gas_ohm",
+            "altitude_m"
+          ]
         }
       },
       "required": [
-        "temp_c",
-        "rel_hum_perc",
-        "pressure_hpa",
-        "gas_ohm",
-        "altitude_m"
+        "room",
+        "data"
       ]
     }
-  },
-  "required": [
-    "device_id",
-    "room",
-    "device_class",
-    "fw_version",
-    "time_ms",
-    "time_iso",
-    "time_valid",
-    "data"
   ]
 }

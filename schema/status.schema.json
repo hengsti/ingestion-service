@@ -1,60 +1,36 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "properties": {
-    "device_id": {
-      "type": "string",
-      "description": "Unique identifier for the device"
-    },
-    "device_class": {
-      "type": "string",
-      "description": "Class or type of the device, e.g., esp32p4-bme680"
-    },
-    "fw_version": {
-      "type": "string",
-      "description": "Firmware version running on the device"
-    },
-    "ip": {
-      "type": "string",
-      "description": "IP address of the device on the local network"
-    },
-    "rssi": {
-      "type": "integer",
-      "description": "Received Signal Strength Indicator in dBm"
-    },
-    "time_ms": {
-      "type": "integer",
-      "description": "Timestamp in milliseconds"
-    },
-    "time_iso": {
-      "type": "string",
-      "description": "Timestamp in ISO 8601 format"
-    },
-    "time_valid": {
-      "type": "boolean",
-      "description": "Indicates if the timestamp is valid and synchronized with real time"
-    },
-    "uptime": {
-      "type": "integer",
-      "description": "Device uptime in seconds"
-    },
-    "free_mem": {
-      "type": "integer",
-      "description": "Free memory in bytes"
-    },
-    "ssid": {
-      "type": "string",
-      "description": "Connected WiFi SSID"
+  "title": "Status Message",
+  "allOf": [
+    { "$ref": "https://smarthome-ingest/base.schema.json" },
+    {
+      "type": "object",
+      "properties": {
+        "ip": {
+          "type": "string",
+          "description": "IP address of the device on the local network"
+        },
+        "rssi": {
+          "type": "integer",
+          "description": "Received Signal Strength Indicator in dBm"
+        },
+        "uptime": {
+          "type": "integer",
+          "description": "Device uptime in seconds"
+        },
+        "free_mem": {
+          "type": "integer",
+          "description": "Free memory in bytes"
+        },
+        "ssid": {
+          "type": "string",
+          "description": "Connected WiFi SSID"
+        }
+      },
+      "required": [
+        "ip",
+        "rssi"
+      ]
     }
-  },
-  "required": [
-    "device_id",
-    "device_class",
-    "fw_version",
-    "ip",
-    "rssi",
-    "time_ms",
-    "time_iso",
-    "time_valid"
   ]
 }

@@ -1,111 +1,87 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Canonical Sensor Message",
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "device_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Unique identifier for the device"
-    },
-    "room": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Room where the device is located"
-    },
-    "device_class": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Device class or model"
-    },
-    "fw_version": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Firmware version running on the device"
-    },
-    "time_ms": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Timestamp in milliseconds"
-    },
-    "time_iso": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Timestamp in ISO 8601 format"
-    },
-    "time_valid": {
-      "type": "boolean",
-      "description": "Indicates if the timestamp is valid and synchronized with real time"
-    },
-    "data": {
+  "allOf": [
+    { "$ref": "https://smarthome-ingest/base.schema.json" },
+    {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "temp_c": {
-          "type": "number",
-          "description": "Temperature in Celsius"
-        },
-        "rel_hum_perc": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "maximum": 100,
-          "description": "Relative humidity in percent"
-        },
-        "pressure_hpa": {
-          "type": "number",
-          "description": "Atmospheric pressure in hPa"
-        },
-        "gas_ohm": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Gas resistance in Ohms"
-        },
-        "iaq_score": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 100,
-          "description": "Indoor air quality score after transform"
-        },
-        "iaq_text": {
+        "device_id": {},
+        "device_class": {},
+        "fw_version": {},
+        "time_ms": {},
+        "time_iso": {},
+        "time_valid": {},
+        "room": {
           "type": "string",
           "minLength": 1,
-          "description": "Human-readable air quality classification"
+          "description": "Room where the device is located"
         },
-        "dew_point_c": {
-          "type": "number",
-          "description": "Calculated dew point in Celsius"
-        },
-        "heat_index_c": {
-          "type": "number",
-          "description": "Calculated heat index in Celsius"
-        },
-        "altitude_m": {
-          "type": "number",
-          "description": "Approximate altitude in meters"
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "temp_c": {
+              "type": "number",
+              "description": "Temperature in Celsius"
+            },
+            "rel_hum_perc": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "description": "Relative humidity in percent"
+            },
+            "pressure_hpa": {
+              "type": "number",
+              "description": "Atmospheric pressure in hPa"
+            },
+            "gas_ohm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Gas resistance in Ohms"
+            },
+            "iaq_score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100,
+              "description": "Indoor air quality score after transform"
+            },
+            "iaq_text": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Human-readable air quality classification"
+            },
+            "dew_point_c": {
+              "type": "number",
+              "description": "Calculated dew point in Celsius"
+            },
+            "heat_index_c": {
+              "type": "number",
+              "description": "Calculated heat index in Celsius"
+            },
+            "altitude_m": {
+              "type": "number",
+              "description": "Approximate altitude in meters"
+            }
+          },
+          "required": [
+            "temp_c",
+            "rel_hum_perc",
+            "pressure_hpa",
+            "gas_ohm",
+            "iaq_score",
+            "iaq_text",
+            "dew_point_c",
+            "heat_index_c",
+            "altitude_m"
+          ]
         }
       },
       "required": [
-        "temp_c",
-        "rel_hum_perc",
-        "pressure_hpa",
-        "gas_ohm",
-        "iaq_score",
-        "iaq_text",
-        "dew_point_c",
-        "heat_index_c",
-        "altitude_m"
+        "room",
+        "data"
       ]
     }
-  },
-  "required": [
-    "device_id",
-    "room",
-    "device_class",
-    "fw_version",
-    "time_ms",
-    "time_iso",
-    "time_valid",
-    "data"
   ]
 }
