@@ -1,72 +1,51 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Canonical Status Message",
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "device_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Unique identifier for the device"
+  "allOf": [
+    {
+      "$ref": "https://smarthome-ingest/base.schema.json"
     },
-    "device_class": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Device class or model"
-    },
-    "fw_version": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Firmware version running on the device"
-    },
-    "ip": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Current IP address of the device"
-    },
-    "rssi": {
-      "type": "integer",
-      "description": "WiFi RSSI in dBm"
-    },
-    "time_ms": {
-      "type": "integer",
-      "description": "Timestamp in milliseconds"
-    },
-    "time_iso": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Timestamp in ISO 8601 format"
-    },
-    "time_valid": {
-      "type": "boolean",
-      "description": "Indicates if the timestamp is valid and synchronized with real time"
-    },
-    "uptime": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Device uptime in seconds or milliseconds, depending on your convention"
-    },
-    "free_mem": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Free memory on the device"
-    },
-    "ssid": {
-      "type": "string",
-      "description": "Connected WiFi SSID"
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {},
+        "device_class": {},
+        "fw_version": {},
+        "time_ms": {},
+        "time_iso": {},
+        "time_valid": {},
+        "ip": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Current IP address of the device"
+        },
+        "rssi": {
+          "type": "integer",
+          "description": "WiFi RSSI in dBm"
+        },
+        "uptime": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Device uptime in seconds or milliseconds, depending on your convention"
+        },
+        "free_mem": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Free memory on the device"
+        },
+        "ssid": {
+          "type": "string",
+          "description": "Connected WiFi SSID"
+        }
+      },
+      "required": [
+        "ip",
+        "rssi",
+        "uptime",
+        "free_mem",
+        "ssid"
+      ]
     }
-  },
-  "required": [
-    "device_id",
-    "device_class",
-    "fw_version",
-    "ip",
-    "rssi",
-    "time_ms",
-    "time_iso",
-    "time_valid",
-    "uptime",
-    "free_mem",
-    "ssid"
   ]
 }
