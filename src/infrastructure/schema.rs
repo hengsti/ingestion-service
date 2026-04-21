@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
-use jsonschema::Validator as JsonSchemaValidator;
+use jsonschema::{Resource, Validator as JsonSchemaValidator};
 use serde_json::Value;
+
+const BASE_SCHEMA: &str = include_str!("../../schema/base.schema.json");
 
 /// Shared JSON-Schema wrapper
 pub struct JsonSchema {
@@ -9,12 +11,19 @@ pub struct JsonSchema {
 
 impl JsonSchema {
     pub fn new(schema: &str) -> Result<Self> {
+        let base_json: Value =
+            serde_json::from_str(BASE_SCHEMA).context("Failed to parse embedded base schema")?;
+
         let schema_json: Value =
             serde_json::from_str(schema).context("Failed to parse embedded JSON schema")?;
 
-        let compiled = jsonschema::draft7::options()
+        let compiled = jsonschema::options()
+            .with_resource(
+                "https://smarthome-ingest/base.schema.json",
+                Resource::from_contents(base_json),
+            )
             .build(&schema_json)
-            .context("Failed to compile JSON schema (draft7)")?;
+            .context("Failed to compile JSON schema")?;
 
         Ok(Self { schema: compiled })
     }
