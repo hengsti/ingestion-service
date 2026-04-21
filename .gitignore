@@ -1,13 +1,7 @@
 /target
 *.zip
 /.idea
-<<<<<<< HEAD
-plan.md
-TODO.md
-.github/
-=======
 /.github/*.md
 /.github/*.json
 plan.md
 TODO.md
->>>>>>> cd74fb03a64ed42a66e3c42c12b932d9429dfb52
