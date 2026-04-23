@@ -33,9 +33,6 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-const EVENT_QUEUE_CAPACITY: usize = 16_384;
-const INFLUX_QUEUE_CAPACITY: usize = 10_000;
-
 #[derive(Debug)]
 struct IngestJob {
     topic: String,
@@ -119,7 +116,7 @@ async fn main() -> Result<()> {
     // ------------------------------------------------------------
     // Influx batcher
     // ------------------------------------------------------------
-    let (influx_tx, influx_rx) = mpsc::channel::<String>(INFLUX_QUEUE_CAPACITY);
+    let (influx_tx, influx_rx) = mpsc::channel::<String>(cfg.influx_queue_capacity);
 
     let influx = InfluxWriter::new(
         &cfg.influx_url,
@@ -164,7 +161,7 @@ async fn main() -> Result<()> {
     // Worker queue — one channel per worker, round-robin dispatch
     // ------------------------------------------------------------
     let worker_total = worker_count();
-    let per_worker_cap = EVENT_QUEUE_CAPACITY / worker_total;
+    let per_worker_cap = cfg.input_queue_capacity / worker_total;
     info!(workers = worker_total, "starting pipeline workers");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
