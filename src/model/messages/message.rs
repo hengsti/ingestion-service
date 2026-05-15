@@ -9,7 +9,7 @@ pub enum MessageType {
     Status,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HandledMessage {
     Sensor(SensorMessage),
     Status(StatusMessage),
