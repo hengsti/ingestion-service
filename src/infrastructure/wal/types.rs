@@ -9,6 +9,24 @@ pub struct WalOffset {
     pub byte_offset: u64,
 }
 
+impl WalOffset {
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&self.segment_id.to_be_bytes());
+        buf[8..].copy_from_slice(&self.byte_offset.to_be_bytes());
+        buf
+    }
+
+    pub fn from_bytes(buf: [u8; 16]) -> Self {
+        let segment_id = u64::from_be_bytes(buf[..8].try_into().unwrap());
+        let byte_offset = u64::from_be_bytes(buf[8..].try_into().unwrap());
+        WalOffset {
+            segment_id,
+            byte_offset,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalEvent {
     pub topic: String,
