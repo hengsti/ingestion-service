@@ -17,9 +17,6 @@ use crate::infrastructure::wal::{
     writer::AtomicWalOffset,
 };
 
-
-
-
 pub struct WalSubscription {
     dir: PathBuf,
     head: Arc<AtomicWalOffset>,
@@ -30,7 +27,12 @@ pub struct WalSubscription {
 }
 
 impl WalSubscription {
-    pub(super) fn new(dir: PathBuf, head: Arc<AtomicWalOffset>, notify: Arc<Notify>, start: WalOffset) -> Self {
+    pub(super) fn new(
+        dir: PathBuf,
+        head: Arc<AtomicWalOffset>,
+        notify: Arc<Notify>,
+        start: WalOffset,
+    ) -> Self {
         Self {
             dir,
             head,
@@ -146,7 +148,6 @@ impl WalSubscription {
             }
         }
     }
-
 
     /// Marks `up_to` as durably processed by the downstream sink.
     ///

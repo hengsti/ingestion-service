@@ -36,7 +36,7 @@ pub struct WalEvent {
 
 #[derive(Debug, Clone)]
 pub struct WalEntry {
-    pub offset: WalOffset, // offset of "this" record's start
+    pub offset: WalOffset,       // offset of "this" record's start
     pub offset_after: WalOffset, // offset of "next" record's start (i.e. this record's end)
     pub event: WalEvent,
 }
