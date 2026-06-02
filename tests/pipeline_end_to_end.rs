@@ -1,9 +1,8 @@
 mod common;
 
-use rumqttc::{AsyncClient, MqttOptions};
-
 use smarthome_ingest::{
     infrastructure::cache::state::CacheState,
+    model::messages::message::HandledMessage,
     pipeline::{
         context::PipelineContext,
         runner::PipelineRunner,
@@ -22,7 +21,7 @@ const STATUS_SCHEMA: &str = include_str!("../schema/status.schema.json");
 
 #[tokio::test]
 async fn valid_sensor_message_processes_end_to_end() {
-    let (pipeline, mut influx_rx, cache) = common::build_pipeline();
+    let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;
     let mut ctx = PipelineContext::new(
         "smarthome/esp32-1/sensor",
         common::valid_sensor_payload("esp32-1"),
@@ -37,12 +36,14 @@ async fn valid_sensor_message_processes_end_to_end() {
     );
     assert!(ctx.ignored_reason().is_none(), "expected not ignored");
 
-    let line = influx_rx
-        .try_recv()
-        .expect("expected a line in the influx channel");
+    let event = common::recv_event(&mut sub, 500)
+        .await
+        .expect("expected a sensor event in the WAL");
+    assert_eq!(event.topic, "smarthome/esp32-1/sensor");
     assert!(
-        line.starts_with("bme680"),
-        "expected measurement 'bme680', got: {line}"
+        matches!(event.message, HandledMessage::Sensor(_)),
+        "expected a sensor message, got: {:?}",
+        event.message
     );
 
     assert!(
@@ -53,7 +54,7 @@ async fn valid_sensor_message_processes_end_to_end() {
 
 #[tokio::test]
 async fn valid_status_message_processes_end_to_end() {
-    let (pipeline, mut influx_rx, _cache) = common::build_pipeline();
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
     let mut ctx = PipelineContext::new(
         "smarthome/esp32-1/status",
         common::valid_status_payload("esp32-1"),
@@ -67,12 +68,13 @@ async fn valid_status_message_processes_end_to_end() {
         ctx.dlq_reason()
     );
 
-    let line = influx_rx
-        .try_recv()
-        .expect("expected a line in the influx channel");
+    let event = common::recv_event(&mut sub, 500)
+        .await
+        .expect("expected a status event in the WAL");
     assert!(
-        line.starts_with("device_status"),
-        "expected measurement 'device_status', got: {line}"
+        matches!(event.message, HandledMessage::Status(_)),
+        "expected a status message, got: {:?}",
+        event.message
     );
 }
 
@@ -80,7 +82,7 @@ async fn valid_status_message_processes_end_to_end() {
 
 #[tokio::test]
 async fn schema_invalid_payload_goes_to_dlq() {
-    let (pipeline, mut influx_rx, _cache) = common::build_pipeline();
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
     // Valid envelope but missing required `data` field → raw schema validation fails.
     let payload = serde_json::json!({
         "device_id": "esp32-1",
@@ -102,14 +104,14 @@ async fn schema_invalid_payload_goes_to_dlq() {
         "expected DLQ for schema-invalid payload"
     );
     assert!(
-        influx_rx.try_recv().is_err(),
-        "influx channel must be empty when pipeline fails"
+        common::recv_event(&mut sub, 150).await.is_none(),
+        "WAL must be empty when pipeline fails"
     );
 }
 
 #[tokio::test]
 async fn transform_failure_goes_to_dlq() {
-    let (pipeline, mut influx_rx, _cache) = common::build_pipeline();
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
     // rel_hum_perc: 0 violates the transform stage's (0, 100] bounds check.
     let payload = serde_json::json!({
         "device_id": "esp32-1",
@@ -138,14 +140,14 @@ async fn transform_failure_goes_to_dlq() {
         "expected DLQ when transform bounds check fails"
     );
     assert!(
-        influx_rx.try_recv().is_err(),
-        "influx channel must be empty when pipeline fails"
+        common::recv_event(&mut sub, 150).await.is_none(),
+        "WAL must be empty when pipeline fails"
     );
 }
 
 #[tokio::test]
 async fn oversized_payload_goes_to_dlq() {
-    let (pipeline, mut influx_rx, _cache) = common::build_pipeline();
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
     let payload = vec![b'x'; 64 * 1024 + 1];
     let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", payload);
 
@@ -161,8 +163,8 @@ async fn oversized_payload_goes_to_dlq() {
         ctx.dlq_reason()
     );
     assert!(
-        influx_rx.try_recv().is_err(),
-        "influx channel must be empty when pipeline fails"
+        common::recv_event(&mut sub, 150).await.is_none(),
+        "WAL must be empty when pipeline fails"
     );
 }
 
@@ -170,7 +172,7 @@ async fn oversized_payload_goes_to_dlq() {
 
 #[tokio::test]
 async fn unknown_topic_strict_mode_goes_to_dlq() {
-    let (pipeline, mut influx_rx, _cache) = common::build_pipeline();
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
     let mut ctx = PipelineContext::new(
         "smarthome/unknown/foo",
         common::valid_sensor_payload("unknown"),
@@ -183,8 +185,8 @@ async fn unknown_topic_strict_mode_goes_to_dlq() {
         "expected DLQ for unknown topic in strict mode"
     );
     assert!(
-        influx_rx.try_recv().is_err(),
-        "influx channel must be empty"
+        common::recv_event(&mut sub, 150).await.is_none(),
+        "WAL must be empty"
     );
 }
 
@@ -192,9 +194,7 @@ async fn unknown_topic_strict_mode_goes_to_dlq() {
 async fn unknown_topic_non_strict_mode_is_ignored() {
     let router = common::build_non_strict_router();
     let cache = CacheState::new(60_000, 64);
-    let (influx_tx, mut influx_rx) = tokio::sync::mpsc::channel::<String>(1_000);
-    let opts = MqttOptions::new("test-non-strict", "localhost", 1883);
-    let (mqtt_client, _ev) = AsyncClient::new(opts, 10);
+    let (wal, mut sub, _tmp) = common::open_temp_wal().await;
     let non_strict_router_clone = router.clone();
 
     let pipeline = PipelineRunner::new()
@@ -203,9 +203,12 @@ async fn unknown_topic_non_strict_mode_is_ignored() {
         .add_stage(TransformStage::new(non_strict_router_clone))
         .add_stage(ValidateBusinessStage::new().unwrap())
         .add_stage(CacheUpdateStage::new(cache))
-        .add_stage(PersistStage::new(influx_tx))
+        .add_stage(PersistStage::new(wal))
         .add_stage(ObserveStage::new())
-        .with_failure_stage(DlqPublishStage::new(mqtt_client, "smarthome/_dlq/ingest"));
+        .with_failure_stage(DlqPublishStage::new(
+            common::dlq_client(),
+            "smarthome/_dlq/ingest",
+        ));
 
     let mut ctx = PipelineContext::new(
         "smarthome/unknown/foo",
@@ -223,8 +226,8 @@ async fn unknown_topic_non_strict_mode_is_ignored() {
         "expected no DLQ in non-strict mode"
     );
     assert!(
-        influx_rx.try_recv().is_err(),
-        "influx channel must be empty for ignored message"
+        common::recv_event(&mut sub, 150).await.is_none(),
+        "WAL must be empty for ignored message"
     );
 }
 

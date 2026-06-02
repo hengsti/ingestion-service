@@ -1,13 +1,17 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{extract::State, routing::post, Router};
 use bytes::Bytes;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 
-use smarthome_ingest::infrastructure::database::influx::InfluxWriter;
+use smarthome_ingest::infrastructure::sink::{influx::InfluxSink, Sink};
+use smarthome_ingest::infrastructure::wal::forwarder::run_forwarder;
+use smarthome_ingest::infrastructure::wal::types::WalEvent;
+use smarthome_ingest::model::messages::message::HandledMessage;
+use smarthome_ingest::model::messages::status::StatusMessage;
 
 // ── mock InfluxDB server ──────────────────────────────────────────────────────
 
@@ -43,125 +47,122 @@ async fn spawn_mock_influx() -> (String, Arc<Mutex<Vec<String>>>) {
     (format!("http://127.0.0.1:{}", addr.port()), received)
 }
 
-fn make_influx(url: &str) -> InfluxWriter {
-    InfluxWriter::new(url, "test_org", "test_bucket", "test_token").unwrap()
+fn make_sink(url: &str) -> Arc<dyn Sink> {
+    Arc::new(InfluxSink::new(url, "test_org", "test_bucket", "test_token").unwrap())
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn size_trigger_flushes_when_batch_is_full() {
-    let (url, received) = spawn_mock_influx().await;
-    let influx = make_influx(&url);
-    let (tx, rx) = mpsc::channel::<String>(100);
-
-    let batch_size = 3;
-    let handle = tokio::spawn(async move {
-        influx.run_batcher(rx, batch_size, 10_000).await.unwrap();
-    });
-
-    // Send exactly batch_size lines; the size trigger fires on the third send.
-    tx.send("line1".to_string()).await.unwrap();
-    tx.send("line2".to_string()).await.unwrap();
-    tx.send("line3".to_string()).await.unwrap();
-
-    // Give the async flush time to complete the HTTP round-trip to the mock.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let (len, body) = {
-        let posts = received.lock().unwrap();
-        (posts.len(), posts.first().cloned().unwrap_or_default())
-    };
-    assert_eq!(len, 1, "expected exactly 1 POST for a full batch");
-    assert!(body.contains("line1"), "batch should contain line1");
-    assert!(body.contains("line3"), "batch should contain line3");
-
-    drop(tx);
-    handle.await.unwrap();
+fn status_event(device_id: &str) -> WalEvent {
+    WalEvent {
+        topic: format!("smarthome/{device_id}/status"),
+        ts_ms: 1_700_000_000_000,
+        message: HandledMessage::Status(StatusMessage {
+            device_id: device_id.to_string(),
+            device_class: "esp32p4-bme680".to_string(),
+            fw_version: "1.0.0".to_string(),
+            ip: "192.168.1.42".to_string(),
+            rssi: -65,
+            time_ms: 1_700_000_000_000,
+            time_iso: "2023-11-14T22:13:20Z".to_string(),
+            time_valid: true,
+            uptime: 3600,
+            free_mem: 200_000,
+            ssid: "HomeNet".to_string(),
+        }),
+    }
 }
 
-#[tokio::test]
-async fn time_trigger_flushes_before_batch_is_full() {
-    let (url, received) = spawn_mock_influx().await;
-    let influx = make_influx(&url);
-    let (tx, rx) = mpsc::channel::<String>(100);
-
-    // Large batch_size so size trigger never fires; short interval for speed.
-    let flush_interval_ms = 50;
-    let handle = tokio::spawn(async move {
-        influx
-            .run_batcher(rx, 1_000, flush_interval_ms)
-            .await
-            .unwrap();
-    });
-
-    // Let the first (immediate) tick fire on an empty buffer.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    tx.send("only_line".to_string()).await.unwrap();
-
-    // Wait for more than one flush interval so the time trigger fires.
-    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-
-    let (len, body) = {
-        let posts = received.lock().unwrap();
-        (posts.len(), posts.first().cloned().unwrap_or_default())
-    };
-    assert_eq!(len, 1, "expected exactly 1 POST from the time trigger");
-    assert!(body.contains("only_line"));
-
-    drop(tx);
-    handle.await.unwrap();
+fn post_count(received: &Arc<Mutex<Vec<String>>>) -> usize {
+    received.lock().unwrap().len()
 }
 
+// ── direct sink tests ─────────────────────────────────────────────────────────
+
 #[tokio::test]
-async fn channel_close_triggers_final_flush() {
+async fn sink_write_posts_line_protocol_body() {
     let (url, received) = spawn_mock_influx().await;
-    let influx = make_influx(&url);
-    let (tx, rx) = mpsc::channel::<String>(100);
+    let sink = make_sink(&url);
 
-    // batch_size=3 so the two lines won't trigger a size flush.
-    let handle = tokio::spawn(async move {
-        influx.run_batcher(rx, 3, 10_000).await.unwrap();
-    });
-
-    tx.send("line_a".to_string()).await.unwrap();
-    tx.send("line_b".to_string()).await.unwrap();
-
-    // Dropping the sender signals the batcher to do a final flush and exit.
-    drop(tx);
-
-    // Await the batcher task — it returns only after the final flush completes.
-    handle.await.unwrap();
+    sink.write(&[status_event("dev-a"), status_event("dev-b")])
+        .await
+        .unwrap();
 
     let posts = received.lock().unwrap();
-    assert_eq!(posts.len(), 1, "expected 1 POST for the final flush");
+    assert_eq!(posts.len(), 1, "expected exactly 1 POST for one write");
     let body = &posts[0];
-    assert!(body.contains("line_a"));
-    assert!(body.contains("line_b"));
+    assert!(body.contains("device_status"), "body: {body}");
+    assert!(
+        body.contains("dev-a") && body.contains("dev-b"),
+        "body: {body}"
+    );
+    assert_eq!(body.lines().count(), 2, "one line per event");
 }
 
 #[tokio::test]
-async fn empty_buffer_does_not_flush() {
+async fn sink_write_empty_batch_makes_no_request() {
     let (url, received) = spawn_mock_influx().await;
-    let influx = make_influx(&url);
-    let (tx, rx) = mpsc::channel::<String>(100);
+    let sink = make_sink(&url);
 
-    let flush_interval_ms = 50;
-    let handle = tokio::spawn(async move {
-        influx.run_batcher(rx, 3, flush_interval_ms).await.unwrap();
-    });
+    sink.write(&[]).await.unwrap();
 
-    // Wait for several flush intervals without sending anything.
-    tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+    assert_eq!(post_count(&received), 0, "empty batch must not POST");
+}
 
-    let posts = received.lock().unwrap().clone();
+// ── forwarder + WAL integration tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn forwarder_size_trigger_flushes_full_batch() {
+    let (url, received) = spawn_mock_influx().await;
+    let sink = make_sink(&url);
+    let (wal, sub, _tmp) = common::open_temp_wal().await;
+
+    // batch_size = 3, long flush interval so only the size trigger can fire.
+    tokio::spawn(run_forwarder(sub, sink, 3, 10_000));
+
+    for i in 0..3 {
+        wal.try_append(status_event(&format!("dev-{i}"))).unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let posts = received.lock().unwrap();
+    assert_eq!(posts.len(), 1, "size trigger should produce 1 POST");
+    assert_eq!(posts[0].lines().count(), 3, "batch should hold 3 lines");
+}
+
+#[tokio::test]
+async fn forwarder_time_trigger_flushes_partial_batch() {
+    let (url, received) = spawn_mock_influx().await;
+    let sink = make_sink(&url);
+    let (wal, sub, _tmp) = common::open_temp_wal().await;
+
+    // Large batch_size so only the time trigger can fire; short interval.
+    tokio::spawn(run_forwarder(sub, sink, 1_000, 50));
+
+    wal.try_append(status_event("only")).unwrap();
+
+    // Wait for more than one flush interval so the time trigger fires.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let posts = received.lock().unwrap();
+    assert_eq!(posts.len(), 1, "time trigger should produce 1 POST");
+    assert!(posts[0].contains("only"), "body: {}", posts[0]);
+}
+
+#[tokio::test]
+async fn forwarder_empty_wal_does_not_flush() {
+    let (url, received) = spawn_mock_influx().await;
+    let sink = make_sink(&url);
+    let (_wal, sub, _tmp) = common::open_temp_wal().await;
+
+    // Short interval, but nothing is ever appended.
+    tokio::spawn(run_forwarder(sub, sink, 3, 50));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     assert_eq!(
-        posts.len(),
+        post_count(&received),
         0,
-        "no POST expected when buffer is always empty"
+        "no POST expected when the WAL stays empty"
     );
-
-    drop(tx);
-    handle.await.unwrap();
 }

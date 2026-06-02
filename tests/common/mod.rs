@@ -1,14 +1,20 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rumqttc::{AsyncClient, MqttOptions};
-use tokio::sync::mpsc;
+use tempfile::TempDir;
 
 use smarthome_ingest::{
     infrastructure::{
         cache::state::CacheState,
         router::{Route, Router},
+        wal::{
+            subscription::WalSubscription,
+            types::{WalEvent, WalOptions},
+            wal::Wal,
+        },
     },
     model::messages::message::MessageType,
     pipeline::{
@@ -49,10 +55,30 @@ pub fn dlq_client() -> AsyncClient {
     client
 }
 
-pub fn build_pipeline() -> (PipelineRunner, mpsc::Receiver<String>, CacheState) {
+/// Opens a fresh WAL backed by a temporary directory.
+///
+/// The returned `TempDir` must be kept alive for the lifetime of the test —
+/// dropping it deletes the WAL segments on disk.
+pub async fn open_temp_wal() -> (Arc<Wal>, WalSubscription, TempDir) {
+    let tmp = tempfile::tempdir().expect("create temp WAL dir");
+    let (wal, sub) = Wal::open(WalOptions {
+        dir: tmp.path().to_path_buf(),
+        segment_bytes: 1024 * 1024,
+        queue_capacity: 1_000,
+    })
+    .await
+    .expect("open WAL");
+    (Arc::new(wal), sub, tmp)
+}
+
+/// Builds the full ingest pipeline persisting to a temporary WAL.
+///
+/// Returns the runner, the WAL subscription (to assert on persisted events),
+/// the cache state, and the backing `TempDir` (keep alive for the test).
+pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
     let router = build_router();
     let cache = CacheState::new(60_000, 64);
-    let (influx_tx, influx_rx) = mpsc::channel::<String>(1_000);
+    let (wal, sub, tmp) = open_temp_wal().await;
 
     let pipeline = PipelineRunner::new()
         .add_stage(DecodeStage::new())
@@ -60,11 +86,21 @@ pub fn build_pipeline() -> (PipelineRunner, mpsc::Receiver<String>, CacheState) 
         .add_stage(TransformStage::new(router.clone()))
         .add_stage(ValidateBusinessStage::new().unwrap())
         .add_stage(CacheUpdateStage::new(cache.clone()))
-        .add_stage(PersistStage::new(influx_tx))
+        .add_stage(PersistStage::new(wal))
         .add_stage(ObserveStage::new())
         .with_failure_stage(DlqPublishStage::new(dlq_client(), "smarthome/_dlq/ingest"));
 
-    (pipeline, influx_rx, cache)
+    (pipeline, sub, cache, tmp)
+}
+
+/// Pulls the next persisted event from the WAL, returning `None` if none
+/// arrives within `ms` milliseconds (used to assert "nothing was persisted").
+pub async fn recv_event(sub: &mut WalSubscription, ms: u64) -> Option<WalEvent> {
+    tokio::time::timeout(Duration::from_millis(ms), sub.next())
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.event)
 }
 
 pub fn valid_sensor_payload(device_id: &str) -> Vec<u8> {
