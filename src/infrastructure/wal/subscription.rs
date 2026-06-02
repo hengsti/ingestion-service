@@ -200,26 +200,33 @@ impl WalSubscription {
     }
 
     async fn wait_or_advance(&mut self) -> bool {
+        // Register interest *before* inspecting `head`/closure so a flush
+        // notification that races with these checks can't be lost.
         let notified = self.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
 
         let head = self.head.load();
 
+        // The writer rotated into a newer segment: the current one is fully
+        // written and flushed, so move on and read the next segment.
         if head.segment_id > self.cur_segment_id {
             self.cur_segment_id += 1;
             self.cur_byte_offset = 0;
             return true;
         }
 
-        if head.segment_id == self.cur_segment_id && head.byte_offset > self.cur_byte_offset {
-            return true;
-        }
-
+        // Writer is gone and there is nothing newer to read: terminate. The
+        // `enable()` above guarantees the writer's shutdown `notify_waiters`
+        // is observed even if it races with this check.
         if Arc::strong_count(&self.notify) == 1 {
             return false;
         }
 
+        // Otherwise wait for the writer to flush more durable bytes (or a torn
+        // tail stays unread until overwritten). We intentionally do *not* spin
+        // on `head.byte_offset > cur_byte_offset`: those bytes may be buffered
+        // or torn, in which case a reopen would read EOF and loop forever.
         notified.await;
         true
     }
