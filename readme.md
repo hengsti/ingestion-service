@@ -67,6 +67,14 @@ All config via environment variables.
 | `BATCH_SIZE` | `500` | Max points per write |
 | `FLUSH_INTERVAL_MS` | `1000` | Max ms before flush |
 
+### Write-Ahead Log
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `WAL_DIR` | — | **Required.** Directory for WAL segment files + commit cursor |
+| `WAL_SEGMENT_BYTES` | `67108864` | Segment rotation threshold (64 MiB) |
+| `WAL_QUEUE_CAPACITY` | `16384` | Bounded queue into the WAL writer task |
+
 ### Service
 
 | Variable | Default | Notes |
