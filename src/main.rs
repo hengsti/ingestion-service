@@ -12,9 +12,13 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
-use infrastructure::database::influx::InfluxWriter;
 use infrastructure::prometheus::MetricsServer;
 use infrastructure::router::{Route, Router};
+use infrastructure::sink::influx::InfluxSink;
+use infrastructure::sink::Sink;
+use infrastructure::wal::forwarder::run_forwarder;
+use infrastructure::wal::types::WalOptions;
+use infrastructure::wal::wal::Wal;
 use model::messages::message::MessageType;
 use pipeline::{
     context::PipelineContext,
@@ -114,26 +118,29 @@ async fn main() -> Result<()> {
     }
 
     // ------------------------------------------------------------
-    // Influx batcher
+    // WAL + InfluxDB sink + forwarder
     // ------------------------------------------------------------
-    let (influx_tx, influx_rx) = mpsc::channel::<String>(cfg.influx_queue_capacity);
+    let (wal, wal_sub) = Wal::open(WalOptions {
+        dir: cfg.wal_dir.clone(),
+        segment_bytes: cfg.wal_segment_bytes,
+        queue_capacity: cfg.wal_queue_capacity,
+    })
+    .await?;
+    let wal = Arc::new(wal);
 
-    let influx = InfluxWriter::new(
+    let sink: Arc<dyn Sink> = Arc::new(InfluxSink::new(
         &cfg.influx_url,
         &cfg.influx_org,
         &cfg.influx_bucket,
         cfg.influx_token.expose_secret(),
-    )?;
+    )?);
 
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
 
-    let _influx_task = tokio::spawn(async move {
-        if let Err(err) = influx
-            .run_batcher(influx_rx, batch_size, flush_interval_ms)
-            .await
-        {
-            error!(error = %err, "influx batcher failed");
+    let _forwarder_task = tokio::spawn(async move {
+        if let Err(err) = run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await {
+            error!(error = %err, "wal forwarder failed");
         }
     });
 
@@ -150,7 +157,7 @@ async fn main() -> Result<()> {
             .add_stage(TransformStage::new(router.clone()))
             .add_stage(ValidateBusinessStage::new()?)
             .add_stage(CacheUpdateStage::new(app_state.clone()))
-            .add_stage(PersistStage::new(influx_tx.clone()))
+            .add_stage(PersistStage::new(wal.clone()))
             .add_stage(ObserveStage::new())
             .with_failure_stage(DlqPublishStage::new(mqtt_client.clone(), dlq_topic.clone())),
     );
