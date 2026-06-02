@@ -121,6 +121,8 @@ async fn writer_loop(
                 let Some(ev) = maybe_ev else {
                     if let Err(e) = writer.flush() {
                         warn!(error = %e, "WAL writer: final flush failed on shutdown");
+                    } else {
+                        head.store(WalOffset { segment_id: current_segment_id, byte_offset: current_byte_offset });
                     }
                     notify.notify_waiters();
                     return;
@@ -160,8 +162,10 @@ async fn writer_loop(
                 }
                 current_byte_offset += record_len;
 
-                head.store(WalOffset { segment_id: current_segment_id, byte_offset: current_byte_offset });
-                notify.notify_waiters();
+                // `head` (and the reader wake-up) is advanced only after a flush
+                // makes the bytes durable on disk — see the flush_tick branch.
+                // Advancing it here would expose buffered-but-unflushed bytes to
+                // the reader, which reads from disk and would busy-spin at EOF.
             }
 
             _ = flush_tick.tick() => {
@@ -170,6 +174,7 @@ async fn writer_loop(
                     continue;
                 }
 
+                head.store(WalOffset { segment_id: current_segment_id, byte_offset: current_byte_offset });
                 notify.notify_waiters();
             }
         }

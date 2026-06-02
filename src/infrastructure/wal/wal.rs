@@ -58,10 +58,245 @@ impl Wal {
         Ok((Self { tx: handle.tx }, subscription))
     }
 
+    // `TryAppendError` carries the rejected `WalEvent` (mirrors `TrySendError`) so
+    // callers can recover the payload; the error path is cold (queue saturated),
+    // so the large-Err size is acceptable over boxing on the hot append path.
+    #[allow(clippy::result_large_err)]
     pub fn try_append(&self, event: WalEvent) -> Result<(), TryAppendError> {
         self.tx.try_send(event).map_err(|err| match err {
             TrySendError::Full(ev) => TryAppendError::Full(ev),
             TrySendError::Closed(ev) => TryAppendError::Closed(ev),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::wal::{
+        segment::list_segments,
+        types::{WalEntry, WalEvent, WalOptions},
+    };
+    use crate::model::messages::message::HandledMessage;
+    use crate::model::messages::status::StatusMessage;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn sample_event(seq: u64) -> WalEvent {
+        WalEvent {
+            topic: format!("smarthome/dev-{seq}/status"),
+            ts_ms: 1_700_000_000_000 + seq as i64,
+            message: HandledMessage::Status(StatusMessage {
+                device_id: format!("dev-{seq}"),
+                device_class: String::from("test"),
+                fw_version: String::from("1.0.0"),
+                ip: String::from("10.0.0.1"),
+                rssi: -50,
+                time_ms: 0,
+                time_iso: String::from("2024-01-01T00:00:00Z"),
+                time_valid: true,
+                uptime: 1,
+                free_mem: 1,
+                ssid: String::from("ssid"),
+            }),
+        }
+    }
+
+    fn opts(dir: &std::path::Path, segment_bytes: u64, queue_capacity: usize) -> WalOptions {
+        WalOptions {
+            dir: dir.to_path_buf(),
+            segment_bytes,
+            queue_capacity,
+        }
+    }
+
+    async fn recv_one(sub: &mut WalSubscription, ms: u64) -> Option<WalEntry> {
+        tokio::time::timeout(Duration::from_millis(ms), sub.next())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn append_then_next_round_trips_a_single_event() {
+        let dir = tempdir().unwrap();
+        let (wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
+
+        let ev = sample_event(1);
+        wal.try_append(ev.clone()).unwrap();
+
+        let got = recv_one(&mut sub, 500).await.expect("event should arrive");
+        assert_eq!(got.event.topic, ev.topic);
+        assert_eq!(got.event.ts_ms, ev.ts_ms);
+        assert_eq!(got.offset.segment_id, 1);
+        assert_eq!(got.offset.byte_offset, 0);
+        assert!(got.offset_after.byte_offset > 0);
+    }
+
+    #[tokio::test]
+    async fn reopen_without_commit_replays_all_records_with_monotonic_offsets() {
+        let dir = tempdir().unwrap();
+
+        {
+            let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 256)).await.unwrap();
+            for i in 0..100 {
+                wal.try_append(sample_event(i)).unwrap();
+                // Yield so the writer task can drain the bounded queue.
+                tokio::task::yield_now().await;
+            }
+            drop(wal);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let (_wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 256)).await.unwrap();
+        let mut prev: Option<WalOffset> = None;
+        for i in 0..100 {
+            let entry = recv_one(&mut sub, 500)
+                .await
+                .unwrap_or_else(|| panic!("missing record {i}"));
+            assert_eq!(entry.event.ts_ms, sample_event(i).ts_ms);
+            if let Some(p) = prev {
+                assert!(
+                    entry.offset > p,
+                    "offsets must be monotonic: prev={p:?}, curr={:?}",
+                    entry.offset
+                );
+            }
+            prev = Some(entry.offset);
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_halfway_resumes_subscription_at_committed_offset() {
+        let dir = tempdir().unwrap();
+
+        // Phase 1: append 10, consume 5, commit at the 5th's `offset_after`.
+        let resume_at = {
+            let (wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 32)).await.unwrap();
+            for i in 0..10 {
+                wal.try_append(sample_event(i)).unwrap();
+                tokio::task::yield_now().await;
+            }
+
+            let mut last_after = None;
+            for _ in 0..5 {
+                let entry = recv_one(&mut sub, 500).await.unwrap();
+                last_after = Some(entry.offset_after);
+            }
+            let cutoff = last_after.unwrap();
+            sub.commit(cutoff).await.unwrap();
+
+            drop(wal);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cutoff
+        };
+
+        // Phase 2: reopen — the remaining 5 events should be yielded.
+        let (_wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 32)).await.unwrap();
+        for i in 5..10 {
+            let entry = recv_one(&mut sub, 500)
+                .await
+                .unwrap_or_else(|| panic!("missing post-commit record {i}"));
+            assert_eq!(entry.event.ts_ms, sample_event(i).ts_ms);
+            assert!(entry.offset >= resume_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_rotation_produces_multiple_files_on_disk() {
+        let dir = tempdir().unwrap();
+
+        let (wal, _sub) = Wal::open(opts(dir.path(), 512, 64)).await.unwrap();
+        for i in 0..50 {
+            wal.try_append(sample_event(i)).unwrap();
+            tokio::task::yield_now().await;
+        }
+        drop(wal);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let segments = list_segments(dir.path()).unwrap();
+        assert!(
+            segments.len() >= 2,
+            "expected rotation to produce >=2 segments, got {segments:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_past_segment_boundary_deletes_older_segments() {
+        let dir = tempdir().unwrap();
+
+        // Force rotation with a tight segment_bytes.
+        let (wal, mut sub) = Wal::open(opts(dir.path(), 512, 64)).await.unwrap();
+        for i in 0..50 {
+            wal.try_append(sample_event(i)).unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        // Drain until we see an entry in segment >= 2, then commit to that offset.
+        let mut commit_at = None;
+        for _ in 0..50 {
+            let entry = recv_one(&mut sub, 500).await.unwrap();
+            if entry.offset.segment_id >= 2 {
+                commit_at = Some(entry.offset);
+                break;
+            }
+        }
+        let cutoff = commit_at.expect("never crossed into segment 2");
+        sub.commit(cutoff).await.unwrap();
+
+        let segments = list_segments(dir.path()).unwrap();
+        assert!(
+            segments.iter().all(|&id| id >= cutoff.segment_id),
+            "older segments should be deleted, got {segments:?}, cutoff segment {}",
+            cutoff.segment_id
+        );
+    }
+
+    #[tokio::test]
+    async fn torn_trailing_record_stops_replay_cleanly() {
+        let dir = tempdir().unwrap();
+
+        // Append one good record, then close the WAL.
+        {
+            let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
+            wal.try_append(sample_event(1)).unwrap();
+            tokio::task::yield_now().await;
+            drop(wal);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Manually corrupt the segment with a length prefix and no payload.
+        let path = dir.path().join("00000000000000000001.log");
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&999u32.to_le_bytes()).unwrap();
+        drop(f);
+
+        // Reopen: exactly the good record should be yielded; nothing more.
+        let (_wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
+        let good = recv_one(&mut sub, 500).await.expect("good record");
+        assert_eq!(good.event.ts_ms, sample_event(1).ts_ms);
+
+        // The torn tail must not produce more events; subscription should block.
+        let after = recv_one(&mut sub, 150).await;
+        assert!(after.is_none(), "replay should stop at torn tail");
+    }
+
+    #[tokio::test]
+    async fn try_append_returns_full_when_queue_is_saturated() {
+        let dir = tempdir().unwrap();
+        // queue_capacity = 1; we don't yield so the writer can't drain.
+        let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 1)).await.unwrap();
+
+        wal.try_append(sample_event(1)).unwrap();
+        // No .await between sends → writer task hasn't been polled yet.
+        let err = wal
+            .try_append(sample_event(2))
+            .expect_err("second send should hit Full");
+        match err {
+            TryAppendError::Full(ev) => assert_eq!(ev.ts_ms, sample_event(2).ts_ms),
+            TryAppendError::Closed(_) => panic!("expected Full, got Closed"),
+        }
     }
 }
