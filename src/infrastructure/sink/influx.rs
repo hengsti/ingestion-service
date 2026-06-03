@@ -5,12 +5,12 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use metrics::{counter, histogram};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 
 use crate::{
     infrastructure::{
         database::influx::{sensor_to_point, status_to_point},
-        sink::Sink,
+        sink::{Sink, SinkError},
         wal::types::WalEvent,
     },
     model::messages::message::HandledMessage,
@@ -67,7 +67,7 @@ impl Sink for InfluxSink {
     fn write<'a>(
         &'a self,
         batch: &'a [WalEvent],
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         Box::pin(async move {
             if batch.is_empty() {
                 return Ok(());
@@ -95,6 +95,7 @@ impl Sink for InfluxSink {
                     .await;
 
                 match send_result {
+                    // Network/timeout failures are always transient — retry.
                     Err(e) => {
                         last_err = anyhow::anyhow!("Influx write request failed: {}", e);
                         continue;
@@ -102,8 +103,17 @@ impl Sink for InfluxSink {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
                         let text = resp.text().await.unwrap_or_default();
-                        last_err =
+                        let err =
                             anyhow::anyhow!("Influx write failed: status={} body={}", status, text);
+
+                        // 4xx are permanent (malformed line protocol) and must not
+                        // be retried — except 408/429, which are transient.
+                        if is_permanent_status(status) {
+                            counter!("influx_write_errors_total").increment(1);
+                            return Err(SinkError::Permanent(err));
+                        }
+
+                        last_err = err;
                         continue;
                     }
                     Ok(_) => {
@@ -117,9 +127,19 @@ impl Sink for InfluxSink {
             }
 
             counter!("influx_write_errors_total").increment(1);
-            Err(last_err)
+            Err(SinkError::Retryable(last_err))
         })
     }
+}
+
+/// Returns `true` if a non-success HTTP status represents a permanent failure
+/// that retrying cannot fix. Client errors (4xx) are permanent, with the
+/// exception of `408 Request Timeout` and `429 Too Many Requests`, which are
+/// transient and should be retried.
+fn is_permanent_status(status: StatusCode) -> bool {
+    status.is_client_error()
+        && status != StatusCode::REQUEST_TIMEOUT
+        && status != StatusCode::TOO_MANY_REQUESTS
 }
 
 #[cfg(test)]

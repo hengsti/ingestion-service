@@ -4,23 +4,35 @@ use std::time::Duration;
 use anyhow::Result;
 use metrics::counter;
 use tokio::time::MissedTickBehavior;
-use tracing::error;
+use tracing::{error, warn};
 
-use crate::infrastructure::sink::Sink;
+use crate::infrastructure::sink::{Sink, SinkError};
 use crate::infrastructure::wal::subscription::WalSubscription;
 use crate::infrastructure::wal::types::{WalEntry, WalEvent};
 
+/// Upper bound on the exponential retry backoff while a retryable sink outage
+/// persists. Keeps the hold-and-retry loop from sleeping unbounded.
+const RETRY_BACKOFF_CAP_MS: u64 = 5_000;
+
+/// Initial retry backoff is clamped to this so a large `flush_interval_ms`
+/// doesn't delay recovery from a brief outage.
+const RETRY_BACKOFF_START_CAP_MS: u64 = 1_000;
+
 /// Drains the WAL subscription, batches entries, writes them to `sink`, and
-/// advances the WAL cursor on each successful (or terminally failed) flush.
+/// advances the WAL cursor on each successful (or permanently failed) flush.
 ///
 /// A flush is triggered when either the batch reaches `batch_size` or the
 /// `flush_interval_ms` ticker fires with a non-empty batch. The loop exits
 /// cleanly when the subscription is closed (`next()` returns `None`).
 ///
+/// On a *retryable* sink failure the batch is held and retried with bounded
+/// backoff without advancing the cursor, so the WAL buffers across the outage;
+/// new entries accumulate on disk (not in RAM) because `next()` isn't polled
+/// while a flush is in flight.
+///
 /// # Errors
 /// Returns an error only if committing the WAL cursor fails — sink write
-/// failures are non-fatal (the batch is dropped and the cursor still advances,
-/// matching the previous drop-after-3-retries semantics).
+/// failures are handled in-loop (retried when transient, dropped when permanent).
 pub async fn run_forwarder(
     mut sub: WalSubscription,
     sink: Arc<dyn Sink>,
@@ -36,7 +48,7 @@ pub async fn run_forwarder(
             biased;
             _ = ticker.tick() => {
                 if !batch.is_empty() {
-                    flush(&sink, &mut batch, &mut sub).await?;
+                    flush(&sink, &mut batch, &mut sub, flush_interval_ms).await?;
                 }
             }
             maybe = sub.next() => {
@@ -44,7 +56,7 @@ pub async fn run_forwarder(
                     Some(entry) => {
                         batch.push(entry);
                         if batch.len() >= batch_size {
-                            flush(&sink, &mut batch, &mut sub).await?;
+                            flush(&sink, &mut batch, &mut sub, flush_interval_ms).await?;
                         }
                     }
                     None => return Ok(()), // wal closed
@@ -55,12 +67,19 @@ pub async fn run_forwarder(
 }
 
 /// Writes the buffered batch to the sink and commits the WAL cursor up to the
-/// end of the last entry. The cursor is advanced even on sink failure so a
-/// poison batch cannot stall the pipeline forever.
+/// end of the last entry.
+///
+/// - On success the cursor advances and the batch clears.
+/// - On a *permanent* sink error the batch is dropped, a metric is recorded, and
+///   the cursor still advances so a poison batch can't stall the pipeline.
+/// - On a *retryable* sink error the batch is held and retried with exponential
+///   backoff (capped at [`RETRY_BACKOFF_CAP_MS`]) and the cursor is **not**
+///   advanced, so the WAL buffers the outage and a crash replays the batch.
 async fn flush(
     sink: &Arc<dyn Sink>,
     batch: &mut Vec<WalEntry>,
     sub: &mut WalSubscription,
+    flush_interval_ms: u64,
 ) -> Result<()> {
     let events: Vec<WalEvent> = batch.iter().map(|e| e.event.clone()).collect();
     let highest = batch
@@ -69,18 +88,198 @@ async fn flush(
         .offset_after;
     let count = batch.len() as u64;
 
-    match sink.write(&events).await {
-        Ok(()) => {
-            counter!("wal_forwarder_committed_total").increment(count);
-        }
-        Err(e) => {
-            error!(error = %e, count, "sink write failed; dropping batch and advancing cursor");
-            counter!("wal_forwarder_drop_total").increment(count);
+    let mut backoff_ms = flush_interval_ms.min(RETRY_BACKOFF_START_CAP_MS);
+    loop {
+        match sink.write(&events).await {
+            Ok(()) => {
+                counter!("wal_forwarder_committed_total").increment(count);
+                break;
+            }
+            Err(SinkError::Permanent(e)) => {
+                error!(error = %e, count, "permanent sink failure; dropping batch and advancing cursor");
+                counter!("wal_forwarder_drop_total").increment(count);
+                break;
+            }
+            Err(SinkError::Retryable(e)) => {
+                warn!(error = %e, count, backoff_ms, "retryable sink failure; holding batch, will retry");
+                counter!("wal_forwarder_retry_total").increment(1);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(RETRY_BACKOFF_CAP_MS);
+            }
         }
     }
 
-    // Advance the cursor regardless of sink outcome (drop-on-failure semantics).
+    // Reached only after a successful or permanently-failed write.
     sub.commit(highest).await?;
     batch.clear();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use crate::infrastructure::wal::cursor::read_cursor;
+    use crate::infrastructure::wal::types::WalOptions;
+    use crate::infrastructure::wal::wal::Wal;
+    use crate::model::messages::message::HandledMessage;
+    use crate::model::messages::status::StatusMessage;
+
+    enum Resp {
+        Ok,
+        Retry,
+        Perm,
+    }
+
+    struct MockSink {
+        responses: Mutex<VecDeque<Resp>>,
+        calls: AtomicUsize,
+    }
+
+    impl MockSink {
+        fn new(responses: Vec<Resp>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Sink for MockSink {
+        fn write<'a>(
+            &'a self,
+            _batch: &'a [WalEvent],
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match self.responses.lock().unwrap().pop_front() {
+                    Some(Resp::Ok) | None => Ok(()),
+                    Some(Resp::Retry) => Err(SinkError::Retryable(anyhow::anyhow!("transient"))),
+                    Some(Resp::Perm) => Err(SinkError::Permanent(anyhow::anyhow!("poison"))),
+                }
+            })
+        }
+    }
+
+    fn sample_event(seq: u64) -> WalEvent {
+        WalEvent {
+            topic: format!("smarthome/dev-{seq}/status"),
+            ts_ms: 1_700_000_000_000 + seq as i64,
+            message: HandledMessage::Status(StatusMessage {
+                device_id: format!("dev-{seq}"),
+                device_class: String::from("test"),
+                fw_version: String::from("1.0.0"),
+                ip: String::from("10.0.0.1"),
+                rssi: -50,
+                time_ms: 0,
+                time_iso: String::from("2024-01-01T00:00:00Z"),
+                time_valid: true,
+                uptime: 1,
+                free_mem: 1,
+                ssid: String::from("ssid"),
+            }),
+        }
+    }
+
+    fn opts(dir: &std::path::Path) -> WalOptions {
+        WalOptions {
+            dir: dir.to_path_buf(),
+            segment_bytes: 1024 * 1024,
+            queue_capacity: 32,
+        }
+    }
+
+    async fn drain(sub: &mut WalSubscription, n: usize) -> Vec<WalEntry> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let entry = tokio::time::timeout(Duration::from_millis(500), sub.next())
+                .await
+                .expect("timed out draining")
+                .expect("subscription closed early");
+            out.push(entry);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn flush_retryable_then_success_commits_once_without_dropping() {
+        let dir = tempdir().unwrap();
+        let (wal, mut sub) = Wal::open(opts(dir.path())).await.unwrap();
+        wal.try_append(sample_event(0)).unwrap();
+        wal.try_append(sample_event(1)).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut batch = drain(&mut sub, 2).await;
+        let highest = batch.last().unwrap().offset_after;
+
+        let mock = Arc::new(MockSink::new(vec![Resp::Retry, Resp::Ok]));
+        let sink: Arc<dyn Sink> = mock.clone();
+
+        // Small interval keeps the retry backoff sleep negligible.
+        flush(&sink, &mut batch, &mut sub, 1).await.unwrap();
+
+        assert_eq!(mock.call_count(), 2, "batch should be retried then succeed");
+        assert!(batch.is_empty(), "batch cleared after success");
+        assert_eq!(
+            read_cursor(dir.path()).unwrap(),
+            Some(highest),
+            "cursor must advance only after the successful write"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_permanent_drops_batch_and_advances_cursor() {
+        let dir = tempdir().unwrap();
+        let (wal, mut sub) = Wal::open(opts(dir.path())).await.unwrap();
+        wal.try_append(sample_event(0)).unwrap();
+        wal.try_append(sample_event(1)).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut batch = drain(&mut sub, 2).await;
+        let highest = batch.last().unwrap().offset_after;
+
+        let mock = Arc::new(MockSink::new(vec![Resp::Perm]));
+        let sink: Arc<dyn Sink> = mock.clone();
+
+        flush(&sink, &mut batch, &mut sub, 1).await.unwrap();
+
+        assert_eq!(mock.call_count(), 1, "permanent error must not be retried");
+        assert!(batch.is_empty(), "poison batch dropped");
+        assert_eq!(
+            read_cursor(dir.path()).unwrap(),
+            Some(highest),
+            "cursor advances past a dropped poison batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_success_commits_and_advances_cursor() {
+        let dir = tempdir().unwrap();
+        let (wal, mut sub) = Wal::open(opts(dir.path())).await.unwrap();
+        wal.try_append(sample_event(0)).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut batch = drain(&mut sub, 1).await;
+        let highest = batch.last().unwrap().offset_after;
+
+        let mock = Arc::new(MockSink::new(vec![Resp::Ok]));
+        let sink: Arc<dyn Sink> = mock.clone();
+
+        flush(&sink, &mut batch, &mut sub, 1).await.unwrap();
+
+        assert_eq!(mock.call_count(), 1);
+        assert_eq!(read_cursor(dir.path()).unwrap(), Some(highest));
+    }
 }
