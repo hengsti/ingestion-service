@@ -52,15 +52,17 @@ impl InfluxSink {
 
 /// Converts a batch of WAL events into a newline-delimited InfluxDB line-protocol body.
 fn build_body(batch: &[WalEvent]) -> String {
-    let mut lines: Vec<String> = Vec::with_capacity(batch.len());
+    let mut body = String::new();
     for event in batch {
-        let line = match &event.message {
-            HandledMessage::Sensor(s) => sensor_to_point(s).to_line_protocol(),
-            HandledMessage::Status(s) => status_to_point(s).to_line_protocol(),
-        };
-        lines.push(line);
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        match &event.message {
+            HandledMessage::Sensor(s) => sensor_to_point(s).write_line_protocol(&mut body),
+            HandledMessage::Status(s) => status_to_point(s).write_line_protocol(&mut body),
+        }
     }
-    lines.join("\n")
+    body
 }
 
 impl Sink for InfluxSink {
@@ -202,17 +204,15 @@ mod tests {
 
         let body = build_body(&batch);
 
-        let expected = format!(
-            "{}\n{}",
-            match &batch[0].message {
-                HandledMessage::Sensor(s) => sensor_to_point(s).to_line_protocol(),
-                HandledMessage::Status(s) => status_to_point(s).to_line_protocol(),
-            },
-            match &batch[1].message {
-                HandledMessage::Sensor(s) => sensor_to_point(s).to_line_protocol(),
-                HandledMessage::Status(s) => status_to_point(s).to_line_protocol(),
-            },
-        );
+        let line = |event: &WalEvent| {
+            let mut s = String::new();
+            match &event.message {
+                HandledMessage::Sensor(s2) => sensor_to_point(s2).write_line_protocol(&mut s),
+                HandledMessage::Status(s2) => status_to_point(s2).write_line_protocol(&mut s),
+            }
+            s
+        };
+        let expected = format!("{}\n{}", line(&batch[0]), line(&batch[1]));
 
         assert_eq!(body, expected);
         assert_eq!(body.lines().count(), 2);

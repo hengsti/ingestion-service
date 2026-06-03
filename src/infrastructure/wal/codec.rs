@@ -22,9 +22,25 @@ pub fn encode_into(buf: &mut Vec<u8>, event: &WalEvent) -> Result<()> {
 /// caller uses it to advance its read cursor without re-measuring the payload.
 ///
 /// Returns `Ok(None)` on a clean EOF *or* a torn tail (short read of either
-/// the length prefix or the payload). Both are non-fatal: the writer will
-/// overwrite a torn tail on the next append.
+/// the length prefix or the payload). Both are non-fatal: a torn tail is
+/// truncated during recovery (`recover::truncate_to`) before the writer reopens.
+///
+/// Convenience wrapper over [`decode_into`] that allocates a fresh payload
+/// buffer per call — used by recovery and tests. The hot read path uses
+/// [`decode_into`] with a reused buffer instead.
 pub fn decode_from<R: Read>(r: &mut R) -> Result<Option<(WalEvent, usize)>> {
+    let mut payload = Vec::new();
+    decode_into(r, &mut payload)
+}
+
+/// Decodes one framed record from `r`, reusing `payload` as the scratch buffer
+/// for the record body instead of allocating a fresh `Vec` per record.
+///
+/// Semantics match [`decode_from`]; the only difference is that the caller owns
+/// and reuses `payload` across calls, removing a per-record allocation on the
+/// subscription's hot read path. `payload` is left holding the decoded record's
+/// bytes (and retains its capacity) on success.
+pub fn decode_into<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Option<(WalEvent, usize)>> {
     let mut len_buf = [0u8; 4];
 
     match r.read_exact(&mut len_buf) {
@@ -34,13 +50,14 @@ pub fn decode_from<R: Read>(r: &mut R) -> Result<Option<(WalEvent, usize)>> {
     }
     let len = u32::from_le_bytes(len_buf) as usize;
 
-    let mut payload = vec![0u8; len];
-    match r.read_exact(&mut payload) {
+    payload.clear();
+    payload.resize(len, 0);
+    match r.read_exact(payload) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    let event: WalEvent = bincode::deserialize(&payload)?;
+    let event: WalEvent = bincode::deserialize(payload)?;
     Ok(Some((event, 4 + len)))
 }
 
@@ -121,6 +138,44 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         let result = decode_from(&mut cursor).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn decode_into_reuses_buffer_across_records() {
+        let event_a = WalEvent {
+            topic: String::from("topic-a"),
+            ts_ms: 1,
+            message: HandledMessage::Status(create_status_message()),
+        };
+        let event_b = WalEvent {
+            topic: String::from("topic-b-longer-than-a"),
+            ts_ms: 2,
+            message: HandledMessage::Status(create_status_message()),
+        };
+
+        let mut wire = Vec::new();
+        let mut enc = Vec::new();
+        encode_into(&mut enc, &event_a).unwrap();
+        wire.extend_from_slice(&enc);
+        encode_into(&mut enc, &event_b).unwrap();
+        wire.extend_from_slice(&enc);
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut payload = Vec::new();
+
+        let (a, _) = decode_into(&mut cursor, &mut payload).unwrap().unwrap();
+        assert_eq!(a.topic, event_a.topic);
+        let cap_after_first = payload.capacity();
+
+        let (b, _) = decode_into(&mut cursor, &mut payload).unwrap().unwrap();
+        assert_eq!(b.topic, event_b.topic);
+
+        // The same buffer was reused; decoding a larger second record may grow
+        // it but must never shrink it, and the first decode allocated capacity.
+        assert!(cap_after_first > 0);
+        assert!(payload.capacity() >= cap_after_first);
+
+        assert!(decode_into(&mut cursor, &mut payload).unwrap().is_none());
     }
 
     #[test]

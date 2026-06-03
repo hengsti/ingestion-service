@@ -109,6 +109,13 @@ async fn writer_loop(
 ) {
     let mut encode_buf: Vec<u8> = Vec::with_capacity(4 * 1024);
 
+    // `dirty` means the BufWriter may hold bytes for records not yet flushed to
+    // disk and therefore not yet reflected in `head`. Set after each successful
+    // `write_all`, cleared after a flush. The periodic flush_tick skips the
+    // flush + `notify_waiters` entirely when not dirty, so an idle writer makes
+    // no syscalls and no spurious wakeups (the 5 ms tick fires 200×/s).
+    let mut dirty = false;
+
     let mut flush_tick = interval(Duration::from_millis(5));
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     flush_tick.tick().await;
@@ -161,6 +168,7 @@ async fn writer_loop(
                     return;
                 }
                 current_byte_offset += record_len;
+                dirty = true;
 
                 // `head` (and the reader wake-up) is advanced only after a flush
                 // makes the bytes durable on disk — see the flush_tick branch.
@@ -169,10 +177,17 @@ async fn writer_loop(
             }
 
             _ = flush_tick.tick() => {
+                // Nothing buffered since the last flush — skip the flush syscall
+                // and the wakeup so an idle writer stays quiet.
+                if !dirty {
+                    continue;
+                }
+
                 if let Err(e) = writer.flush() {
                     warn!(error = %e, segment_id = current_segment_id, "WAL writer: periodic flush failed");
                     continue;
                 }
+                dirty = false;
 
                 head.store(WalOffset { segment_id: current_segment_id, byte_offset: current_byte_offset });
                 notify.notify_waiters();
@@ -366,5 +381,50 @@ mod tests {
         let (b, _) = decode_from(&mut cur).unwrap().expect("second record");
         assert_eq!(a.ts_ms, sample_event(1).ts_ms);
         assert_eq!(b.ts_ms, sample_event(2).ts_ms);
+    }
+
+    #[tokio::test]
+    async fn idle_writer_does_not_notify_when_no_new_records() {
+        let dir = tempdir().unwrap();
+        let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
+
+        // Write one record and wait until it's flushed (head advanced). This
+        // consumes the single notify that flush produces.
+        let ev = sample_event(1);
+        let mut buf = Vec::new();
+        codec::encode_into(&mut buf, &ev).unwrap();
+        let len = buf.len() as u64;
+        handle.tx.send(ev).await.unwrap();
+        wait_for_head(
+            &handle,
+            WalOffset {
+                segment_id: 1,
+                byte_offset: len,
+            },
+        )
+        .await;
+
+        // The writer is now idle. Spanning many 5 ms flush ticks, a freshly
+        // registered waiter must NOT be woken — proving the dirty flag suppresses
+        // the periodic flush + notify when nothing new was written. Before the
+        // fix, `notify_waiters` fired every tick and this would resolve at once.
+        let woken = tokio::time::timeout(Duration::from_millis(60), handle.notify.notified()).await;
+        assert!(
+            woken.is_err(),
+            "idle writer must not notify when no new records were written"
+        );
+
+        // A subsequent write must still wake the waiter (notify path intact).
+        // Register the waiter *before* sending so the flush's `notify_waiters`
+        // can't fire in the gap and be missed.
+        let notified = handle.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        handle.tx.send(sample_event(2)).await.unwrap();
+        let woken = tokio::time::timeout(Duration::from_millis(500), notified).await;
+        assert!(
+            woken.is_ok(),
+            "a new record must still flush and notify the waiter"
+        );
     }
 }

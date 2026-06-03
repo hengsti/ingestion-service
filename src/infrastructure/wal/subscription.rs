@@ -25,6 +25,16 @@ pub struct WalSubscription {
     cur_segment_id: u64,
     cur_byte_offset: u64,
     cur_reader: Option<BufReader<File>>,
+    /// Reusable scratch buffer for the record payload, passed to
+    /// [`codec::decode_into`] so the hot read path doesn't allocate a fresh
+    /// `Vec` per record. Retains capacity across `next()` calls.
+    payload_buf: Vec<u8>,
+    /// Highest segment id below which we've already reclaimed (GC'd) on commit.
+    /// Lets `commit` skip the per-commit `readdir` unless the committed segment
+    /// has advanced. Initialized one below `start.segment_id` so exactly one GC
+    /// runs on the first commit, reclaiming any segments a prior crash left
+    /// behind after writing the cursor but before finishing deletion.
+    last_gc_segment_id: u64,
 }
 
 impl WalSubscription {
@@ -41,6 +51,8 @@ impl WalSubscription {
             cur_segment_id: start.segment_id,
             cur_byte_offset: start.byte_offset,
             cur_reader: None,
+            payload_buf: Vec::new(),
+            last_gc_segment_id: start.segment_id.saturating_sub(1),
         }
     }
 
@@ -111,7 +123,7 @@ impl WalSubscription {
             //       Ok(Some) – a full record materialised: advance cursor + return.
             //       Ok(None) – clean EOF or torn tail: wait for the writer.
             //       Err      – a fully-framed record whose payload won't decode.
-            match codec::decode_from(reader) {
+            match codec::decode_into(reader, &mut self.payload_buf) {
                 Ok(Some((event, bytes_consumed))) => {
                     // Advance our cursor past the record we just consumed and
                     // compute the post-record offset for the forwarder to commit.
@@ -219,30 +231,36 @@ impl WalSubscription {
         // (2) Reclaim disk: drop every segment whose id is strictly below the
         //     committed segment. The segment that *contains* the committed
         //     offset is kept — it may still hold uncommitted records past
-        //     `up_to.byte_offset`. `list_segments` returns ids ascending, so
-        //     once we hit one >= up_to.segment_id we can stop scanning.
-        for seg_id in segment::list_segments(&self.dir)? {
-            if seg_id >= up_to.segment_id {
-                break;
-            }
+        //     `up_to.byte_offset`. To avoid a `readdir` on every commit, only
+        //     scan when the committed segment has advanced past the last one we
+        //     reclaimed; commits that stay within the same segment have nothing
+        //     new to delete. `list_segments` returns ids ascending, so once we
+        //     hit one >= up_to.segment_id we can stop scanning.
+        if up_to.segment_id > self.last_gc_segment_id {
+            for seg_id in segment::list_segments(&self.dir)? {
+                if seg_id >= up_to.segment_id {
+                    break;
+                }
 
-            let path = segment::segment_path(&self.dir, seg_id);
-            match fs::remove_file(&path) {
-                Ok(()) => {}
+                let path = segment::segment_path(&self.dir, seg_id);
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
 
-                // A prior commit already removed it — commit is idempotent.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // A prior commit already removed it — commit is idempotent.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
 
-                // Non-fatal: the watermark is already persisted. Log so a
-                // filling disk is visible; the next commit will try again.
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        path = %path.display(),
-                        "WAL subscription: failed to delete segment; will retry on next commit"
-                    );
+                    // Non-fatal: the watermark is already persisted. Log so a
+                    // filling disk is visible; the next commit will try again.
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %path.display(),
+                            "WAL subscription: failed to delete segment; will retry on next commit"
+                        );
+                    }
                 }
             }
+            self.last_gc_segment_id = up_to.segment_id;
         }
 
         Ok(())
@@ -401,5 +419,89 @@ mod tests {
 
         // Nothing else durable: the subscription parks on the empty segment 2.
         assert!(recv_one(&mut sub, 150).await.is_none());
+    }
+
+    fn make_segment(dir: &Path, id: u64) {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(dir.join(segment_filename(id)))
+            .unwrap();
+    }
+
+    fn new_sub(dir: &Path, start: WalOffset) -> WalSubscription {
+        WalSubscription::new(
+            dir.to_path_buf(),
+            Arc::new(AtomicWalOffset::new(start)),
+            Arc::new(Notify::new()),
+            start,
+        )
+    }
+
+    fn remaining_segments(dir: &Path) -> Vec<u64> {
+        crate::infrastructure::wal::segment::list_segments(dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn commit_reclaims_segments_below_committed_segment() {
+        let dir = tempdir().unwrap();
+        for id in 1..=3 {
+            make_segment(dir.path(), id);
+        }
+
+        let mut sub = new_sub(
+            dir.path(),
+            WalOffset {
+                segment_id: 1,
+                byte_offset: 0,
+            },
+        );
+
+        // Commit within segment 1: nothing older than 1 exists, keeps 1..=3.
+        sub.commit(WalOffset {
+            segment_id: 1,
+            byte_offset: 10,
+        })
+        .await
+        .unwrap();
+        assert_eq!(remaining_segments(dir.path()), vec![1, 2, 3]);
+
+        // Commit into segment 3: segments 1 and 2 are reclaimed, 3 is kept.
+        sub.commit(WalOffset {
+            segment_id: 3,
+            byte_offset: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(remaining_segments(dir.path()), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn first_commit_reclaims_crash_leftover_segments_below_start() {
+        let dir = tempdir().unwrap();
+        // A prior run left segments 0 and 1 behind after advancing the cursor
+        // into segment 2 but before finishing GC.
+        for id in 0..=2 {
+            make_segment(dir.path(), id);
+        }
+
+        let mut sub = new_sub(
+            dir.path(),
+            WalOffset {
+                segment_id: 2,
+                byte_offset: 0,
+            },
+        );
+
+        // The very first commit (even at the start segment) must run GC once and
+        // reclaim the stale 0 and 1.
+        sub.commit(WalOffset {
+            segment_id: 2,
+            byte_offset: 5,
+        })
+        .await
+        .unwrap();
+        assert_eq!(remaining_segments(dir.path()), vec![2]);
     }
 }

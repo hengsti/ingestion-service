@@ -90,12 +90,17 @@ async fn flush(
     sub: &mut WalSubscription,
     flush_interval_ms: u64,
 ) -> Result<()> {
-    let events: Vec<WalEvent> = batch.iter().map(|e| e.event.clone()).collect();
     let highest = batch
         .last()
         .expect("flush called with a non-empty batch")
         .offset_after;
     let count = batch.len() as u64;
+
+    // Move events out of the batch instead of deep-cloning each one (String
+    // topic + message). `events` is owned for the whole retry loop and
+    // `highest`/`count` are captured above, so the drained `batch` is never
+    // needed again. The Vec's capacity is retained for the next flush.
+    let events: Vec<WalEvent> = batch.drain(..).map(|e| e.event).collect();
 
     let mut backoff_ms = flush_interval_ms.min(RETRY_BACKOFF_START_CAP_MS);
     loop {
