@@ -36,8 +36,11 @@ pub struct WalEvent {
 
 #[derive(Debug, Clone)]
 pub struct WalEntry {
-    /// Offset of this record's start. Kept for observability and consumed by
-    /// the WAL test suite; the forwarder commits using `offset_after`.
+    /// Byte offset of this record's *start*. Production code never reads it —
+    /// the forwarder commits using `offset_after` — hence `#[allow(dead_code)]`.
+    /// It is retained because the WAL test suite asserts record-start framing
+    /// and monotonicity (e.g. the first record starts at byte 0, and successive
+    /// starts strictly increase), invariants that `offset_after` cannot express.
     #[allow(dead_code)]
     pub offset: WalOffset,
     pub offset_after: WalOffset, // offset of "next" record's start (i.e. this record's end)

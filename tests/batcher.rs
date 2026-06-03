@@ -48,7 +48,15 @@ async fn spawn_mock_influx() -> (String, Arc<Mutex<Vec<String>>>) {
 }
 
 fn make_sink(url: &str) -> Arc<dyn Sink> {
-    Arc::new(InfluxSink::new(url, "test_org", "test_bucket", "test_token").unwrap())
+    Arc::new(
+        InfluxSink::new(
+            url,
+            "test_org",
+            "test_bucket",
+            secrecy::SecretString::new("test_token".to_string()),
+        )
+        .unwrap(),
+    )
 }
 
 fn status_event(device_id: &str) -> WalEvent {

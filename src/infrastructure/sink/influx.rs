@@ -6,6 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use metrics::{counter, histogram};
 use reqwest::{Client, StatusCode};
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     infrastructure::{
@@ -20,15 +21,19 @@ use crate::{
 pub struct InfluxSink {
     client: Client,
     write_url: String,
-    token: String,
+    token: SecretString,
 }
 
 impl InfluxSink {
     /// Builds a new sink targeting an InfluxDB v2 write endpoint.
     ///
+    /// The `token` is kept wrapped in [`SecretString`] and only exposed when
+    /// building the `Authorization` header, so it is never logged or surfaced
+    /// via `Debug`.
+    ///
     /// # Errors
     /// Returns an error if the underlying HTTP client cannot be constructed.
-    pub fn new(url: &str, org: &str, bucket: &str, token: &str) -> Result<Self> {
+    pub fn new(url: &str, org: &str, bucket: &str, token: SecretString) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -45,7 +50,7 @@ impl InfluxSink {
         Ok(Self {
             client,
             write_url,
-            token: token.to_string(),
+            token,
         })
     }
 }
@@ -90,7 +95,10 @@ impl Sink for InfluxSink {
                 let send_result = self
                     .client
                     .post(&self.write_url)
-                    .header("Authorization", format!("Token {}", self.token))
+                    .header(
+                        "Authorization",
+                        format!("Token {}", self.token.expose_secret()),
+                    )
                     .header("Content-Type", "text/plain; charset=utf-8")
                     .body(body.clone())
                     .send()
