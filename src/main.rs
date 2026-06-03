@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
 
-    let _forwarder_task = tokio::spawn(async move {
+    let forwarder_task = tokio::spawn(async move {
         if let Err(err) = run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await {
             error!(error = %err, "wal forwarder failed");
         }
@@ -275,6 +275,24 @@ async fn main() -> Result<()> {
             Ok(Ok(())) => {}
             Ok(Err(err)) => error!(error = %err, "worker failed during shutdown"),
             Err(err) => error!(error = %err, "worker join failed during shutdown"),
+        }
+    }
+
+    // Drain the WAL forwarder before exiting. The writer task only stops once
+    // every `Arc<Wal>` sender is released: the pipeline holds one via the
+    // PersistStage and `wal` holds the other. Dropping both closes the writer's
+    // channel, so it flushes its final batch and the subscription terminates,
+    // letting the forwarder persist and commit any buffered records.
+    drop(pipeline);
+    drop(wal);
+
+    let mut forwarder_task = forwarder_task;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut forwarder_task).await {
+        Ok(Ok(())) => info!("wal forwarder drained cleanly"),
+        Ok(Err(err)) => error!(error = %err, "wal forwarder task panicked during drain"),
+        Err(_) => {
+            warn!("wal forwarder drain timed out after 5s; aborting and exiting");
+            forwarder_task.abort();
         }
     }
 

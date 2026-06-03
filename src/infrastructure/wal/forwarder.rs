@@ -59,7 +59,16 @@ pub async fn run_forwarder(
                             flush(&sink, &mut batch, &mut sub, flush_interval_ms).await?;
                         }
                     }
-                    None => return Ok(()), // wal closed
+                    None => {
+                        // WAL closed (writer gone): flush whatever is still
+                        // buffered so the final partial batch is persisted and
+                        // committed, then exit. Without this the last batch would
+                        // be silently dropped on shutdown.
+                        if !batch.is_empty() {
+                            flush(&sink, &mut batch, &mut sub, flush_interval_ms).await?;
+                        }
+                        return Ok(());
+                    }
                 }
             }
         }

@@ -347,6 +347,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_subscription_drains_all_records_after_writer_shutdown() {
+        let dir = tempdir().unwrap();
+
+        let (wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 256)).await.unwrap();
+        for i in 0..20 {
+            wal.try_append(sample_event(i)).unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        // Close the WAL: the writer flushes its final batch and exits, leaving
+        // the live subscription to drain. Every appended record must surface
+        // before `next()` returns `None`.
+        drop(wal);
+
+        let mut count = 0u64;
+        while let Some(entry) = recv_one(&mut sub, 500).await {
+            assert_eq!(entry.event.ts_ms, sample_event(count).ts_ms);
+            count += 1;
+        }
+        assert_eq!(count, 20, "graceful drain must yield every appended record");
+    }
+
+    #[tokio::test]
     async fn try_append_returns_full_when_queue_is_saturated() {
         let dir = tempdir().unwrap();
         // queue_capacity = 1; we don't yield so the writer can't drain.

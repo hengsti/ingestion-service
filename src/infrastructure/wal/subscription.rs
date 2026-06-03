@@ -269,7 +269,18 @@ impl WalSubscription {
         // `enable()` above guarantees the writer's shutdown `notify_waiters`
         // is observed even if it races with this check.
         if Arc::strong_count(&self.notify) == 1 {
-            return false;
+            // The writer has finished its final flush, so `head` is now durable
+            // and final. Re-load it and drain any records we haven't consumed
+            // yet before terminating — this guarantees a graceful shutdown
+            // delivers every committed record instead of dropping the tail when
+            // the reader hasn't caught up to the writer's final offset.
+            let head = self.head.load();
+            if head.segment_id > self.cur_segment_id {
+                self.cur_segment_id += 1;
+                self.cur_byte_offset = 0;
+                return true;
+            }
+            return head.byte_offset > self.cur_byte_offset;
         }
 
         // Otherwise wait for the writer to flush more durable bytes (or a torn

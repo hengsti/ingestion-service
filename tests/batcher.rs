@@ -166,3 +166,36 @@ async fn forwarder_empty_wal_does_not_flush() {
         "no POST expected when the WAL stays empty"
     );
 }
+
+#[tokio::test]
+async fn forwarder_drains_final_batch_and_terminates_when_wal_closes() {
+    let (url, received) = spawn_mock_influx().await;
+    let sink = make_sink(&url);
+    let (wal, sub, _tmp) = common::open_temp_wal().await;
+
+    // Large batch + long interval so neither the size nor the time trigger fires;
+    // only the shutdown drain can flush the buffered records.
+    let handle = tokio::spawn(run_forwarder(sub, sink, 1_000, 60_000));
+
+    for i in 0..5 {
+        wal.try_append(status_event(&format!("dev-{i}"))).unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    // Close the WAL: the writer finishes and the forwarder must flush its final
+    // batch before returning cleanly.
+    drop(wal);
+
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("forwarder drain timed out")
+        .expect("forwarder task panicked")
+        .expect("forwarder returned an error");
+
+    let posts = received.lock().unwrap();
+    let total_lines: usize = posts.iter().map(|b| b.lines().count()).sum();
+    assert_eq!(
+        total_lines, 5,
+        "every appended event must reach the sink on graceful drain"
+    );
+}
