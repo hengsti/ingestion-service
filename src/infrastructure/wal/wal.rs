@@ -2,9 +2,11 @@ use std::fs;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc::{self, error::TrySendError};
+use tracing::warn;
 
 use crate::infrastructure::wal::{
     cursor::read_cursor,
+    recover::{last_valid_offset, truncate_to},
     segment::{list_segments, segment_path},
     subscription::WalSubscription,
     types::{TryAppendError, WalEvent, WalOffset, WalOptions},
@@ -26,10 +28,21 @@ impl Wal {
         let (active_id, active_len) = match segments.last().copied() {
             None => (1u64, 0u64),
             Some(id) => {
-                let len = fs::metadata(segment_path(&options.dir, id))
+                let path = segment_path(&options.dir, id);
+                let file_len = fs::metadata(&path)
                     .with_context(|| format!("stat WAL segment {id}"))?
                     .len();
-                (id, len)
+                let valid = last_valid_offset(&path)?;
+                if valid < file_len {
+                    truncate_to(&path, valid)
+                        .with_context(|| format!("truncating torn WAL segment {id}"))?;
+                    warn!(
+                        segment_id = id,
+                        reclaimed_bytes = file_len - valid,
+                        "healed torn WAL tail on recovery"
+                    );
+                }
+                (id, valid)
             }
         };
 
@@ -281,6 +294,56 @@ mod tests {
         // The torn tail must not produce more events; subscription should block.
         let after = recv_one(&mut sub, 150).await;
         assert!(after.is_none(), "replay should stop at torn tail");
+    }
+
+    #[tokio::test]
+    async fn torn_tail_is_healed_on_open_and_subsequent_append_replays_cleanly() {
+        let dir = tempdir().unwrap();
+
+        // Append one good record, then close the WAL.
+        {
+            let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
+            wal.try_append(sample_event(1)).unwrap();
+            tokio::task::yield_now().await;
+            drop(wal);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Corrupt the segment with a length prefix and no payload (torn tail).
+        let path = dir.path().join("00000000000000000001.log");
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&999u32.to_le_bytes()).unwrap();
+            drop(f);
+        }
+
+        // Reopen: `open` must truncate the torn tail. Append a second good record.
+        {
+            let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
+            wal.try_append(sample_event(2)).unwrap();
+            tokio::task::yield_now().await;
+            drop(wal);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Reopen and replay: exactly the two good records, monotonic offsets,
+        // then a clean block.
+        let (_wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
+
+        let first = recv_one(&mut sub, 500).await.expect("first good record");
+        assert_eq!(first.event.ts_ms, sample_event(1).ts_ms);
+
+        let second = recv_one(&mut sub, 500).await.expect("second good record");
+        assert_eq!(second.event.ts_ms, sample_event(2).ts_ms);
+        assert!(
+            second.offset > first.offset,
+            "offsets must be monotonic: first={:?}, second={:?}",
+            first.offset,
+            second.offset
+        );
+
+        let after = recv_one(&mut sub, 150).await;
+        assert!(after.is_none(), "replay should block after the last record");
     }
 
     #[tokio::test]
