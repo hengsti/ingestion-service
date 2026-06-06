@@ -44,7 +44,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 
 ## B) Performance/latency/memory findings
 
-### CRITICAL — Blocking file I/O in Tokio async paths
+### CRITICAL — Blocking file I/O in Tokio async paths ✅ DONE
 - **Evidence:** `src/infrastructure/wal/writer.rs` (`writer_loop`), `src/infrastructure/wal/subscription.rs` (`WalSubscription::next`)
 - **Weak spot:** `std::fs` blocking I/O inside async loops can starve runtime workers under disk pressure.
 - **Fix direction:** Move disk I/O to dedicated blocking thread(s) or `spawn_blocking`.
@@ -73,12 +73,12 @@ Collected from parallel sub-agent reviews using different models/agent types:
 
 ## C) Tests and observability findings
 
-### CRITICAL — Missing test for `TryAppendError::Closed` in persist stage
+### CRITICAL — Missing test for `TryAppendError::Closed` in persist stage ✅ DONE
 - **Evidence:** `src/pipeline/stages/persist.rs` closed branch untested
 - **Weak spot:** No proof that DLQ route/Stop semantics are correct when WAL channel is closed.
 - **Fix direction:** Add targeted unit test asserting `StageFlow::Stop`, DLQ flag, reason string.
 
-### CRITICAL — No tests for `is_permanent_status`
+### CRITICAL — No tests for `is_permanent_status` ✅ DONE
 - **Evidence:** `src/infrastructure/sink/influx.rs` classification function untested
 - **Weak spot:** Misclassification can either silently drop retryable data or stall WAL indefinitely.
 - **Fix direction:** Add unit tests for key status codes (400/401/404/408/429/500/503) + integration assertions.
