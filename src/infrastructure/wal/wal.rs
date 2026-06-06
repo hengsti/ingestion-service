@@ -1,7 +1,10 @@
 use std::fs;
+use std::sync::{
+    mpsc::{SyncSender, TrySendError},
+    Arc,
+};
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::warn;
 
 use crate::infrastructure::wal::{
@@ -14,7 +17,7 @@ use crate::infrastructure::wal::{
 };
 
 pub struct Wal {
-    tx: mpsc::Sender<WalEvent>,
+    tx: SyncSender<WalEvent>,
 }
 
 impl Wal {
@@ -63,7 +66,7 @@ impl Wal {
         )?;
 
         let subscription = WalSubscription::new(
-            options.dir,
+            Arc::from(options.dir),
             handle.head.clone(),
             handle.notify.clone(),
             read_start,
@@ -78,7 +81,7 @@ impl Wal {
     pub fn try_append(&self, event: WalEvent) -> Result<(), TryAppendError> {
         self.tx.try_send(event).map_err(|err| match err {
             TrySendError::Full(ev) => TryAppendError::Full(ev),
-            TrySendError::Closed(ev) => TryAppendError::Closed(ev),
+            TrySendError::Disconnected(ev) => TryAppendError::Closed(ev),
         })
     }
 }
@@ -372,16 +375,22 @@ mod tests {
     #[tokio::test]
     async fn try_append_returns_full_when_queue_is_saturated() {
         let dir = tempdir().unwrap();
-        // queue_capacity = 1; we don't yield so the writer can't drain.
+        // queue_capacity = 1 with a real writer thread draining concurrently:
+        // flood the channel until a `try_send` observes the buffer full. The
+        // producer's tight loop outruns the writer's encode + write, so this is
+        // deterministic without relying on cooperative scheduling.
         let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 1)).await.unwrap();
 
-        wal.try_append(sample_event(1)).unwrap();
-        // No .await between sends → writer task hasn't been polled yet.
-        let err = wal
-            .try_append(sample_event(2))
-            .expect_err("second send should hit Full");
-        match err {
-            TryAppendError::Full(ev) => assert_eq!(ev.ts_ms, sample_event(2).ts_ms),
+        let mut hit = None;
+        for i in 0..10_000 {
+            if let Err(err) = wal.try_append(sample_event(i)) {
+                hit = Some(err);
+                break;
+            }
+        }
+
+        match hit.expect("queue should saturate under a tight flood") {
+            TryAppendError::Full(_) => {}
             TryAppendError::Closed(_) => panic!("expected Full, got Closed"),
         }
     }

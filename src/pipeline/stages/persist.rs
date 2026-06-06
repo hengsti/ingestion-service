@@ -206,20 +206,25 @@ mod tests {
     #[tokio::test]
     async fn run_marks_dlq_with_queue_full_when_wal_queue_is_saturated() {
         let dir = tempdir().unwrap();
-        // queue_capacity = 1; pre-fill without yielding so the writer can't drain.
+        // queue_capacity = 1 with a real writer thread draining concurrently:
+        // flood the stage until an append observes the queue full. The producer's
+        // tight loop outruns the writer's encode + write, so this is
+        // deterministic without relying on cooperative scheduling.
         let (wal, _sub) = open_wal(dir.path(), 1).await;
         let stage = PersistStage::new(wal);
 
-        // First append fills the single queue slot.
-        let mut filler = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
-        stage.run(&mut filler).await.unwrap();
+        let mut saturated = None;
+        for _ in 0..10_000 {
+            let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+            let result = stage.run(&mut ctx).await;
+            if ctx.should_publish_dlq() {
+                saturated = Some((result, ctx));
+                break;
+            }
+        }
 
-        // Second append (no await that lets the writer drain) must hit Full.
-        let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
-        let result = stage.run(&mut ctx).await;
-
+        let (result, ctx) = saturated.expect("WAL queue should saturate under a tight flood");
         assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
         assert_eq!(ctx.dlq_reason(), Some("wal queue full"));
     }
 

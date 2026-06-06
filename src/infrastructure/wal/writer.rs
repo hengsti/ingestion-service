@@ -1,19 +1,18 @@
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
         Arc,
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use tokio::{
-    sync::{mpsc, Notify},
-    time::{interval, MissedTickBehavior},
-};
+use tokio::sync::Notify;
 use tracing::{error, warn};
 
 use crate::infrastructure::wal::{
@@ -21,6 +20,11 @@ use crate::infrastructure::wal::{
     segment::segment_path,
     types::{WalEvent, WalOffset},
 };
+
+/// How long buffered records may sit in the `BufWriter` before the writer flushes
+/// them to disk and signals the reader. Bounds reader latency without flushing on
+/// every record.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 
 pub(super) struct AtomicWalOffset {
     segment_id: AtomicU64,
@@ -52,7 +56,7 @@ impl AtomicWalOffset {
 }
 
 pub(super) struct WriterHandle {
-    pub tx: mpsc::Sender<WalEvent>,
+    pub tx: SyncSender<WalEvent>,
     pub notify: Arc<Notify>,
     pub head: Arc<AtomicWalOffset>,
 }
@@ -72,7 +76,7 @@ pub(super) fn spawn_writer(
         .with_context(|| format!("opening WAL segment {}", path.display()))?;
     let writer = BufWriter::with_capacity(64 * 1024, file);
 
-    let (tx, rx) = mpsc::channel::<WalEvent>(queue_capacity);
+    let (tx, rx) = mpsc::sync_channel::<WalEvent>(queue_capacity);
     let notify = Arc::new(Notify::new());
     let head = Arc::new(AtomicWalOffset::new(WalOffset {
         segment_id: start_segment_id,
@@ -82,28 +86,37 @@ pub(super) fn spawn_writer(
     let task_notify = notify.clone();
     let task_head = head.clone();
 
-    tokio::spawn(writer_loop(
-        dir,
-        start_segment_id,
-        start_byte_offset,
-        segment_bytes,
-        writer,
-        rx,
-        task_head,
-        task_notify,
-    ));
+    // The writer runs on a dedicated OS thread, not a tokio task: its file I/O is
+    // blocking and would otherwise stall a runtime worker under disk pressure.
+    // `head.store` and `Notify::notify_waiters` are both thread-safe and callable
+    // from outside the runtime, so the reader still observes progress.
+    thread::Builder::new()
+        .name("wal-writer".to_string())
+        .spawn(move || {
+            writer_loop(
+                dir,
+                start_segment_id,
+                start_byte_offset,
+                segment_bytes,
+                writer,
+                rx,
+                task_head,
+                task_notify,
+            );
+        })
+        .context("spawning WAL writer thread")?;
 
     Ok(WriterHandle { tx, notify, head })
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn writer_loop(
+fn writer_loop(
     dir: PathBuf,
     mut current_segment_id: u64,
     mut current_byte_offset: u64,
     segment_bytes: u64,
-    mut writer: BufWriter<std::fs::File>,
-    mut rx: mpsc::Receiver<WalEvent>,
+    mut writer: BufWriter<File>,
+    rx: Receiver<WalEvent>,
     head: Arc<AtomicWalOffset>,
     notify: Arc<Notify>,
 ) {
@@ -111,89 +124,106 @@ async fn writer_loop(
 
     // `dirty` means the BufWriter may hold bytes for records not yet flushed to
     // disk and therefore not yet reflected in `head`. Set after each successful
-    // `write_all`, cleared after a flush. The periodic flush_tick skips the
-    // flush + `notify_waiters` entirely when not dirty, so an idle writer makes
-    // no syscalls and no spurious wakeups (the 5 ms tick fires 200×/s).
+    // `write_all`, cleared after a flush. While clean the loop blocks on `recv`,
+    // so an idle writer makes no syscalls and no spurious wakeups.
     let mut dirty = false;
-
-    let mut flush_tick = interval(Duration::from_millis(5));
-    flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    flush_tick.tick().await;
+    // Instant at which buffered bytes must be flushed to bound reader latency.
+    // Armed on the clean→dirty transition (oldest unflushed record), never pushed
+    // by later writes, so sustained load can't starve the reader.
+    let mut flush_deadline = Instant::now();
 
     loop {
-        tokio::select! {
-            biased;
-
-            maybe_ev = rx.recv() => {
-                let Some(ev) = maybe_ev else {
-                    if let Err(e) = writer.flush() {
-                        warn!(error = %e, "WAL writer: final flush failed on shutdown");
-                    } else {
-                        head.store(WalOffset { segment_id: current_segment_id, byte_offset: current_byte_offset });
-                    }
-                    notify.notify_waiters();
-                    return;
-                };
-
-                if let Err(e) = codec::encode_into(&mut encode_buf, &ev) {
-                    error!(error = %e, "WAL writer: failed to encode event; dropping event");
-                    continue;
-                }
-
-                let record_len = encode_buf.len() as u64;
-
-                if current_byte_offset > 0 && current_byte_offset + record_len > segment_bytes {
-                    if let Err(e) = writer.flush() {
-                        error!(error = %e, segment_id = current_segment_id, "WAL writer: flush failed before rotation; exiting");
-                        return;
-                    }
-                    drop(writer);
-
-                    current_segment_id += 1;
-                    current_byte_offset = 0;
-
-                    let path = segment_path(&dir, current_segment_id);
-                    let file = match OpenOptions::new().append(true).create(true).open(&path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            error!(error = %e, path = %path.display(), "WAL writer: failed to open next segment; exiting");
-                            return;
-                        }
-                    };
-                    writer = BufWriter::with_capacity(64 * 1024, file);
-                }
-
-                if let Err(e) = writer.write_all(&encode_buf) {
-                    error!(error = %e, segment_id = current_segment_id, "WAL writer: write_all failed; exiting");
-                    return;
-                }
-                current_byte_offset += record_len;
-                dirty = true;
-
-                // `head` (and the reader wake-up) is advanced only after a flush
-                // makes the bytes durable on disk — see the flush_tick branch.
-                // Advancing it here would expose buffered-but-unflushed bytes to
-                // the reader, which reads from disk and would busy-spin at EOF.
-            }
-
-            _ = flush_tick.tick() => {
-                // Nothing buffered since the last flush — skip the flush syscall
-                // and the wakeup so an idle writer stays quiet.
-                if !dirty {
-                    continue;
-                }
-
-                if let Err(e) = writer.flush() {
-                    warn!(error = %e, segment_id = current_segment_id, "WAL writer: periodic flush failed");
-                    continue;
-                }
+        // Flush at the top of the loop: under sustained load `recv_timeout` keeps
+        // returning `Ok` and never reports a timeout, so the periodic flush must
+        // be driven by this explicit deadline check rather than a timer branch.
+        if dirty && Instant::now() >= flush_deadline {
+            if let Err(e) = writer.flush() {
+                warn!(error = %e, segment_id = current_segment_id, "WAL writer: periodic flush failed");
+                // Back off so a failing disk doesn't spin this loop.
+                flush_deadline = Instant::now() + FLUSH_INTERVAL;
+            } else {
                 dirty = false;
-
-                head.store(WalOffset { segment_id: current_segment_id, byte_offset: current_byte_offset });
+                head.store(WalOffset {
+                    segment_id: current_segment_id,
+                    byte_offset: current_byte_offset,
+                });
                 notify.notify_waiters();
             }
         }
+
+        // Wait for the next event. While clean, block indefinitely; while dirty,
+        // block only until the flush deadline. `saturating_duration_since` yields
+        // a non-negative timeout even if the deadline just elapsed (the loop top
+        // will flush on the next iteration).
+        let ev = if dirty {
+            match rx.recv_timeout(flush_deadline.saturating_duration_since(Instant::now())) {
+                Ok(ev) => ev,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(ev) => ev,
+                Err(_) => break,
+            }
+        };
+
+        if let Err(e) = codec::encode_into(&mut encode_buf, &ev) {
+            error!(error = %e, "WAL writer: failed to encode event; dropping event");
+            continue;
+        }
+
+        let record_len = encode_buf.len() as u64;
+
+        if current_byte_offset > 0 && current_byte_offset + record_len > segment_bytes {
+            if let Err(e) = writer.flush() {
+                error!(error = %e, segment_id = current_segment_id, "WAL writer: flush failed before rotation; exiting");
+                return;
+            }
+            drop(writer);
+
+            current_segment_id += 1;
+            current_byte_offset = 0;
+
+            let path = segment_path(&dir, current_segment_id);
+            let file = match OpenOptions::new().append(true).create(true).open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    error!(error = %e, path = %path.display(), "WAL writer: failed to open next segment; exiting");
+                    return;
+                }
+            };
+            writer = BufWriter::with_capacity(64 * 1024, file);
+        }
+
+        if let Err(e) = writer.write_all(&encode_buf) {
+            error!(error = %e, segment_id = current_segment_id, "WAL writer: write_all failed; exiting");
+            return;
+        }
+        current_byte_offset += record_len;
+
+        // `head` (and the reader wake-up) is advanced only after a flush makes the
+        // bytes durable on disk — see the flush at the top of the loop. Advancing
+        // it here would expose buffered-but-unflushed bytes to the reader, which
+        // reads from disk and would busy-spin at EOF.
+        if !dirty {
+            dirty = true;
+            flush_deadline = Instant::now() + FLUSH_INTERVAL;
+        }
     }
+
+    // Shutdown: all senders dropped. Flush whatever remains, publish head, then
+    // wake the reader. Returning drops this thread's `notify`/`head` Arc clones,
+    // letting the subscription's `strong_count == 1` shutdown detection fire.
+    if let Err(e) = writer.flush() {
+        warn!(error = %e, "WAL writer: final flush failed on shutdown");
+    } else {
+        head.store(WalOffset {
+            segment_id: current_segment_id,
+            byte_offset: current_byte_offset,
+        });
+    }
+    notify.notify_waiters();
 }
 
 #[cfg(test)]
@@ -205,7 +235,6 @@ mod tests {
     use crate::model::messages::status::StatusMessage;
     use std::fs;
     use std::io::Cursor;
-    use std::time::Instant;
     use tempfile::tempdir;
 
     fn sample_event(seq: u64) -> WalEvent {
@@ -249,7 +278,7 @@ mod tests {
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
 
         let event = sample_event(1);
-        handle.tx.send(event.clone()).await.unwrap();
+        handle.tx.send(event.clone()).unwrap();
 
         // Drop sender so writer task flushes + exits.
         drop(handle.tx);
@@ -283,7 +312,7 @@ mod tests {
         codec::encode_into(&mut encode_buf, &ev2).unwrap();
         let len2 = encode_buf.len() as u64;
 
-        handle.tx.send(ev1).await.unwrap();
+        handle.tx.send(ev1).unwrap();
         wait_for_head(
             &handle,
             WalOffset {
@@ -293,7 +322,7 @@ mod tests {
         )
         .await;
 
-        handle.tx.send(ev2).await.unwrap();
+        handle.tx.send(ev2).unwrap();
         wait_for_head(
             &handle,
             WalOffset {
@@ -310,8 +339,8 @@ mod tests {
         // Tiny segment_bytes guarantees rotation after the first record.
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 64, 8).unwrap();
 
-        handle.tx.send(sample_event(1)).await.unwrap();
-        handle.tx.send(sample_event(2)).await.unwrap();
+        handle.tx.send(sample_event(1)).unwrap();
+        handle.tx.send(sample_event(2)).unwrap();
 
         // Wait until head has advanced into segment 2.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -344,7 +373,7 @@ mod tests {
 
         // Pre-populate segment 1 with one record using a first writer.
         let first = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
-        first.tx.send(sample_event(1)).await.unwrap();
+        first.tx.send(sample_event(1)).unwrap();
         let mut buf = Vec::new();
         codec::encode_into(&mut buf, &sample_event(1)).unwrap();
         let first_len = buf.len() as u64;
@@ -361,7 +390,7 @@ mod tests {
 
         // Reopen at the recovered offset; the new writer should append, not overwrite.
         let second = spawn_writer(dir.path().to_path_buf(), 1, first_len, 1024 * 1024, 8).unwrap();
-        second.tx.send(sample_event(2)).await.unwrap();
+        second.tx.send(sample_event(2)).unwrap();
         codec::encode_into(&mut buf, &sample_event(2)).unwrap();
         let second_len = buf.len() as u64;
         wait_for_head(
@@ -394,7 +423,7 @@ mod tests {
         let mut buf = Vec::new();
         codec::encode_into(&mut buf, &ev).unwrap();
         let len = buf.len() as u64;
-        handle.tx.send(ev).await.unwrap();
+        handle.tx.send(ev).unwrap();
         wait_for_head(
             &handle,
             WalOffset {
@@ -420,7 +449,7 @@ mod tests {
         let notified = handle.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        handle.tx.send(sample_event(2)).await.unwrap();
+        handle.tx.send(sample_event(2)).unwrap();
         let woken = tokio::time::timeout(Duration::from_millis(500), notified).await;
         assert!(
             woken.is_ok(),
