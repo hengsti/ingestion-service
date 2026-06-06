@@ -230,4 +230,16 @@ mod tests {
     fn build_body_empty_batch_is_empty_string() {
         assert_eq!(build_body(&[]), "");
     }
+
+    #[test]
+    fn is_permanent_status_classifies_expected_http_codes() {
+        assert!(is_permanent_status(StatusCode::BAD_REQUEST));
+        assert!(is_permanent_status(StatusCode::UNAUTHORIZED));
+        assert!(is_permanent_status(StatusCode::NOT_FOUND));
+
+        assert!(!is_permanent_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(!is_permanent_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_permanent_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_permanent_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
 }

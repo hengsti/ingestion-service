@@ -85,13 +85,16 @@ impl PipelineStage for PersistStage {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::Duration;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::{
-        infrastructure::wal::{subscription::WalSubscription, types::WalOptions},
+        infrastructure::wal::{
+            segment::segment_path, subscription::WalSubscription, types::WalOptions,
+        },
         model::messages::{
             message::HandledMessage,
             sensor::{SensorData, SensorMessage},
@@ -226,6 +229,54 @@ mod tests {
         let (result, ctx) = saturated.expect("WAL queue should saturate under a tight flood");
         assert!(matches!(result, Ok(StageFlow::Stop)));
         assert_eq!(ctx.dlq_reason(), Some("wal queue full"));
+    }
+
+    #[tokio::test]
+    async fn run_marks_dlq_with_queue_closed_when_wal_writer_has_exited() {
+        let dir = tempdir().unwrap();
+        let (wal, _sub) = Wal::open(WalOptions {
+            dir: dir.path().to_path_buf(),
+            // Tiny segment limit guarantees rotation on the second record.
+            segment_bytes: 1,
+            queue_capacity: 64,
+        })
+        .await
+        .expect("wal open");
+        let wal = Arc::new(wal);
+        let stage = PersistStage::new(wal);
+
+        // First append writes segment 1.
+        let mut first = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+        assert!(matches!(
+            stage.run(&mut first).await,
+            Ok(StageFlow::Continue)
+        ));
+
+        // Force rotation-open to fail by pre-creating segment 2 path as a directory.
+        let seg2 = segment_path(dir.path(), 2);
+        fs::create_dir_all(&seg2).unwrap();
+
+        // Second append is accepted into the queue; writer then hits fatal open
+        // error while rotating and exits, disconnecting the channel.
+        let mut second = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+        let _ = stage.run(&mut second).await;
+
+        // Wait until a subsequent append observes the closed sender.
+        let mut closed = None;
+        for _ in 0..200 {
+            let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+            let result = stage.run(&mut ctx).await;
+            if ctx.dlq_reason() == Some("wal queue closed") {
+                closed = Some((result, ctx));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let (result, ctx) = closed.expect("WAL channel should close after writer fatal exit");
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+        assert!(ctx.should_publish_dlq());
+        assert_eq!(ctx.dlq_reason(), Some("wal queue closed"));
     }
 
     // ── run(): missing handled_message ────────────────────────────────────────
