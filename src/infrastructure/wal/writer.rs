@@ -77,8 +77,15 @@ impl AtomicWalOffset {
     }
 }
 
+pub(super) type DurableAck = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+pub(super) struct WriteRequest {
+    pub event: WalEvent,
+    pub durable_ack: Option<DurableAck>,
+}
+
 pub(super) struct WriterHandle {
-    pub tx: SyncSender<WalEvent>,
+    pub tx: SyncSender<WriteRequest>,
     pub notify: Arc<Notify>,
     pub head: Arc<AtomicWalOffset>,
 }
@@ -98,7 +105,7 @@ pub(super) fn spawn_writer(
         .with_context(|| format!("opening WAL segment {}", path.display()))?;
     let writer = BufWriter::with_capacity(64 * 1024, file);
 
-    let (tx, rx) = mpsc::sync_channel::<WalEvent>(queue_capacity);
+    let (tx, rx) = mpsc::sync_channel::<WriteRequest>(queue_capacity);
     let notify = Arc::new(Notify::new());
     let head = Arc::new(AtomicWalOffset::new(WalOffset {
         segment_id: start_segment_id,
@@ -138,11 +145,12 @@ fn writer_loop(
     mut current_byte_offset: u64,
     segment_bytes: u64,
     mut writer: BufWriter<File>,
-    rx: Receiver<WalEvent>,
+    rx: Receiver<WriteRequest>,
     head: Arc<AtomicWalOffset>,
     notify: Arc<Notify>,
 ) {
     let mut encode_buf: Vec<u8> = Vec::with_capacity(4 * 1024);
+    let mut pending_durable_acks: Vec<DurableAck> = Vec::new();
 
     // `dirty` means the BufWriter may hold bytes for records not yet flushed to
     // disk and therefore not yet reflected in `head`. Set after each successful
@@ -170,6 +178,7 @@ fn writer_loop(
                     byte_offset: current_byte_offset,
                 });
                 notify.notify_waiters();
+                acknowledge_pending_durable_ok(&mut pending_durable_acks);
             }
         }
 
@@ -177,21 +186,24 @@ fn writer_loop(
         // block only until the flush deadline. `saturating_duration_since` yields
         // a non-negative timeout even if the deadline just elapsed (the loop top
         // will flush on the next iteration).
-        let ev = if dirty {
+        let mut req = if dirty {
             match rx.recv_timeout(flush_deadline.saturating_duration_since(Instant::now())) {
-                Ok(ev) => ev,
+                Ok(req) => req,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         } else {
             match rx.recv() {
-                Ok(ev) => ev,
+                Ok(req) => req,
                 Err(_) => break,
             }
         };
 
-        if let Err(e) = codec::encode_into(&mut encode_buf, &ev) {
+        if let Err(e) = codec::encode_into(&mut encode_buf, &req.event) {
             error!(error = %e, "WAL writer: failed to encode event; dropping event");
+            if let Some(ack) = req.durable_ack.take() {
+                let _ = ack.send(Err(format!("WAL writer encode failed: {e}")));
+            }
             continue;
         }
 
@@ -200,8 +212,21 @@ fn writer_loop(
         if current_byte_offset > 0 && current_byte_offset + record_len > segment_bytes {
             if let Err(e) = writer.flush() {
                 error!(error = %e, segment_id = current_segment_id, "WAL writer: flush failed before rotation; exiting");
+                if let Some(ack) = req.durable_ack.take() {
+                    let _ = ack.send(Err(format!("WAL writer flush failed before rotation: {e}")));
+                }
+                fail_pending_durable_acks(
+                    &mut pending_durable_acks,
+                    format!("WAL writer flush failed before rotation: {e}"),
+                );
                 return;
             }
+            head.store(WalOffset {
+                segment_id: current_segment_id,
+                byte_offset: current_byte_offset,
+            });
+            notify.notify_waiters();
+            acknowledge_pending_durable_ok(&mut pending_durable_acks);
             drop(writer);
 
             current_segment_id += 1;
@@ -212,6 +237,14 @@ fn writer_loop(
                 Ok(f) => f,
                 Err(e) => {
                     error!(error = %e, path = %path.display(), "WAL writer: failed to open next segment; exiting");
+                    if let Some(ack) = req.durable_ack.take() {
+                        let _ =
+                            ack.send(Err(format!("WAL writer failed to open next segment: {e}")));
+                    }
+                    fail_pending_durable_acks(
+                        &mut pending_durable_acks,
+                        format!("WAL writer failed to open next segment: {e}"),
+                    );
                     return;
                 }
             };
@@ -220,9 +253,19 @@ fn writer_loop(
 
         if let Err(e) = writer.write_all(&encode_buf) {
             error!(error = %e, segment_id = current_segment_id, "WAL writer: write_all failed; exiting");
+            if let Some(ack) = req.durable_ack.take() {
+                let _ = ack.send(Err(format!("WAL writer write_all failed: {e}")));
+            }
+            fail_pending_durable_acks(
+                &mut pending_durable_acks,
+                format!("WAL writer write_all failed: {e}"),
+            );
             return;
         }
         current_byte_offset += record_len;
+        if let Some(ack) = req.durable_ack.take() {
+            pending_durable_acks.push(ack);
+        }
 
         // `head` (and the reader wake-up) is advanced only after a flush makes the
         // bytes durable on disk — see the flush at the top of the loop. Advancing
@@ -239,13 +282,30 @@ fn writer_loop(
     // letting the subscription's `strong_count == 1` shutdown detection fire.
     if let Err(e) = writer.flush() {
         warn!(error = %e, "WAL writer: final flush failed on shutdown");
+        fail_pending_durable_acks(
+            &mut pending_durable_acks,
+            format!("WAL writer final flush failed on shutdown: {e}"),
+        );
     } else {
         head.store(WalOffset {
             segment_id: current_segment_id,
             byte_offset: current_byte_offset,
         });
+        acknowledge_pending_durable_ok(&mut pending_durable_acks);
     }
     notify.notify_waiters();
+}
+
+fn acknowledge_pending_durable_ok(pending: &mut Vec<DurableAck>) {
+    for ack in pending.drain(..) {
+        let _ = ack.send(Ok(()));
+    }
+}
+
+fn fail_pending_durable_acks(pending: &mut Vec<DurableAck>, reason: String) {
+    for ack in pending.drain(..) {
+        let _ = ack.send(Err(reason.clone()));
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +330,13 @@ mod tests {
         }
     }
 
+    fn req(event: WalEvent) -> WriteRequest {
+        WriteRequest {
+            event,
+            durable_ack: None,
+        }
+    }
+
     async fn wait_for_head(handle: &WriterHandle, expected: WalOffset) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -291,7 +358,7 @@ mod tests {
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
 
         let event = sample_event(1);
-        handle.tx.send(event.clone()).unwrap();
+        handle.tx.send(req(event.clone())).unwrap();
 
         // Drop sender so writer task flushes + exits.
         drop(handle.tx);
@@ -325,7 +392,7 @@ mod tests {
         codec::encode_into(&mut encode_buf, &ev2).unwrap();
         let len2 = encode_buf.len() as u64;
 
-        handle.tx.send(ev1).unwrap();
+        handle.tx.send(req(ev1)).unwrap();
         wait_for_head(
             &handle,
             WalOffset {
@@ -335,7 +402,7 @@ mod tests {
         )
         .await;
 
-        handle.tx.send(ev2).unwrap();
+        handle.tx.send(req(ev2)).unwrap();
         wait_for_head(
             &handle,
             WalOffset {
@@ -352,8 +419,8 @@ mod tests {
         // Tiny segment_bytes guarantees rotation after the first record.
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 64, 8).unwrap();
 
-        handle.tx.send(sample_event(1)).unwrap();
-        handle.tx.send(sample_event(2)).unwrap();
+        handle.tx.send(req(sample_event(1))).unwrap();
+        handle.tx.send(req(sample_event(2))).unwrap();
 
         // Wait until head has advanced into segment 2.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -386,7 +453,7 @@ mod tests {
 
         // Pre-populate segment 1 with one record using a first writer.
         let first = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
-        first.tx.send(sample_event(1)).unwrap();
+        first.tx.send(req(sample_event(1))).unwrap();
         let mut buf = Vec::new();
         codec::encode_into(&mut buf, &sample_event(1)).unwrap();
         let first_len = buf.len() as u64;
@@ -403,7 +470,7 @@ mod tests {
 
         // Reopen at the recovered offset; the new writer should append, not overwrite.
         let second = spawn_writer(dir.path().to_path_buf(), 1, first_len, 1024 * 1024, 8).unwrap();
-        second.tx.send(sample_event(2)).unwrap();
+        second.tx.send(req(sample_event(2))).unwrap();
         codec::encode_into(&mut buf, &sample_event(2)).unwrap();
         let second_len = buf.len() as u64;
         wait_for_head(
@@ -436,7 +503,7 @@ mod tests {
         let mut buf = Vec::new();
         codec::encode_into(&mut buf, &ev).unwrap();
         let len = buf.len() as u64;
-        handle.tx.send(ev).unwrap();
+        handle.tx.send(req(ev)).unwrap();
         wait_for_head(
             &handle,
             WalOffset {
@@ -462,7 +529,7 @@ mod tests {
         let notified = handle.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        handle.tx.send(sample_event(2)).unwrap();
+        handle.tx.send(req(sample_event(2))).unwrap();
         let woken = tokio::time::timeout(Duration::from_millis(500), notified).await;
         assert!(
             woken.is_ok(),

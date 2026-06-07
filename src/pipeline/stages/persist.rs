@@ -8,7 +8,7 @@ use metrics::{counter, histogram};
 use crate::{
     infrastructure::database::influx::{sensor_to_point, status_to_point},
     infrastructure::wal::{
-        types::{TryAppendError, WalEvent},
+        types::{AppendDurableError, WalEvent},
         wal::Wal,
     },
     model::messages::message::HandledMessage,
@@ -60,7 +60,7 @@ impl PipelineStage for PersistStage {
                 line_protocol,
             };
 
-            match self.wal.try_append(event) {
+            match self.wal.append_durable(event).await {
                 Ok(()) => {
                     counter!("ingest_messages_enqueued_total", "kind" => kind).increment(1);
                     histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "success")
@@ -68,7 +68,7 @@ impl PipelineStage for PersistStage {
 
                     Ok(StageFlow::Continue)
                 }
-                Err(TryAppendError::Full(_)) => {
+                Err(AppendDurableError::Full(_)) => {
                     counter!("ingest_queue_full_total", "kind" => kind).increment(1);
                     warn!(topic = %ctx.topic(), "wal queue full; marking for DLQ");
                     ctx.mark_dlq("wal queue full");
@@ -77,13 +77,21 @@ impl PipelineStage for PersistStage {
 
                     Ok(StageFlow::Stop)
                 }
-                Err(TryAppendError::Closed(_)) => {
+                Err(AppendDurableError::Closed(_)) => {
                     counter!("ingest_queue_closed_total", "kind" => kind).increment(1);
                     warn!(topic = %ctx.topic(), "wal queue closed; marking for DLQ");
                     ctx.mark_dlq("wal queue closed");
                     histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "queue_closed")
                         .record(start.elapsed().as_secs_f64());
 
+                    Ok(StageFlow::Stop)
+                }
+                Err(AppendDurableError::Durability(reason)) => {
+                    counter!("ingest_durability_ack_failed_total", "kind" => kind).increment(1);
+                    warn!(topic = %ctx.topic(), reason = %reason, "wal durability ack failed; marking for DLQ");
+                    ctx.mark_dlq("wal durability ack failed");
+                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "durability_failed")
+                        .record(start.elapsed().as_secs_f64());
                     Ok(StageFlow::Stop)
                 }
             }
@@ -102,7 +110,9 @@ mod tests {
     use crate::{
         infrastructure::database::influx::{sensor_to_point, status_to_point},
         infrastructure::wal::{
-            segment::segment_path, subscription::WalSubscription, types::WalOptions,
+            segment::segment_path,
+            subscription::WalSubscription,
+            types::{WalEvent, WalOptions},
         },
         model::messages::{
             message::HandledMessage,
@@ -233,15 +243,26 @@ mod tests {
     #[tokio::test]
     async fn run_marks_dlq_with_queue_full_when_wal_queue_is_saturated() {
         let dir = tempdir().unwrap();
-        // queue_capacity = 1 with a real writer thread draining concurrently:
-        // flood the stage until an append observes the queue full. The producer's
-        // tight loop outruns the writer's encode + write, so this is
-        // deterministic without relying on cooperative scheduling.
         let (wal, _sub) = open_wal(dir.path(), 1).await;
-        let stage = PersistStage::new(wal);
+        let stage = PersistStage::new(wal.clone());
+
+        // Keep the WAL channel under pressure with best-effort non-durable appends
+        // from a separate producer so this durable append can observe `Full`.
+        let flood_wal = wal.clone();
+        let _flood = std::thread::spawn(move || {
+            for i in 0..100_000u64 {
+                let _ = flood_wal.try_append(WalEvent {
+                    topic: format!("smarthome/dev-{i}/status"),
+                    ts_ms: i as i64,
+                    line_protocol: format!(
+                        "device_status,device_id=dev-{i},device_class=test rssi=-50i {i}"
+                    ),
+                });
+            }
+        });
 
         let mut saturated = None;
-        for _ in 0..10_000 {
+        for _ in 0..1_000 {
             let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
             let result = stage.run(&mut ctx).await;
             if ctx.should_publish_dlq() {
@@ -250,7 +271,7 @@ mod tests {
             }
         }
 
-        let (result, ctx) = saturated.expect("WAL queue should saturate under a tight flood");
+        let (result, ctx) = saturated.expect("WAL queue should saturate under producer contention");
         assert!(matches!(result, Ok(StageFlow::Stop)));
         assert_eq!(ctx.dlq_reason(), Some("wal queue full"));
     }

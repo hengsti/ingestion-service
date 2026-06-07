@@ -12,12 +12,12 @@ use crate::infrastructure::wal::{
     recover::{last_valid_offset, truncate_to},
     segment::{list_segments, segment_path},
     subscription::WalSubscription,
-    types::{TryAppendError, WalEvent, WalOffset, WalOptions},
-    writer::spawn_writer,
+    types::{AppendDurableError, TryAppendError, WalEvent, WalOffset, WalOptions},
+    writer::{spawn_writer, WriteRequest},
 };
 
 pub struct Wal {
-    tx: SyncSender<WalEvent>,
+    tx: SyncSender<WriteRequest>,
 }
 
 impl Wal {
@@ -77,12 +77,39 @@ impl Wal {
     // `TryAppendError` carries the rejected `WalEvent` (mirrors `TrySendError`) so
     // callers can recover the payload; the error path is cold (queue saturated),
     // so the large-Err size is acceptable over boxing on the hot append path.
+    #[allow(dead_code)]
     #[allow(clippy::result_large_err)]
     pub fn try_append(&self, event: WalEvent) -> Result<(), TryAppendError> {
-        self.tx.try_send(event).map_err(|err| match err {
-            TrySendError::Full(ev) => TryAppendError::Full(ev),
-            TrySendError::Disconnected(ev) => TryAppendError::Closed(ev),
+        let req = WriteRequest {
+            event,
+            durable_ack: None,
+        };
+        self.tx.try_send(req).map_err(|err| match err {
+            TrySendError::Full(req) => TryAppendError::Full(req.event),
+            TrySendError::Disconnected(req) => TryAppendError::Closed(req.event),
         })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn append_durable(&self, event: WalEvent) -> Result<(), AppendDurableError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let req = WriteRequest {
+            event,
+            durable_ack: Some(ack_tx),
+        };
+
+        self.tx.try_send(req).map_err(|err| match err {
+            TrySendError::Full(req) => AppendDurableError::Full(req.event),
+            TrySendError::Disconnected(req) => AppendDurableError::Closed(req.event),
+        })?;
+
+        match ack_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(AppendDurableError::Durability(reason)),
+            Err(_) => Err(AppendDurableError::Durability(String::from(
+                "wal writer exited before durability ack",
+            ))),
+        }
     }
 }
 
@@ -138,6 +165,23 @@ mod tests {
         assert_eq!(got.offset.segment_id, 1);
         assert_eq!(got.offset.byte_offset, 0);
         assert!(got.offset_after.byte_offset > 0);
+    }
+
+    #[tokio::test]
+    async fn append_durable_returns_only_after_event_is_flushed_to_disk() {
+        let dir = tempdir().unwrap();
+        let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
+        let ev = sample_event(1);
+
+        wal.append_durable(ev.clone()).await.unwrap();
+
+        let bytes = fs::read(dir.path().join("00000000000000000001.log")).unwrap();
+        let mut cur = std::io::Cursor::new(bytes);
+        let (decoded, _) = crate::infrastructure::wal::codec::decode_from(&mut cur)
+            .unwrap()
+            .expect("durable append must be on disk before return");
+        assert_eq!(decoded.ts_ms, ev.ts_ms);
+        assert_eq!(decoded.topic, ev.topic);
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 
 ## A) Correctness findings
 
-### HIGH — WAL append success is not a durability boundary
+### HIGH — WAL append success is not a durability boundary ✅ DONE
 - **Evidence:** `src/pipeline/stages/persist.rs` (`PersistStage::run`), `src/infrastructure/wal/wal.rs` (`Wal::try_append`), `src/infrastructure/wal/writer.rs` (`writer_loop`)
 - **Weak spot:** `try_append` success only means enqueue to in-memory channel, not durable WAL flush. Crash window can lose data while pipeline considers it persisted.
 - **Fix direction:** Add durability ack/barrier from writer after flush + head advance, or redefine persistence guarantee explicitly.

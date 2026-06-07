@@ -55,10 +55,21 @@ pub struct WalOptions {
 /// Reason a non-blocking append was rejected. Each variant carries the rejected
 /// event so callers can recover it (mirrors `tokio`'s `TrySendError`); the
 /// pipeline currently routes to DLQ and drops the payload.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum TryAppendError {
     #[allow(dead_code)]
     Full(WalEvent),
     #[allow(dead_code)]
     Closed(WalEvent),
+}
+
+/// Reason a durability-bound append failed.
+#[derive(Debug)]
+pub enum AppendDurableError {
+    #[allow(dead_code)]
+    Full(WalEvent),
+    #[allow(dead_code)]
+    Closed(WalEvent),
+    Durability(String),
 }
