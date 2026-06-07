@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::model::messages::message::HandledMessage;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
 pub struct WalOffset {
     pub segment_id: u64,
@@ -31,7 +29,7 @@ impl WalOffset {
 pub struct WalEvent {
     pub topic: String,
     pub ts_ms: i64,
-    pub message: HandledMessage,
+    pub line_protocol: String,
 }
 
 #[derive(Debug, Clone)]

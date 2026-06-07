@@ -6,6 +6,7 @@ use tracing::warn;
 use metrics::{counter, histogram};
 
 use crate::{
+    infrastructure::database::influx::{sensor_to_point, status_to_point},
     infrastructure::wal::{
         types::{TryAppendError, WalEvent},
         wal::Wal,
@@ -40,16 +41,23 @@ impl PipelineStage for PersistStage {
         Box::pin(async move {
             let start = Instant::now();
 
-            let message = ctx.handled_message()?.clone();
-            let kind = match &message {
-                HandledMessage::Sensor(_) => "sensor",
-                HandledMessage::Status(_) => "status",
+            let message = ctx.handled_message()?;
+            let mut line_protocol = String::new();
+            let kind = match message {
+                HandledMessage::Sensor(sensor) => {
+                    sensor_to_point(sensor).write_line_protocol(&mut line_protocol);
+                    "sensor"
+                }
+                HandledMessage::Status(status) => {
+                    status_to_point(status).write_line_protocol(&mut line_protocol);
+                    "status"
+                }
             };
 
             let event = WalEvent {
                 topic: ctx.topic().to_string(),
                 ts_ms: chrono::Utc::now().timestamp_millis(),
-                message,
+                line_protocol,
             };
 
             match self.wal.try_append(event) {
@@ -92,6 +100,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        infrastructure::database::influx::{sensor_to_point, status_to_point},
         infrastructure::wal::{
             segment::segment_path, subscription::WalSubscription, types::WalOptions,
         },
@@ -150,6 +159,15 @@ mod tests {
         ctx
     }
 
+    fn expected_line_protocol(msg: &HandledMessage) -> String {
+        let mut out = String::new();
+        match msg {
+            HandledMessage::Sensor(sensor) => sensor_to_point(sensor).write_line_protocol(&mut out),
+            HandledMessage::Status(status) => status_to_point(status).write_line_protocol(&mut out),
+        }
+        out
+    }
+
     async fn open_wal(dir: &std::path::Path, queue_capacity: usize) -> (Arc<Wal>, WalSubscription) {
         let (wal, sub) = Wal::open(WalOptions {
             dir: dir.to_path_buf(),
@@ -185,7 +203,10 @@ mod tests {
 
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
         assert_eq!(event.topic, "smarthome/esp32-1/sensor");
-        assert!(matches!(event.message, HandledMessage::Sensor(_)));
+        assert_eq!(
+            event.line_protocol,
+            expected_line_protocol(&HandledMessage::Sensor(valid_sensor_msg()))
+        );
     }
 
     #[tokio::test]
@@ -201,7 +222,10 @@ mod tests {
         assert!(!ctx.should_publish_dlq());
 
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
-        assert!(matches!(event.message, HandledMessage::Status(_)));
+        assert_eq!(
+            event.line_protocol,
+            expected_line_protocol(&HandledMessage::Status(valid_status_msg()))
+        );
     }
 
     // ── run(): queue error paths ──────────────────────────────────────────────

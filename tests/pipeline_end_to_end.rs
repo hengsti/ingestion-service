@@ -2,7 +2,6 @@ mod common;
 
 use smarthome_ingest::{
     infrastructure::cache::state::CacheState,
-    model::messages::message::HandledMessage,
     pipeline::{
         context::PipelineContext,
         runner::PipelineRunner,
@@ -41,9 +40,9 @@ async fn valid_sensor_message_processes_end_to_end() {
         .expect("expected a sensor event in the WAL");
     assert_eq!(event.topic, "smarthome/esp32-1/sensor");
     assert!(
-        matches!(event.message, HandledMessage::Sensor(_)),
-        "expected a sensor message, got: {:?}",
-        event.message
+        event.line_protocol.contains("bme680"),
+        "expected a sensor line protocol, got: {:?}",
+        event.line_protocol
     );
 
     assert!(
@@ -72,9 +71,9 @@ async fn valid_status_message_processes_end_to_end() {
         .await
         .expect("expected a status event in the WAL");
     assert!(
-        matches!(event.message, HandledMessage::Status(_)),
-        "expected a status message, got: {:?}",
-        event.message
+        event.line_protocol.contains("device_status"),
+        "expected a status line protocol, got: {:?}",
+        event.line_protocol
     );
 }
 

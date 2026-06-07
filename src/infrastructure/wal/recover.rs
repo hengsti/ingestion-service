@@ -68,8 +68,6 @@ mod tests {
     use super::*;
     use crate::infrastructure::wal::codec::encode_into;
     use crate::infrastructure::wal::types::WalEvent;
-    use crate::model::messages::message::HandledMessage;
-    use crate::model::messages::status::StatusMessage;
     use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -79,19 +77,10 @@ mod tests {
         WalEvent {
             topic: format!("smarthome/dev-{seq}/status"),
             ts_ms: 1_700_000_000_000 + seq as i64,
-            message: HandledMessage::Status(StatusMessage {
-                device_id: format!("dev-{seq}"),
-                device_class: String::from("test"),
-                fw_version: String::from("1.0.0"),
-                ip: String::from("10.0.0.1"),
-                rssi: -50,
-                time_ms: 0,
-                time_iso: String::from("2024-01-01T00:00:00Z"),
-                time_valid: true,
-                uptime: 1,
-                free_mem: 1,
-                ssid: String::from("ssid"),
-            }),
+            line_protocol: format!(
+                "device_status,device_id=dev-{seq},device_class=test rssi=-50i {}",
+                1_700_000_000_000 + seq as i64
+            ),
         }
     }
 

@@ -8,13 +8,9 @@ use metrics::{counter, histogram};
 use reqwest::{Client, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::{
-    infrastructure::{
-        database::influx::{sensor_to_point, status_to_point},
-        sink::{Sink, SinkError},
-        wal::types::WalEvent,
-    },
-    model::messages::message::HandledMessage,
+use crate::infrastructure::{
+    sink::{Sink, SinkError},
+    wal::types::WalEvent,
 };
 
 /// InfluxDB v2 sink: converts WAL events to line protocol and writes them with a bounded retry loop.
@@ -62,10 +58,7 @@ fn build_body(batch: &[WalEvent]) -> String {
         if !body.is_empty() {
             body.push('\n');
         }
-        match &event.message {
-            HandledMessage::Sensor(s) => sensor_to_point(s).write_line_protocol(&mut body),
-            HandledMessage::Status(s) => status_to_point(s).write_line_protocol(&mut body),
-        }
+        body.push_str(&event.line_protocol);
     }
     body
 }
@@ -156,33 +149,11 @@ fn is_permanent_status(status: StatusCode) -> bool {
 mod tests {
     use super::*;
 
-    use crate::model::messages::sensor::{SensorData, SensorMessage};
-    use crate::model::messages::status::StatusMessage;
-
     fn sample_sensor() -> WalEvent {
         WalEvent {
             topic: "smarthome/dev-1/sensor".to_string(),
             ts_ms: 1_700_000_000_000,
-            message: HandledMessage::Sensor(SensorMessage {
-                device_id: "dev-1".to_string(),
-                room: "living".to_string(),
-                device_class: "bme680".to_string(),
-                fw_version: "1.0.0".to_string(),
-                time_ms: 1_700_000_000_000,
-                time_iso: "2023-11-14T22:13:20Z".to_string(),
-                time_valid: true,
-                data: SensorData {
-                    temp_c: 21.5,
-                    rel_hum_perc: 45.0,
-                    pressure_hpa: 1013.0,
-                    gas_ohm: 50_000.0,
-                    iaq_score: 80.0,
-                    iaq_text: "good".to_string(),
-                    dew_point_c: 9.3,
-                    heat_index_c: 21.0,
-                    altitude_m: 200.0,
-                },
-            }),
+            line_protocol: "bme680,device_id=dev-1 temp_c=21.5 1700000000000".to_string(),
         }
     }
 
@@ -190,19 +161,7 @@ mod tests {
         WalEvent {
             topic: "smarthome/dev-1/status".to_string(),
             ts_ms: 1_700_000_000_000,
-            message: HandledMessage::Status(StatusMessage {
-                device_id: "dev-1".to_string(),
-                device_class: "bme680".to_string(),
-                fw_version: "1.0.0".to_string(),
-                ip: "192.168.0.10".to_string(),
-                rssi: -55,
-                time_ms: 1_700_000_000_000,
-                time_iso: "2023-11-14T22:13:20Z".to_string(),
-                time_valid: true,
-                uptime: 3600,
-                free_mem: 20480,
-                ssid: "home".to_string(),
-            }),
+            line_protocol: "device_status,device_id=dev-1 rssi=-55i 1700000000000".to_string(),
         }
     }
 
@@ -212,15 +171,7 @@ mod tests {
 
         let body = build_body(&batch);
 
-        let line = |event: &WalEvent| {
-            let mut s = String::new();
-            match &event.message {
-                HandledMessage::Sensor(s2) => sensor_to_point(s2).write_line_protocol(&mut s),
-                HandledMessage::Status(s2) => status_to_point(s2).write_line_protocol(&mut s),
-            }
-            s
-        };
-        let expected = format!("{}\n{}", line(&batch[0]), line(&batch[1]));
+        let expected = format!("{}\n{}", batch[0].line_protocol, batch[1].line_protocol);
 
         assert_eq!(body, expected);
         assert_eq!(body.lines().count(), 2);

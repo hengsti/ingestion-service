@@ -54,7 +54,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Two atomics can be observed inconsistently (`segment_id`, `byte_offset`).
 - **Fix direction:** Use one atomic packed value or lock-protected struct.
 
-### HIGH — Allocation churn from cloning and (de)serializing full `HandledMessage`
+### HIGH — Allocation churn from cloning and (de)serializing full `HandledMessage` ✅ DONE
 - **Evidence:** `src/pipeline/stages/persist.rs` clone path, `src/infrastructure/wal/codec.rs` decode path
 - **Weak spot:** Deep clone + nested serialization/deserialization increases allocator pressure.
 - **Fix direction:** Store flat line protocol payload in WAL event instead of full message object graph.

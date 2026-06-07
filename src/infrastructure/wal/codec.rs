@@ -65,31 +65,13 @@ pub fn decode_into<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Option<(
 mod tests {
     use super::*;
     use crate::infrastructure::wal::types::WalEvent;
-    use crate::model::messages::message::HandledMessage;
-    use crate::model::messages::status::StatusMessage;
-
-    fn create_status_message() -> StatusMessage {
-        StatusMessage {
-            device_id: String::from("device-123"),
-            device_class: String::from("temperature"),
-            fw_version: String::from("1.0.0"),
-            ip: String::from("192.168.1.1"),
-            rssi: -42,
-            time_ms: 123456789,
-            time_iso: String::from("2024-06-01T12:34:56Z"),
-            time_valid: true,
-            uptime: 3600,
-            free_mem: 1024,
-            ssid: String::from("MyWiFi"),
-        }
-    }
 
     #[test]
     fn test_encode() {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            message: HandledMessage::Status(create_status_message()),
+            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();
@@ -101,7 +83,7 @@ mod tests {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            message: HandledMessage::Status(create_status_message()),
+            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();
@@ -110,7 +92,7 @@ mod tests {
         let (decoded_event, consumed) = decode_from(&mut cursor).unwrap().unwrap();
         assert_eq!(event.ts_ms, decoded_event.ts_ms);
         assert_eq!(event.topic, decoded_event.topic);
-        assert_eq!(event.message, decoded_event.message);
+        assert_eq!(event.line_protocol, decoded_event.line_protocol);
         assert_eq!(consumed, cursor.position() as usize);
     }
 
@@ -119,7 +101,7 @@ mod tests {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            message: HandledMessage::Status(create_status_message()),
+            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();
@@ -129,7 +111,7 @@ mod tests {
         let (decoded_event, consumed) = decode_from(&mut cursor).unwrap().unwrap();
         assert_eq!(event.ts_ms, decoded_event.ts_ms);
         assert_eq!(event.topic, decoded_event.topic);
-        assert_eq!(event.message, decoded_event.message);
+        assert_eq!(event.line_protocol, decoded_event.line_protocol);
         assert_eq!(consumed, encoded_len);
     }
 
@@ -145,12 +127,14 @@ mod tests {
         let event_a = WalEvent {
             topic: String::from("topic-a"),
             ts_ms: 1,
-            message: HandledMessage::Status(create_status_message()),
+            line_protocol: String::from("device_status,device_id=device-a rssi=-42i 1"),
         };
         let event_b = WalEvent {
             topic: String::from("topic-b-longer-than-a"),
             ts_ms: 2,
-            message: HandledMessage::Status(create_status_message()),
+            line_protocol: String::from(
+                "device_status,device_id=device-b-longer-than-a rssi=-42i 2",
+            ),
         };
 
         let mut wire = Vec::new();
@@ -183,7 +167,7 @@ mod tests {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            message: HandledMessage::Status(create_status_message()),
+            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();

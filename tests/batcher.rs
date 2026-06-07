@@ -10,8 +10,6 @@ use tokio::net::TcpListener;
 use smarthome_ingest::infrastructure::sink::{influx::InfluxSink, Sink};
 use smarthome_ingest::infrastructure::wal::forwarder::run_forwarder;
 use smarthome_ingest::infrastructure::wal::types::WalEvent;
-use smarthome_ingest::model::messages::message::HandledMessage;
-use smarthome_ingest::model::messages::status::StatusMessage;
 
 // ── mock InfluxDB server ──────────────────────────────────────────────────────
 
@@ -63,19 +61,9 @@ fn status_event(device_id: &str) -> WalEvent {
     WalEvent {
         topic: format!("smarthome/{device_id}/status"),
         ts_ms: 1_700_000_000_000,
-        message: HandledMessage::Status(StatusMessage {
-            device_id: device_id.to_string(),
-            device_class: "esp32p4-bme680".to_string(),
-            fw_version: "1.0.0".to_string(),
-            ip: "192.168.1.42".to_string(),
-            rssi: -65,
-            time_ms: 1_700_000_000_000,
-            time_iso: "2023-11-14T22:13:20Z".to_string(),
-            time_valid: true,
-            uptime: 3600,
-            free_mem: 200_000,
-            ssid: "HomeNet".to_string(),
-        }),
+        line_protocol: format!(
+            "device_status,device_id={device_id},device_class=esp32p4-bme680 rssi=-65i 1700000000000"
+        ),
     }
 }
 
