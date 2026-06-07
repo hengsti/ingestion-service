@@ -298,6 +298,12 @@ impl WalSubscription {
             self.cur_byte_offset = 0;
             return true;
         }
+        if head.segment_id == self.cur_segment_id && head.byte_offset > self.cur_byte_offset {
+            // Head has advanced within the current segment. This means durable
+            // bytes are available now, so continue without waiting for another
+            // notify edge that might already have raced.
+            return true;
+        }
 
         // Writer is gone and there is nothing newer to read: terminate. The
         // `enable()` above guarantees the writer's shutdown `notify_waiters`
@@ -317,10 +323,7 @@ impl WalSubscription {
             return head.byte_offset > self.cur_byte_offset;
         }
 
-        // Otherwise wait for the writer to flush more durable bytes (or a torn
-        // tail stays unread until overwritten). We intentionally do *not* spin
-        // on `head.byte_offset > cur_byte_offset`: those bytes may be buffered
-        // or torn, in which case a reopen would read EOF and loop forever.
+        // Otherwise wait for the next writer notify edge.
         notified.await;
         true
     }
@@ -507,6 +510,36 @@ mod tests {
 
         // Nothing else durable: the subscription parks on the empty segment 2.
         assert!(recv_one(&mut sub, 150).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_or_advance_returns_immediately_on_same_segment_head_progress() {
+        let dir = tempdir().unwrap();
+        let head = Arc::new(AtomicWalOffset::new(WalOffset {
+            segment_id: 1,
+            byte_offset: 128,
+        }));
+        let notify = Arc::new(Notify::new());
+        // Keep a writer-like reference alive so wait_or_advance does not take the
+        // writer-shutdown fast-path.
+        let _writer_notify = notify.clone();
+
+        let mut sub = WalSubscription::new(
+            Arc::from(dir.path()),
+            head,
+            notify,
+            WalOffset {
+                segment_id: 1,
+                byte_offset: 64,
+            },
+        );
+
+        let progressed =
+            tokio::time::timeout(Duration::from_millis(50), sub.wait_or_advance()).await;
+        assert!(
+            matches!(progressed, Ok(true)),
+            "same-segment head progress should not block waiting for notify"
+        );
     }
 
     fn make_segment(dir: &Path, id: u64) {

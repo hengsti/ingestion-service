@@ -15,7 +15,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** `try_append` success only means enqueue to in-memory channel, not durable WAL flush. Crash window can lose data while pipeline considers it persisted.
 - **Fix direction:** Add durability ack/barrier from writer after flush + head advance, or redefine persistence guarantee explicitly.
 
-### HIGH — Same-segment notification race can stall replay
+### HIGH — Same-segment notification race can stall replay ✅ DONE
 - **Evidence:** `src/infrastructure/wal/subscription.rs` (`WalSubscription::wait_or_advance`)
 - **Weak spot:** Logic advances only when segment ID increases. If same segment offset advanced and notify was raced/missed, reader can park until another write.
 - **Fix direction:** Also treat `head.segment_id == cur_segment_id && head.byte_offset > cur_byte_offset` as progress.
