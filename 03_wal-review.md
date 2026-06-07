@@ -20,7 +20,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Logic advances only when segment ID increases. If same segment offset advanced and notify was raced/missed, reader can park until another write.
 - **Fix direction:** Also treat `head.segment_id == cur_segment_id && head.byte_offset > cur_byte_offset` as progress.
 
-### HIGH — Recovery truncates after first decodable-corrupt record
+### HIGH — Recovery truncates after first decodable-corrupt record ✅ DONE
 - **Evidence:** `src/infrastructure/wal/recover.rs` (`last_valid_offset`), `src/infrastructure/wal/wal.rs` (`Wal::open`), `src/infrastructure/wal/subscription.rs` skip behavior
 - **Weak spot:** Recovery conflates torn tail vs fully-framed corrupt payload, potentially deleting valid records after a poison record.
 - **Fix direction:** Truncate only incomplete tail; keep framed corrupt records and skip/commit poison safely.

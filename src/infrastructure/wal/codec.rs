@@ -3,6 +3,17 @@ use std::io::Read;
 
 use crate::infrastructure::wal::types::WalEvent;
 
+/// Outcome of attempting to decode a WAL record.
+pub enum DecodeOutcome {
+    /// Valid record decoded successfully.
+    ValidRecord(#[allow(dead_code)] WalEvent, usize),
+    /// Clean EOF or torn tail (incomplete frame).
+    CleanEof,
+    /// Frame was complete but payload deserialization failed (decodable-corrupt).
+    /// Includes the number of bytes consumed so recovery can skip this record.
+    FrameCorrupt(usize),
+}
+
 pub fn encode_into(buf: &mut Vec<u8>, event: &WalEvent) -> Result<()> {
     buf.clear();
     buf.extend_from_slice(&[0u8; 4]); // Placeholder for the length of the encoded event
@@ -28,6 +39,7 @@ pub fn encode_into(buf: &mut Vec<u8>, event: &WalEvent) -> Result<()> {
 /// Convenience wrapper over [`decode_into`] that allocates a fresh payload
 /// buffer per call — used by recovery and tests. The hot read path uses
 /// [`decode_into`] with a reused buffer instead.
+#[allow(dead_code)]
 pub fn decode_from<R: Read>(r: &mut R) -> Result<Option<(WalEvent, usize)>> {
     let mut payload = Vec::new();
     decode_into(r, &mut payload)
@@ -59,6 +71,44 @@ pub fn decode_into<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Option<(
     }
     let event: WalEvent = bincode::deserialize(payload)?;
     Ok(Some((event, 4 + len)))
+}
+
+/// Decodes one record for recovery purposes, distinguishing between frame errors
+/// and deserialization errors.
+///
+/// - Returns `DecodeOutcome::ValidRecord` on successful deserialization.
+/// - Returns `DecodeOutcome::CleanEof` on I/O EOF or torn frame.
+/// - Returns `DecodeOutcome::FrameCorrupt` if frame was complete but payload
+///   deserialization failed; includes the bytes consumed so recovery can skip
+///   this record and continue scanning.
+pub fn decode_for_recovery<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<DecodeOutcome> {
+    let mut len_buf = [0u8; 4];
+
+    match r.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(DecodeOutcome::CleanEof)
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    payload.clear();
+    payload.resize(len, 0);
+    match r.read_exact(payload) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(DecodeOutcome::CleanEof)
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Frame is complete; try to deserialize. If deserialization fails, report it
+    // as a frame-corrupt record (not as an I/O error), so recovery can skip it.
+    match bincode::deserialize::<WalEvent>(payload) {
+        Ok(event) => Ok(DecodeOutcome::ValidRecord(event, 4 + len)),
+        Err(_) => Ok(DecodeOutcome::FrameCorrupt(4 + len)),
+    }
 }
 
 #[cfg(test)]
