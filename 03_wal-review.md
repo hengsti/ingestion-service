@@ -49,7 +49,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** `std::fs` blocking I/O inside async loops can starve runtime workers under disk pressure.
 - **Fix direction:** Move disk I/O to dedicated blocking thread(s) or `spawn_blocking`.
 
-### HIGH — Torn read risk in `AtomicWalOffset`
+### HIGH — Torn read risk in `AtomicWalOffset` ✅ DONE
 - **Evidence:** `src/infrastructure/wal/wal.rs` (`AtomicWalOffset::load` / `store`)
 - **Weak spot:** Two atomics can be observed inconsistently (`segment_id`, `byte_offset`).
 - **Fix direction:** Use one atomic packed value or lock-protected struct.

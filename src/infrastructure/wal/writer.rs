@@ -27,6 +27,7 @@ use crate::infrastructure::wal::{
 const FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 
 pub(super) struct AtomicWalOffset {
+    version: AtomicU64,
     segment_id: AtomicU64,
     byte_offset: AtomicU64,
 }
@@ -34,24 +35,45 @@ pub(super) struct AtomicWalOffset {
 impl AtomicWalOffset {
     pub fn new(offset: WalOffset) -> Self {
         Self {
+            version: AtomicU64::new(0),
             segment_id: AtomicU64::new(offset.segment_id),
             byte_offset: AtomicU64::new(offset.byte_offset),
         }
     }
 
     pub fn load(&self) -> WalOffset {
-        let segment_id = self.segment_id.load(Ordering::Acquire);
-        let byte_offset = self.byte_offset.load(Ordering::Acquire);
-        WalOffset {
-            segment_id,
-            byte_offset,
+        loop {
+            let start = self.version.load(Ordering::Acquire);
+            if start & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let segment_id = self.segment_id.load(Ordering::Relaxed);
+            let byte_offset = self.byte_offset.load(Ordering::Relaxed);
+
+            let end = self.version.load(Ordering::Acquire);
+            if start == end {
+                return WalOffset {
+                    segment_id,
+                    byte_offset,
+                };
+            }
+            std::hint::spin_loop();
         }
     }
 
     pub fn store(&self, offset: WalOffset) {
-        self.segment_id.store(offset.segment_id, Ordering::Release);
+        // Seqlock write section: readers retry while `version` is odd.
+        // The WAL has one writer thread, so a single write section is active.
+        let start = self.version.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(start & 1, 0, "AtomicWalOffset assumes a single writer");
+
+        self.segment_id.store(offset.segment_id, Ordering::Relaxed);
         self.byte_offset
-            .store(offset.byte_offset, Ordering::Release);
+            .store(offset.byte_offset, Ordering::Relaxed);
+
+        self.version.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -235,6 +257,8 @@ mod tests {
     use crate::model::messages::status::StatusMessage;
     use std::fs;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
     use tempfile::tempdir;
 
     fn sample_event(seq: u64) -> WalEvent {
@@ -455,5 +479,44 @@ mod tests {
             woken.is_ok(),
             "a new record must still flush and notify the waiter"
         );
+    }
+
+    #[test]
+    fn atomic_wal_offset_load_never_observes_torn_snapshot() {
+        let head = Arc::new(AtomicWalOffset::new(WalOffset {
+            segment_id: 1,
+            byte_offset: 1_000_000,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer_head = head.clone();
+        let writer_stop = stop.clone();
+        let writer = thread::spawn(move || {
+            let mut segment_id = 1u64;
+            while !writer_stop.load(Ordering::Relaxed) {
+                writer_head.store(WalOffset {
+                    segment_id,
+                    byte_offset: segment_id * 1_000_000,
+                });
+                segment_id = if segment_id == 1 { 2 } else { 1 };
+            }
+        });
+
+        let mut torn = None;
+        let deadline = Instant::now() + Duration::from_millis(120);
+        while Instant::now() < deadline {
+            let observed = head.load();
+            let expected = observed.segment_id * 1_000_000;
+            if observed.byte_offset != expected {
+                torn = Some(observed);
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        assert!(torn.is_none(), "observed torn WAL head snapshot: {torn:?}");
     }
 }
