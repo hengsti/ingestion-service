@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use metrics::counter;
+use metrics::{counter, gauge, histogram};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
@@ -17,6 +17,8 @@ const RETRY_BACKOFF_CAP_MS: u64 = 5_000;
 /// Initial retry backoff is clamped to this so a large `flush_interval_ms`
 /// doesn't delay recovery from a brief outage.
 const RETRY_BACKOFF_START_CAP_MS: u64 = 1_000;
+const RETRY_OUTAGE_DURATION_METRIC: &str = "wal_forwarder_retry_outage_seconds";
+const RETRY_OUTAGE_ACTIVE_METRIC: &str = "wal_forwarder_retry_outage_active";
 
 /// Drains the WAL subscription, batches entries, writes them to `sink`, and
 /// advances the WAL cursor on each successful (or permanently failed) flush.
@@ -106,18 +108,33 @@ async fn flush(
     let events: Vec<WalEvent> = batch.drain(..).map(|e| e.event).collect();
 
     let mut backoff_ms = flush_interval_ms.min(RETRY_BACKOFF_START_CAP_MS);
+    let mut outage_started_at: Option<Instant> = None;
     loop {
         match sink.write(&events).await {
             Ok(()) => {
+                if let Some(started_at) = outage_started_at.take() {
+                    histogram!(RETRY_OUTAGE_DURATION_METRIC)
+                        .record(started_at.elapsed().as_secs_f64());
+                    gauge!(RETRY_OUTAGE_ACTIVE_METRIC).set(0.0);
+                }
                 counter!("wal_forwarder_committed_total").increment(count);
                 break;
             }
             Err(SinkError::Permanent(e)) => {
+                if let Some(started_at) = outage_started_at.take() {
+                    histogram!(RETRY_OUTAGE_DURATION_METRIC)
+                        .record(started_at.elapsed().as_secs_f64());
+                    gauge!(RETRY_OUTAGE_ACTIVE_METRIC).set(0.0);
+                }
                 error!(error = %e, count, "permanent sink failure; dropping batch and advancing cursor");
                 counter!("wal_forwarder_drop_total").increment(count);
                 break;
             }
             Err(SinkError::Retryable(e)) => {
+                if outage_started_at.is_none() {
+                    outage_started_at = Some(Instant::now());
+                    gauge!(RETRY_OUTAGE_ACTIVE_METRIC).set(1.0);
+                }
                 warn!(error = %e, count, backoff_ms, "retryable sink failure; holding batch, will retry");
                 counter!("wal_forwarder_retry_total").increment(1);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -338,5 +355,17 @@ mod tests {
             "sink write must not be replayed while commit is retried"
         );
         assert_eq!(read_cursor(&dir_path).unwrap(), Some(highest));
+    }
+
+    #[test]
+    fn retry_outage_metric_names_are_stable() {
+        assert_eq!(
+            RETRY_OUTAGE_DURATION_METRIC,
+            "wal_forwarder_retry_outage_seconds"
+        );
+        assert_eq!(
+            RETRY_OUTAGE_ACTIVE_METRIC,
+            "wal_forwarder_retry_outage_active"
+        );
     }
 }

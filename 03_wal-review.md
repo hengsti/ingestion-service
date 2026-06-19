@@ -103,7 +103,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Hard to separate normal throughput from WAL growth incidents.
 - **Fix direction:** Add `wal_segment_rotations_total`.
 
-### MEDIUM — Retry outage duration is not directly observable
+### MEDIUM — Retry outage duration is not directly observable ✅ DONE
 - **Evidence:** only retry count counter exists
 - **Weak spot:** Count alone does not show active outage duration.
 - **Fix direction:** Add retry-state gauge and/or elapsed duration log on recovery.
