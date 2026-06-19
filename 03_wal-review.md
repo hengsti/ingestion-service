@@ -83,7 +83,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Misclassification can either silently drop retryable data or stall WAL indefinitely.
 - **Fix direction:** Add unit tests for key status codes (400/401/404/408/429/500/503) + integration assertions.
 
-### HIGH — No full-path outage retry-hold integration test via `run_forwarder`
+### HIGH — No full-path outage retry-hold integration test via `run_forwarder` ✅ DONE
 - **Evidence:** `forwarder.rs` unit tests rely on `flush`; `tests/batcher.rs` mostly happy-path 204
 - **Weak spot:** Core invariant (hold cursor on retryable outage) not validated end-to-end.
 - **Fix direction:** Add integration sequence (503, 503, 204) validating retries and delayed commit.

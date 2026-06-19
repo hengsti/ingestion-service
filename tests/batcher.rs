@@ -1,13 +1,16 @@
 mod common;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{extract::State, routing::post, Router};
 use bytes::Bytes;
+use reqwest::StatusCode;
 use tokio::net::TcpListener;
 
 use smarthome_ingest::infrastructure::sink::{influx::InfluxSink, Sink};
+use smarthome_ingest::infrastructure::wal::cursor::read_cursor;
 use smarthome_ingest::infrastructure::wal::forwarder::run_forwarder;
 use smarthome_ingest::infrastructure::wal::types::WalEvent;
 
@@ -34,6 +37,53 @@ async fn spawn_mock_influx() -> (String, Arc<Mutex<Vec<String>>>) {
             ),
         )
         .with_state(received.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (format!("http://127.0.0.1:{}", addr.port()), received)
+}
+
+#[derive(Clone)]
+struct ScriptedInfluxState {
+    received: Arc<Mutex<Vec<String>>>,
+    statuses: Arc<Mutex<VecDeque<StatusCode>>>,
+}
+
+async fn spawn_scripted_mock_influx(
+    statuses: Vec<StatusCode>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let state = ScriptedInfluxState {
+        received: Arc::new(Mutex::new(Vec::new())),
+        statuses: Arc::new(Mutex::new(statuses.into())),
+    };
+    let received = state.received.clone();
+
+    let app = Router::new()
+        .route(
+            "/api/v2/write",
+            post(
+                |State(state): State<ScriptedInfluxState>, body: Bytes| async move {
+                    state
+                        .received
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&body).to_string());
+
+                    state
+                        .statuses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(StatusCode::NO_CONTENT)
+                },
+            ),
+        )
+        .with_state(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -193,5 +243,63 @@ async fn forwarder_drains_final_batch_and_terminates_when_wal_closes() {
     assert_eq!(
         total_lines, 5,
         "every appended event must reach the sink on graceful drain"
+    );
+}
+
+#[tokio::test]
+async fn forwarder_outage_retries_and_commits_only_after_recovery() {
+    // Simulate one transient outage window for a single sink.write call:
+    // 503, 503, then 204. InfluxSink retries these internally, so the forwarder
+    // must hold the WAL batch and only commit after recovery.
+    let (url, received) = spawn_scripted_mock_influx(vec![
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::NO_CONTENT,
+    ])
+    .await;
+    let sink = make_sink(&url);
+    let (wal, sub, tmp) = common::open_temp_wal().await;
+
+    let handle = tokio::spawn(run_forwarder(sub, sink, 1, 1));
+
+    wal.try_append(status_event("dev-outage")).unwrap();
+
+    let request_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while post_count(&received) < 2 && tokio::time::Instant::now() < request_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        post_count(&received) >= 2,
+        "expected at least two failed write attempts during outage window"
+    );
+    assert_eq!(
+        read_cursor(tmp.path()).unwrap(),
+        None,
+        "cursor must not advance while sink retries are still in-flight"
+    );
+
+    let commit_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while read_cursor(tmp.path()).unwrap().is_none()
+        && tokio::time::Instant::now() < commit_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let committed = read_cursor(tmp.path()).unwrap();
+    assert!(
+        committed.is_some(),
+        "cursor must advance after service recovery and successful write"
+    );
+
+    drop(wal);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("forwarder shutdown timed out")
+        .expect("forwarder task panicked")
+        .expect("forwarder returned an error");
+
+    assert_eq!(
+        post_count(&received),
+        3,
+        "expected two 503 retries followed by one successful recovery write"
     );
 }
