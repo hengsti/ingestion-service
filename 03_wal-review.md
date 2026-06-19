@@ -59,7 +59,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Deep clone + nested serialization/deserialization increases allocator pressure.
 - **Fix direction:** Store flat line protocol payload in WAL event instead of full message object graph.
 
-### MEDIUM — Reopen-on-EOF causes syscall churn
+### MEDIUM — Reopen-on-EOF causes syscall churn ✅ DONE
 - **Evidence:** `src/infrastructure/wal/subscription.rs` (`WalSubscription::next`)
 - **Weak spot:** Drops/reopens file repeatedly on EOF at tail.
 - **Fix direction:** Keep descriptor/reader open and re-read after notify.

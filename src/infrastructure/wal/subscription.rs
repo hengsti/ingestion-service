@@ -131,9 +131,9 @@ impl WalSubscription {
                     }
                 }
 
-                // Reader saw EOF (or a torn tail). `read_one` already dropped the
-                // reader so the next iteration reopens the file and sees bytes the
-                // writer appended after our last read.
+                // Reader saw EOF (or a torn tail). Keep the same descriptor open
+                // and wait for notify/head advance; the next read on this
+                // descriptor observes newly appended bytes without reopen churn.
                 ReadOutcome::Eof => {
                     if !self.wait_or_advance().await {
                         return None;
@@ -296,6 +296,7 @@ impl WalSubscription {
         if head.segment_id > self.cur_segment_id {
             self.cur_segment_id += 1;
             self.cur_byte_offset = 0;
+            self.cur_reader = None;
             return true;
         }
         if head.segment_id == self.cur_segment_id && head.byte_offset > self.cur_byte_offset {
@@ -318,6 +319,7 @@ impl WalSubscription {
             if head.segment_id > self.cur_segment_id {
                 self.cur_segment_id += 1;
                 self.cur_byte_offset = 0;
+                self.cur_reader = None;
                 return true;
             }
             return head.byte_offset > self.cur_byte_offset;
@@ -364,9 +366,9 @@ enum ReadOutcome {
 /// `BufReader` and the payload scratch buffer is passed in and handed back so the
 /// caller can cache them across calls. Runs entirely on a blocking thread.
 ///
-/// The returned reader is `Some` only when a record decoded (so it stays cached);
-/// on EOF, corruption, or any open/seek failure it is dropped here (closing the
-/// file descriptor off-runtime) and returned as `None`, forcing a reopen.
+/// The returned reader is retained across successful decodes and EOF so tail
+/// polling can re-read without reopen churn. It is dropped only on corruption or
+/// open/seek failures, where forcing a reopen is safer.
 fn read_one(
     dir: &Path,
     segment_id: u64,
@@ -408,7 +410,7 @@ fn read_one(
             reader,
             payload,
         ),
-        Ok(None) => (ReadOutcome::Eof, None, payload),
+        Ok(None) => (ReadOutcome::Eof, reader, payload),
         Err(e) => (ReadOutcome::Corrupt(e), None, payload),
     }
 }
@@ -540,6 +542,26 @@ mod tests {
             matches!(progressed, Ok(true)),
             "same-segment head progress should not block waiting for notify"
         );
+    }
+
+    #[test]
+    fn read_one_eof_keeps_reader_open_for_tail_polling() {
+        let dir = tempdir().unwrap();
+        let seg = dir.path().join(segment_filename(1));
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(seg)
+            .unwrap();
+
+        let (outcome, reader, payload) = read_one(dir.path(), 1, 0, None, Vec::new());
+        assert!(matches!(outcome, ReadOutcome::Eof));
+        assert!(
+            reader.is_some(),
+            "EOF should retain descriptor to avoid reopen churn"
+        );
+        assert!(payload.is_empty());
     }
 
     fn make_segment(dir: &Path, id: u64) {
