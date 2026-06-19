@@ -88,7 +88,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Core invariant (hold cursor on retryable outage) not validated end-to-end.
 - **Fix direction:** Add integration sequence (503, 503, 204) validating retries and delayed commit.
 
-### HIGH — Influx sink non-204 failure paths not integration-tested
+### HIGH — Influx sink non-204 failure paths not integration-tested ✅ DONE
 - **Evidence:** mock server returns only 204 in existing integration coverage
 - **Weak spot:** Permanent/retryable branches and backoff behavior not covered.
 - **Fix direction:** Extend mock server to scripted response sequences and assert error mapping.

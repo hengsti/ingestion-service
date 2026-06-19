@@ -9,7 +9,7 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use tokio::net::TcpListener;
 
-use smarthome_ingest::infrastructure::sink::{influx::InfluxSink, Sink};
+use smarthome_ingest::infrastructure::sink::{influx::InfluxSink, Sink, SinkError};
 use smarthome_ingest::infrastructure::wal::cursor::read_cursor;
 use smarthome_ingest::infrastructure::wal::forwarder::run_forwarder;
 use smarthome_ingest::infrastructure::wal::types::WalEvent;
@@ -151,6 +151,42 @@ async fn sink_write_empty_batch_makes_no_request() {
     sink.write(&[]).await.unwrap();
 
     assert_eq!(post_count(&received), 0, "empty batch must not POST");
+}
+
+#[tokio::test]
+async fn sink_write_http_400_returns_permanent_without_retry() {
+    let (url, received) =
+        spawn_scripted_mock_influx(vec![StatusCode::BAD_REQUEST, StatusCode::NO_CONTENT]).await;
+    let sink = make_sink(&url);
+
+    let result = sink.write(&[status_event("bad-request")]).await;
+
+    assert!(matches!(result, Err(SinkError::Permanent(_))));
+    assert_eq!(
+        post_count(&received),
+        1,
+        "400 must be treated as permanent and must not be retried"
+    );
+}
+
+#[tokio::test]
+async fn sink_write_http_503_retries_and_returns_retryable_after_exhaustion() {
+    let (url, received) = spawn_scripted_mock_influx(vec![
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ])
+    .await;
+    let sink = make_sink(&url);
+
+    let result = sink.write(&[status_event("svc-unavailable")]).await;
+
+    assert!(matches!(result, Err(SinkError::Retryable(_))));
+    assert_eq!(
+        post_count(&received),
+        3,
+        "503 must be retried three times before returning retryable error"
+    );
 }
 
 // ── forwarder + WAL integration tests ─────────────────────────────────────────
