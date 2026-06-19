@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use metrics::counter;
 use tokio::sync::Notify;
 use tracing::{error, warn};
 
@@ -88,6 +89,27 @@ pub(super) struct WriterHandle {
     pub tx: SyncSender<WriteRequest>,
     pub notify: Arc<Notify>,
     pub head: Arc<AtomicWalOffset>,
+}
+
+#[derive(Clone, Copy)]
+enum WriterFatalReason {
+    FlushBeforeRotation,
+    OpenNextSegment,
+    WriteAll,
+}
+
+impl WriterFatalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FlushBeforeRotation => "flush_before_rotation",
+            Self::OpenNextSegment => "open_next_segment",
+            Self::WriteAll => "write_all",
+        }
+    }
+}
+
+fn record_writer_fatal(reason: WriterFatalReason) {
+    counter!("wal_writer_fatal_total", "reason" => reason.as_str()).increment(1);
 }
 
 pub(super) fn spawn_writer(
@@ -212,6 +234,7 @@ fn writer_loop(
         if current_byte_offset > 0 && current_byte_offset + record_len > segment_bytes {
             if let Err(e) = writer.flush() {
                 error!(error = %e, segment_id = current_segment_id, "WAL writer: flush failed before rotation; exiting");
+                record_writer_fatal(WriterFatalReason::FlushBeforeRotation);
                 if let Some(ack) = req.durable_ack.take() {
                     let _ = ack.send(Err(format!("WAL writer flush failed before rotation: {e}")));
                 }
@@ -237,6 +260,7 @@ fn writer_loop(
                 Ok(f) => f,
                 Err(e) => {
                     error!(error = %e, path = %path.display(), "WAL writer: failed to open next segment; exiting");
+                    record_writer_fatal(WriterFatalReason::OpenNextSegment);
                     if let Some(ack) = req.durable_ack.take() {
                         let _ =
                             ack.send(Err(format!("WAL writer failed to open next segment: {e}")));
@@ -253,6 +277,7 @@ fn writer_loop(
 
         if let Err(e) = writer.write_all(&encode_buf) {
             error!(error = %e, segment_id = current_segment_id, "WAL writer: write_all failed; exiting");
+            record_writer_fatal(WriterFatalReason::WriteAll);
             if let Some(ack) = req.durable_ack.take() {
                 let _ = ack.send(Err(format!("WAL writer write_all failed: {e}")));
             }
@@ -337,6 +362,19 @@ mod tests {
             event,
             durable_ack: None,
         }
+    }
+
+    #[test]
+    fn writer_fatal_reason_labels_are_stable() {
+        assert_eq!(
+            WriterFatalReason::FlushBeforeRotation.as_str(),
+            "flush_before_rotation"
+        );
+        assert_eq!(
+            WriterFatalReason::OpenNextSegment.as_str(),
+            "open_next_segment"
+        );
+        assert_eq!(WriterFatalReason::WriteAll.as_str(), "write_all");
     }
 
     async fn wait_for_head(handle: &WriterHandle, expected: WalOffset) {

@@ -93,7 +93,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Permanent/retryable branches and backoff behavior not covered.
 - **Fix direction:** Extend mock server to scripted response sequences and assert error mapping.
 
-### MEDIUM — No metric for WAL writer fatal exits
+### MEDIUM — No metric for WAL writer fatal exits ✅ DONE
 - **Evidence:** fatal returns in `src/infrastructure/wal/writer.rs` only log
 - **Weak spot:** No alertable signal for writer death.
 - **Fix direction:** Add `wal_writer_fatal_total{reason=...}` counter.
