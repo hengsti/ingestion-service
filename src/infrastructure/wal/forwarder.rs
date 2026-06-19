@@ -182,6 +182,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::infrastructure::wal::cursor::read_cursor;
+    use crate::infrastructure::wal::test_support::sample_event;
     use crate::infrastructure::wal::types::WalOptions;
     use crate::infrastructure::wal::wal::Wal;
 
@@ -225,17 +226,6 @@ mod tests {
         }
     }
 
-    fn sample_event(seq: u64) -> WalEvent {
-        WalEvent {
-            topic: format!("smarthome/dev-{seq}/status"),
-            ts_ms: 1_700_000_000_000 + seq as i64,
-            line_protocol: format!(
-                "device_status,device_id=dev-{seq},device_class=test rssi=-50i {}",
-                1_700_000_000_000 + seq as i64
-            ),
-        }
-    }
-
     fn opts(dir: &std::path::Path) -> WalOptions {
         WalOptions {
             dir: dir.to_path_buf(),
@@ -257,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_retryable_then_success_commits_once_without_dropping() {
+    async fn test_flush_retryable_then_success_commits_once_without_dropping() {
         let dir = tempdir().unwrap();
         let (wal, mut sub) = Wal::open(opts(dir.path())).await.unwrap();
         wal.try_append(sample_event(0)).unwrap();
@@ -283,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_permanent_drops_batch_and_advances_cursor() {
+    async fn test_flush_permanent_error_drops_batch_and_advances_cursor() {
         let dir = tempdir().unwrap();
         let (wal, mut sub) = Wal::open(opts(dir.path())).await.unwrap();
         wal.try_append(sample_event(0)).unwrap();
@@ -308,7 +298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_success_commits_and_advances_cursor() {
+    async fn test_flush_success_commits_and_advances_cursor() {
         let dir = tempdir().unwrap();
         let (wal, mut sub) = Wal::open(opts(dir.path())).await.unwrap();
         wal.try_append(sample_event(0)).unwrap();
@@ -327,7 +317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_retries_commit_until_cursor_becomes_writable_without_rewriting_sink() {
+    async fn test_flush_commit_transient_failure_retries_without_rewriting_sink() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path().to_path_buf();
         let (wal, mut sub) = Wal::open(opts(&dir_path)).await.unwrap();
@@ -358,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_outage_metric_names_are_stable() {
+    fn test_retry_outage_metric_names_are_stable() {
         assert_eq!(
             RETRY_OUTAGE_DURATION_METRIC,
             "wal_forwarder_retry_outage_seconds"

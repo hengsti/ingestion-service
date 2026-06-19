@@ -113,22 +113,22 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Hard to diagnose root cause from logs.
 - **Fix direction:** Include `error = %last_err` (and status where available) in warn logs.
 
-### LOW — `sample_event` helper duplicated across WAL test modules
+### LOW — `sample_event` helper duplicated across WAL test modules ✅ DONE
 - **Evidence:** duplicated helper in multiple WAL test files
 - **Weak spot:** Maintenance drift risk.
 - **Fix direction:** Centralize in WAL test support helper.
 
-### LOW — Non-atomic offset load semantics undocumented
+### LOW — Non-atomic offset load semantics undocumented ✅ DONE
 - **Evidence:** `AtomicWalOffset` two-load behavior lacks rationale comment
 - **Weak spot:** Subtle concurrency assumption not documented.
 - **Fix direction:** Add explicit invariant/safety note.
 
-### LOW — WAL test names diverge from repo naming convention
+### LOW — WAL test names diverge from repo naming convention ✅ DONE
 - **Evidence:** descriptive names not in `test_<function>_<scenario>_<expected>` pattern
 - **Weak spot:** Consistency/filterability impact.
 - **Fix direction:** Rename gradually.
 
-### LOW — No end-to-end test for corrupt cursor file startup behavior
+### LOW — No end-to-end test for corrupt cursor file startup behavior ✅ DONE
 - **Evidence:** unit coverage in cursor module exists; startup policy path lacks E2E assertion
 - **Weak spot:** Recovery behavior under corrupt cursor not validated at service-open boundary.
 - **Fix direction:** Add WAL open test with malformed cursor and explicit expected policy.

@@ -123,23 +123,13 @@ mod tests {
     use super::*;
     use crate::infrastructure::wal::{
         segment::list_segments,
-        types::{WalEntry, WalEvent, WalOptions},
+        test_support::sample_event,
+        types::{WalEntry, WalOptions},
     };
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::time::Duration;
     use tempfile::tempdir;
-
-    fn sample_event(seq: u64) -> WalEvent {
-        WalEvent {
-            topic: format!("smarthome/dev-{seq}/status"),
-            ts_ms: 1_700_000_000_000 + seq as i64,
-            line_protocol: format!(
-                "device_status,device_id=dev-{seq},device_class=test rssi=-50i {}",
-                1_700_000_000_000 + seq as i64
-            ),
-        }
-    }
 
     fn opts(dir: &std::path::Path, segment_bytes: u64, queue_capacity: usize) -> WalOptions {
         WalOptions {
@@ -157,7 +147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_then_next_round_trips_a_single_event() {
+    async fn test_try_append_then_next_round_trips_single_event() {
         let dir = tempdir().unwrap();
         let (wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
 
@@ -173,7 +163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_durable_returns_only_after_event_is_visible_after_writer_flush() {
+    async fn test_append_durable_writer_flush_visibility_returns_after_readable() {
         let dir = tempdir().unwrap();
         let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
         let ev = sample_event(1);
@@ -190,7 +180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_without_commit_replays_all_records_with_monotonic_offsets() {
+    async fn test_open_reopen_without_commit_replays_all_records_with_monotonic_offsets() {
         let dir = tempdir().unwrap();
 
         {
@@ -223,7 +213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_halfway_resumes_subscription_at_committed_offset() {
+    async fn test_commit_halfway_reopen_resumes_subscription_at_committed_offset() {
         let dir = tempdir().unwrap();
 
         // Phase 1: append 10, consume 5, commit at the 5th's `offset_after`.
@@ -259,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segment_rotation_produces_multiple_files_on_disk() {
+    async fn test_try_append_segment_rotation_produces_multiple_files_on_disk() {
         let dir = tempdir().unwrap();
 
         let (wal, _sub) = Wal::open(opts(dir.path(), 512, 64)).await.unwrap();
@@ -278,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_past_segment_boundary_deletes_older_segments() {
+    async fn test_commit_past_segment_boundary_deletes_older_segments() {
         let dir = tempdir().unwrap();
 
         // Force rotation with a tight segment_bytes.
@@ -309,7 +299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn torn_trailing_record_stops_replay_cleanly() {
+    async fn test_open_torn_trailing_record_stops_replay_cleanly() {
         let dir = tempdir().unwrap();
 
         // Append one good record, then close the WAL.
@@ -338,7 +328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn torn_tail_is_healed_on_open_and_subsequent_append_replays_cleanly() {
+    async fn test_open_torn_tail_heals_and_subsequent_append_replays_cleanly() {
         let dir = tempdir().unwrap();
 
         // Append one good record, then close the WAL.
@@ -388,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_subscription_drains_all_records_after_writer_shutdown() {
+    async fn test_next_live_subscription_after_writer_shutdown_drains_all_records() {
         let dir = tempdir().unwrap();
 
         let (wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 256)).await.unwrap();
@@ -411,7 +401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_append_returns_full_when_queue_is_saturated() {
+    async fn test_try_append_queue_saturated_returns_full() {
         let dir = tempdir().unwrap();
         // queue_capacity = 1 with a real writer thread draining concurrently:
         // flood the channel until a `try_send` observes the buffer full. The
@@ -431,5 +421,22 @@ mod tests {
             TryAppendError::Full(_) => {}
             TryAppendError::Closed(_) => panic!("expected Full, got Closed"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_open_corrupt_cursor_file_returns_error() {
+        let dir = tempdir().unwrap();
+        let cursor_path = dir.path().join("commit.cursor");
+        fs::write(&cursor_path, [1u8, 2u8, 3u8]).unwrap();
+
+        let err = match Wal::open(opts(dir.path(), 1024 * 1024, 16)).await {
+            Ok(_) => panic!("corrupt cursor must fail startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("Invalid cursor file length: expected 16 bytes, got 3"),
+            "{err:#}"
+        );
     }
 }

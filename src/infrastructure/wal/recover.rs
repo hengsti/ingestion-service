@@ -82,22 +82,11 @@ pub fn truncate_to(path: &Path, len: u64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::infrastructure::wal::codec::encode_into;
-    use crate::infrastructure::wal::types::WalEvent;
+    use crate::infrastructure::wal::test_support::sample_event;
     use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
     use tempfile::tempdir;
-
-    fn sample_event(seq: u64) -> WalEvent {
-        WalEvent {
-            topic: format!("smarthome/dev-{seq}/status"),
-            ts_ms: 1_700_000_000_000 + seq as i64,
-            line_protocol: format!(
-                "device_status,device_id=dev-{seq},device_class=test rssi=-50i {}",
-                1_700_000_000_000 + seq as i64
-            ),
-        }
-    }
 
     /// Writes `n` framed records to a fresh segment file, returning its path and
     /// the total number of bytes written.
@@ -120,14 +109,14 @@ mod tests {
     }
 
     #[test]
-    fn last_valid_offset_missing_file_returns_zero() {
+    fn test_last_valid_offset_missing_file_returns_zero() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("does-not-exist.log");
         assert_eq!(last_valid_offset(&path).unwrap(), 0);
     }
 
     #[test]
-    fn last_valid_offset_empty_file_returns_zero() {
+    fn test_last_valid_offset_empty_file_returns_zero() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("00000000000000000001.log");
         fs::File::create(&path).unwrap();
@@ -135,14 +124,14 @@ mod tests {
     }
 
     #[test]
-    fn last_valid_offset_clean_file_returns_full_length() {
+    fn test_last_valid_offset_clean_file_returns_full_length() {
         let dir = tempdir().unwrap();
         let (path, total) = write_records(dir.path(), 5);
         assert_eq!(last_valid_offset(&path).unwrap(), total);
     }
 
     #[test]
-    fn last_valid_offset_torn_length_prefix_returns_offset_before_prefix() {
+    fn test_last_valid_offset_torn_length_prefix_returns_offset_before_prefix() {
         let dir = tempdir().unwrap();
         let (path, total) = write_records(dir.path(), 3);
 
@@ -155,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn last_valid_offset_full_prefix_partial_payload_returns_offset_before_prefix() {
+    fn test_last_valid_offset_full_prefix_partial_payload_returns_offset_before_prefix() {
         let dir = tempdir().unwrap();
         let (path, total) = write_records(dir.path(), 3);
 
@@ -168,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_shrinks_file() {
+    fn test_truncate_to_torn_tail_shrinks_file() {
         let dir = tempdir().unwrap();
         let (path, total) = write_records(dir.path(), 3);
 
@@ -185,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn last_valid_offset_skips_decodable_corrupt_record_and_continues() {
+    fn test_last_valid_offset_decodable_corrupt_record_skips_and_continues() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("00000000000000000001.log");
 

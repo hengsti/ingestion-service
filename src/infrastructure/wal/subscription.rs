@@ -430,21 +430,11 @@ mod tests {
     use super::*;
     use crate::infrastructure::wal::codec::encode_into;
     use crate::infrastructure::wal::segment::segment_filename;
+    use crate::infrastructure::wal::test_support::sample_event;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::time::Duration;
     use tempfile::tempdir;
-
-    fn sample_event(seq: u64) -> WalEvent {
-        WalEvent {
-            topic: format!("smarthome/dev-{seq}/status"),
-            ts_ms: 1_700_000_000_000 + seq as i64,
-            line_protocol: format!(
-                "device_status,device_id=dev-{seq},device_class=test rssi=-50i {}",
-                1_700_000_000_000 + seq as i64
-            ),
-        }
-    }
 
     async fn recv_one(sub: &mut WalSubscription, ms: u64) -> Option<WalEntry> {
         tokio::time::timeout(Duration::from_millis(ms), sub.next())
@@ -454,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_record_in_sealed_segment_is_skipped_and_following_record_yielded() {
+    async fn test_next_corrupt_record_in_sealed_segment_skips_and_yields_following_record() {
         let dir = tempdir().unwrap();
 
         // Build segment 1 by hand: good record A, a fully-framed but corrupt
@@ -515,7 +505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_or_advance_returns_immediately_on_same_segment_head_progress() {
+    async fn test_wait_or_advance_same_segment_head_progress_returns_immediately() {
         let dir = tempdir().unwrap();
         let head = Arc::new(AtomicWalOffset::new(WalOffset {
             segment_id: 1,
@@ -545,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn read_one_eof_keeps_reader_open_for_tail_polling() {
+    fn test_read_one_eof_keeps_reader_open_for_tail_polling() {
         let dir = tempdir().unwrap();
         let seg = dir.path().join(segment_filename(1));
         OpenOptions::new()
@@ -587,7 +577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_reclaims_segments_below_committed_segment() {
+    async fn test_commit_segments_below_committed_segment_reclaims_older_files() {
         let dir = tempdir().unwrap();
         for id in 1..=3 {
             make_segment(dir.path(), id);
@@ -621,7 +611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_commit_reclaims_crash_leftover_segments_below_start() {
+    async fn test_commit_first_call_reclaims_crash_leftover_segments_below_start() {
         let dir = tempdir().unwrap();
         // A prior run left segments 0 and 1 behind after advancing the cursor
         // into segment 2 but before finishing GC.

@@ -44,6 +44,11 @@ impl AtomicWalOffset {
 
     pub fn load(&self) -> WalOffset {
         loop {
+            // Seqlock read section: `segment_id` and `byte_offset` are separate atomics
+            // and therefore not atomically loaded as a pair. We read both fields only
+            // while `version` is even, then verify the same `version` afterwards.
+            // If a writer overlaps, `version` changes (or is odd) and we retry,
+            // ensuring readers observe a coherent offset snapshot.
             let start = self.version.load(Ordering::Acquire);
             if start & 1 == 1 {
                 std::hint::spin_loop();
@@ -347,22 +352,12 @@ mod tests {
     use super::*;
     use crate::infrastructure::wal::codec::decode_from;
     use crate::infrastructure::wal::segment::list_segments;
+    use crate::infrastructure::wal::test_support::sample_event;
     use std::fs;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use tempfile::tempdir;
-
-    fn sample_event(seq: u64) -> WalEvent {
-        WalEvent {
-            topic: format!("smarthome/dev-{seq}/status"),
-            ts_ms: 1_700_000_000_000 + seq as i64,
-            line_protocol: format!(
-                "device_status,device_id=dev-{seq},device_class=test rssi=-50i {}",
-                1_700_000_000_000 + seq as i64
-            ),
-        }
-    }
 
     fn req(event: WalEvent) -> WriteRequest {
         WriteRequest {
@@ -372,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_fatal_reason_labels_are_stable() {
+    fn test_writer_fatal_reason_labels_are_stable() {
         assert_eq!(
             WriterFatalReason::FlushBeforeRotation.as_str(),
             "flush_before_rotation"
@@ -385,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_rotation_metric_name_is_stable() {
+    fn test_writer_rotation_metric_name_is_stable() {
         assert_eq!(WAL_SEGMENT_ROTATIONS_METRIC, "wal_segment_rotations_total");
     }
 
@@ -405,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_writer_persists_single_event_after_sender_drop() {
+    async fn test_spawn_writer_sender_drop_persists_single_event() {
         let dir = tempdir().unwrap();
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
 
@@ -431,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_writer_updates_head_after_each_record() {
+    async fn test_spawn_writer_each_record_updates_head() {
         let dir = tempdir().unwrap();
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
 
@@ -466,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_writer_rotates_segment_when_threshold_exceeded() {
+    async fn test_spawn_writer_segment_threshold_exceeded_rotates_segment() {
         let dir = tempdir().unwrap();
         // Tiny segment_bytes guarantees rotation after the first record.
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 64, 8).unwrap();
@@ -500,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_writer_appends_to_existing_segment_using_start_offset() {
+    async fn test_spawn_writer_existing_segment_with_start_offset_appends_without_overwrite() {
         let dir = tempdir().unwrap();
 
         // Pre-populate segment 1 with one record using a first writer.
@@ -545,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_writer_does_not_notify_when_no_new_records() {
+    async fn test_spawn_writer_idle_does_not_notify_without_new_records() {
         let dir = tempdir().unwrap();
         let handle = spawn_writer(dir.path().to_path_buf(), 1, 0, 1024 * 1024, 8).unwrap();
 
@@ -590,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_wal_offset_load_never_observes_torn_snapshot() {
+    fn test_atomic_wal_offset_load_never_observes_torn_snapshot() {
         let head = Arc::new(AtomicWalOffset::new(WalOffset {
             segment_id: 1,
             byte_offset: 1_000_000,

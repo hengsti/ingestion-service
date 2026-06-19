@@ -56,7 +56,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_read_cursor() -> Result<()> {
+    fn test_read_cursor_file_states_returns_expected_offsets() -> Result<()> {
         let dir = tempdir()?;
         let cursor_path = dir.path().join("commit.cursor");
 
@@ -80,7 +80,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_cursor() -> Result<()> {
+    fn test_write_cursor_valid_offset_round_trips() -> Result<()> {
         let dir = tempdir()?;
         let offset = WalOffset {
             segment_id: 42,
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_cursor_atomic() -> Result<()> {
+    fn test_write_cursor_over_existing_temp_file_commits_latest_offset() -> Result<()> {
         let dir = tempdir()?;
         let offset1 = WalOffset {
             segment_id: 42,
@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_and_read_cursor() -> Result<()> {
+    fn test_write_cursor_then_read_cursor_returns_written_offset() -> Result<()> {
         let dir = tempdir()?;
         let offset = WalOffset {
             segment_id: 42,
