@@ -25,12 +25,12 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Recovery conflates torn tail vs fully-framed corrupt payload, potentially deleting valid records after a poison record.
 - **Fix direction:** Truncate only incomplete tail; keep framed corrupt records and skip/commit poison safely.
 
-### MEDIUM — Corrupt length prefix can trigger huge allocation
+### MEDIUM — Corrupt length prefix can trigger huge allocation ✅ DONE
 - **Evidence:** `src/infrastructure/wal/codec.rs` (`decode_into`), `src/infrastructure/wal/recover.rs` (`last_valid_offset`), `src/infrastructure/wal/subscription.rs` (`next`)
 - **Weak spot:** Unbounded length from disk is trusted before allocation.
 - **Fix direction:** Enforce max WAL record size before allocation.
 
-### MEDIUM — Cursor commit error can stop forwarder after successful sink write
+### MEDIUM — Cursor commit error can stop forwarder after successful sink write ✅ DONE
 - **Evidence:** `src/infrastructure/wal/forwarder.rs` (`flush`, `run_forwarder`), `src/main.rs` forwarder task error handling
 - **Weak spot:** If sink write succeeds but commit fails, forwarder exits; duplicates on restart and WAL growth while stopped.
 - **Fix direction:** Retry commit and preserve successful batch boundary until cursor durable.

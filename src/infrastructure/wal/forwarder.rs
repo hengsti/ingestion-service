@@ -31,8 +31,9 @@ const RETRY_BACKOFF_START_CAP_MS: u64 = 1_000;
 /// while a flush is in flight.
 ///
 /// # Errors
-/// Returns an error only if committing the WAL cursor fails — sink write
-/// failures are handled in-loop (retried when transient, dropped when permanent).
+/// This function only returns `Ok(())` on normal shutdown. Sink failures are
+/// handled in-loop (retried when transient, dropped when permanent), and cursor
+/// commit failures are retried in-loop until durable.
 pub async fn run_forwarder(
     mut sub: WalSubscription,
     sink: Arc<dyn Sink>,
@@ -84,6 +85,8 @@ pub async fn run_forwarder(
 /// - On a *retryable* sink error the batch is held and retried with exponential
 ///   backoff (capped at [`RETRY_BACKOFF_CAP_MS`]) and the cursor is **not**
 ///   advanced, so the WAL buffers the outage and a crash replays the batch.
+/// - After a terminal sink outcome (success or permanent drop), cursor commits
+///   are retried with bounded backoff until durable before accepting more WAL.
 async fn flush(
     sink: &Arc<dyn Sink>,
     batch: &mut Vec<WalEntry>,
@@ -124,7 +127,26 @@ async fn flush(
     }
 
     // Reached only after a successful or permanently-failed write.
-    sub.commit(highest).await?;
+    // Keep retrying commit until durable so the forwarder does not exit and the
+    // sink write is not replayed.
+    let mut commit_backoff_ms = flush_interval_ms.min(RETRY_BACKOFF_START_CAP_MS);
+    loop {
+        match sub.commit(highest).await {
+            Ok(()) => break,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    count,
+                    backoff_ms = commit_backoff_ms,
+                    "WAL cursor commit failed after sink write; retrying"
+                );
+                counter!("wal_forwarder_commit_retry_total").increment(1);
+                tokio::time::sleep(Duration::from_millis(commit_backoff_ms)).await;
+                commit_backoff_ms = (commit_backoff_ms * 2).min(RETRY_BACKOFF_CAP_MS);
+            }
+        }
+    }
+
     batch.clear();
     Ok(())
 }
@@ -133,6 +155,7 @@ async fn flush(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::fs;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -284,5 +307,36 @@ mod tests {
 
         assert_eq!(mock.call_count(), 1);
         assert_eq!(read_cursor(dir.path()).unwrap(), Some(highest));
+    }
+
+    #[tokio::test]
+    async fn flush_retries_commit_until_cursor_becomes_writable_without_rewriting_sink() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let (wal, mut sub) = Wal::open(opts(&dir_path)).await.unwrap();
+        wal.try_append(sample_event(0)).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut batch = drain(&mut sub, 1).await;
+        let highest = batch.last().unwrap().offset_after;
+
+        let mock = Arc::new(MockSink::new(vec![Resp::Ok]));
+        let sink: Arc<dyn Sink> = mock.clone();
+
+        fs::remove_dir_all(&dir_path).unwrap();
+        let recreate_dir = dir_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            fs::create_dir_all(recreate_dir).unwrap();
+        });
+
+        flush(&sink, &mut batch, &mut sub, 5).await.unwrap();
+
+        assert_eq!(
+            mock.call_count(),
+            1,
+            "sink write must not be replayed while commit is retried"
+        );
+        assert_eq!(read_cursor(&dir_path).unwrap(), Some(highest));
     }
 }
