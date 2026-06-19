@@ -1,7 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::io::Read;
 
 use crate::infrastructure::wal::types::WalEvent;
+
+const MAX_WAL_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// Outcome of attempting to decode a WAL record.
 pub enum DecodeOutcome {
@@ -61,6 +63,7 @@ pub fn decode_into<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Option<(
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_le_bytes(len_buf) as usize;
+    ensure_len_within_limit(len)?;
 
     payload.clear();
     payload.resize(len, 0);
@@ -92,6 +95,14 @@ pub fn decode_for_recovery<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_le_bytes(len_buf) as usize;
+    if ensure_len_within_limit(len).is_err() {
+        let consumed = 4 + len;
+        return if discard_bytes(r, len)? {
+            Ok(DecodeOutcome::FrameCorrupt(consumed))
+        } else {
+            Ok(DecodeOutcome::CleanEof)
+        };
+    }
 
     payload.clear();
     payload.resize(len, 0);
@@ -109,6 +120,31 @@ pub fn decode_for_recovery<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<
         Ok(event) => Ok(DecodeOutcome::ValidRecord(event, 4 + len)),
         Err(_) => Ok(DecodeOutcome::FrameCorrupt(4 + len)),
     }
+}
+
+fn ensure_len_within_limit(len: usize) -> Result<()> {
+    if len > MAX_WAL_RECORD_PAYLOAD_BYTES {
+        return Err(anyhow!(
+            "WAL record length {len} exceeds max {MAX_WAL_RECORD_PAYLOAD_BYTES} bytes"
+        ));
+    }
+
+    Ok(())
+}
+
+fn discard_bytes<R: Read>(r: &mut R, mut remaining: usize) -> Result<bool> {
+    let mut scratch = [0u8; 8192];
+
+    while remaining > 0 {
+        let to_read = remaining.min(scratch.len());
+        match r.read_exact(&mut scratch[..to_read]) {
+            Ok(()) => remaining -= to_read,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -229,5 +265,37 @@ mod tests {
 
         let result = decode_from(&mut cursor).unwrap();
         assert!(result.is_none()); // Should return None due to incomplete event
+    }
+
+    #[test]
+    fn decode_into_oversized_length_prefix_returns_error_without_growing_payload_buffer() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&2_000_000u32.to_le_bytes());
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut payload = Vec::with_capacity(16);
+        let cap_before = payload.capacity();
+
+        let err =
+            decode_into(&mut cursor, &mut payload).expect_err("oversized frame must be rejected");
+        assert!(
+            err.to_string().contains("WAL record length"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(payload.capacity(), cap_before);
+    }
+
+    #[test]
+    fn decode_for_recovery_oversized_length_prefix_keeps_small_payload_buffer() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&2_000_000u32.to_le_bytes());
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut payload = Vec::with_capacity(16);
+        let cap_before = payload.capacity();
+
+        let outcome = decode_for_recovery(&mut cursor, &mut payload).unwrap();
+        assert!(matches!(outcome, DecodeOutcome::CleanEof));
+        assert_eq!(payload.capacity(), cap_before);
     }
 }
