@@ -63,6 +63,10 @@ fn build_body(batch: &[WalEvent]) -> String {
     body
 }
 
+fn http_write_error(status: StatusCode, body: &str) -> anyhow::Error {
+    anyhow::anyhow!("Influx write failed: status={} body={}", status, body)
+}
+
 impl Sink for InfluxSink {
     fn write<'a>(
         &'a self,
@@ -82,7 +86,7 @@ impl Sink for InfluxSink {
             for attempt in 0u32..3 {
                 if attempt > 0 {
                     tokio::time::sleep(Duration::from_secs(1u64 << (attempt - 1))).await;
-                    tracing::warn!(attempt, "retrying influx write");
+                    tracing::warn!(attempt, error = %last_err, "retrying influx write");
                 }
 
                 let send_result = self
@@ -106,8 +110,7 @@ impl Sink for InfluxSink {
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
                         let text = resp.text().await.unwrap_or_default();
-                        let err =
-                            anyhow::anyhow!("Influx write failed: status={} body={}", status, text);
+                        let err = http_write_error(status, &text);
 
                         // 4xx are permanent (malformed line protocol) and must not
                         // be retried — except 408/429, which are transient.
@@ -192,5 +195,13 @@ mod tests {
         assert!(!is_permanent_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(!is_permanent_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!is_permanent_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn http_write_error_includes_status_and_body_context() {
+        let err = http_write_error(StatusCode::SERVICE_UNAVAILABLE, "outage");
+        let text = err.to_string();
+        assert!(text.contains("status=503 Service Unavailable"), "{text}");
+        assert!(text.contains("body=outage"), "{text}");
     }
 }

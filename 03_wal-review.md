@@ -108,7 +108,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Count alone does not show active outage duration.
 - **Fix direction:** Add retry-state gauge and/or elapsed duration log on recovery.
 
-### MEDIUM — Retry log misses error/status context
+### MEDIUM — Retry log misses error/status context ✅ DONE
 - **Evidence:** `src/infrastructure/sink/influx.rs` retry warn log without error field
 - **Weak spot:** Hard to diagnose root cause from logs.
 - **Fix direction:** Include `error = %last_err` (and status where available) in warn logs.
