@@ -35,7 +35,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** If sink write succeeds but commit fails, forwarder exits; duplicates on restart and WAL growth while stopped.
 - **Fix direction:** Retry commit and preserve successful batch boundary until cursor durable.
 
-### MEDIUM — Shutdown can drop pre-WAL worker-queued messages
+### MEDIUM — Shutdown can drop pre-WAL worker-queued messages ✅ DONE
 - **Evidence:** `src/main.rs` worker queueing/shutdown order and post-shutdown WAL drain
 - **Weak spot:** Worker queue items not yet appended to WAL can be dropped on shutdown path.
 - **Fix direction:** Stop intake first, drain worker queues into WAL before worker exit (or WAL-before-queue architecture).

@@ -48,6 +48,26 @@ fn worker_count() -> usize {
         .unwrap_or(4)
 }
 
+async fn recv_worker_job(
+    rx: &mut mpsc::Receiver<IngestJob>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<IngestJob> {
+    loop {
+        if *shutdown_rx.borrow() {
+            return rx.try_recv().ok();
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() {
+                    return rx.try_recv().ok();
+                }
+            }
+            job = rx.recv() => return job,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -185,12 +205,9 @@ async fn main() -> Result<()> {
             info!(worker_id, "pipeline worker started");
 
             loop {
-                let job = tokio::select! {
-                    _ = shutdown_rx.changed() => break,
-                    job = rx.recv() => match job {
-                        Some(j) => j,
-                        None => break,
-                    },
+                let job = match recv_worker_job(&mut rx, &mut shutdown_rx).await {
+                    Some(j) => j,
+                    None => break,
                 };
 
                 let mut ctx = PipelineContext::new(job.topic.clone(), job.payload);
@@ -339,4 +356,51 @@ fn build_router(cfg: &Config) -> Result<Router> {
     }
 
     Ok(router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn recv_worker_job_after_shutdown_drains_queued_messages_before_stopping() {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(4);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        tx.try_send(IngestJob {
+            topic: "smarthome/dev-1/status".to_string(),
+            payload: Bytes::from_static(b"{\"device_id\":\"dev-1\"}"),
+        })
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+
+        let job = recv_worker_job(&mut rx, &mut shutdown_rx).await;
+        assert!(
+            job.is_some(),
+            "queued message must be drained after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_worker_job_after_shutdown_keeps_draining_until_queue_is_empty() {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(4);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        tx.try_send(IngestJob {
+            topic: "smarthome/dev-1/status".to_string(),
+            payload: Bytes::from_static(b"{\"device_id\":\"dev-1\"}"),
+        })
+        .unwrap();
+        tx.try_send(IngestJob {
+            topic: "smarthome/dev-2/status".to_string(),
+            payload: Bytes::from_static(b"{\"device_id\":\"dev-2\"}"),
+        })
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+
+        assert!(recv_worker_job(&mut rx, &mut shutdown_rx).await.is_some());
+        assert!(recv_worker_job(&mut rx, &mut shutdown_rx).await.is_some());
+        assert!(recv_worker_job(&mut rx, &mut shutdown_rx).await.is_none());
+    }
 }
