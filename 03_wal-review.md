@@ -64,7 +64,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** Drops/reopens file repeatedly on EOF at tail.
 - **Fix direction:** Keep descriptor/reader open and re-read after notify.
 
-### MEDIUM — `flush()` comment/semantics mismatch durability expectations
+### MEDIUM — `flush()` comment/semantics mismatch durability expectations ✅ DONE
 - **Evidence:** `src/infrastructure/wal/writer.rs` flush tick handling
 - **Weak spot:** `BufWriter::flush` writes to OS cache, not guaranteed persisted media.
 - **Fix direction:** If required, call `sync_data`; otherwise document weaker durability explicitly.

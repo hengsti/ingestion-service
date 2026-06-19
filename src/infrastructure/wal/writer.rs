@@ -22,8 +22,8 @@ use crate::infrastructure::wal::{
 };
 
 /// How long buffered records may sit in the `BufWriter` before the writer flushes
-/// them to disk and signals the reader. Bounds reader latency without flushing on
-/// every record.
+/// them from process memory into the OS file cache and signals the reader.
+/// Bounds reader latency without flushing on every record.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 
 pub(super) struct AtomicWalOffset {
@@ -267,10 +267,12 @@ fn writer_loop(
             pending_durable_acks.push(ack);
         }
 
-        // `head` (and the reader wake-up) is advanced only after a flush makes the
-        // bytes durable on disk — see the flush at the top of the loop. Advancing
-        // it here would expose buffered-but-unflushed bytes to the reader, which
-        // reads from disk and would busy-spin at EOF.
+        // `head` (and the reader wake-up) is advanced only after a flush pushes
+        // bytes out of this process buffer — see the flush at the top of the loop.
+        // This is a page-cache durability boundary (`BufWriter::flush`), not a
+        // storage-media fsync boundary. Advancing it here would expose
+        // buffered-but-unflushed bytes to the reader, which reads from disk and
+        // would busy-spin at EOF.
         if !dirty {
             dirty = true;
             flush_deadline = Instant::now() + FLUSH_INTERVAL;

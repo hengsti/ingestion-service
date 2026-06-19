@@ -91,6 +91,11 @@ impl Wal {
     }
 
     #[allow(clippy::result_large_err)]
+    /// Appends one event and waits for the writer's flush boundary.
+    ///
+    /// This guarantee is bounded to `BufWriter::flush`: bytes are written out of
+    /// process memory and become readable from the WAL file, but no storage-media
+    /// fsync (`sync_data`) is performed here.
     pub async fn append_durable(&self, event: WalEvent) -> Result<(), AppendDurableError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let req = WriteRequest {
@@ -168,7 +173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_durable_returns_only_after_event_is_flushed_to_disk() {
+    async fn append_durable_returns_only_after_event_is_visible_after_writer_flush() {
         let dir = tempdir().unwrap();
         let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
         let ev = sample_event(1);
@@ -179,7 +184,7 @@ mod tests {
         let mut cur = std::io::Cursor::new(bytes);
         let (decoded, _) = crate::infrastructure::wal::codec::decode_from(&mut cur)
             .unwrap()
-            .expect("durable append must be on disk before return");
+            .expect("append_durable return implies WAL bytes are flushed and readable");
         assert_eq!(decoded.ts_ms, ev.ts_ms);
         assert_eq!(decoded.topic, ev.topic);
     }
