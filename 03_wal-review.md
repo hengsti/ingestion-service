@@ -98,7 +98,7 @@ Collected from parallel sub-agent reviews using different models/agent types:
 - **Weak spot:** No alertable signal for writer death.
 - **Fix direction:** Add `wal_writer_fatal_total{reason=...}` counter.
 
-### MEDIUM — Segment rotation is not observable
+### MEDIUM — Segment rotation is not observable ✅ DONE
 - **Evidence:** increment of `current_segment_id` has no counter/log metric
 - **Weak spot:** Hard to separate normal throughput from WAL growth incidents.
 - **Fix direction:** Add `wal_segment_rotations_total`.

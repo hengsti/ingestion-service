@@ -112,6 +112,12 @@ fn record_writer_fatal(reason: WriterFatalReason) {
     counter!("wal_writer_fatal_total", "reason" => reason.as_str()).increment(1);
 }
 
+const WAL_SEGMENT_ROTATIONS_METRIC: &str = "wal_segment_rotations_total";
+
+fn record_segment_rotation() {
+    counter!(WAL_SEGMENT_ROTATIONS_METRIC).increment(1);
+}
+
 pub(super) fn spawn_writer(
     dir: PathBuf,
     start_segment_id: u64,
@@ -273,6 +279,7 @@ fn writer_loop(
                 }
             };
             writer = BufWriter::with_capacity(64 * 1024, file);
+            record_segment_rotation();
         }
 
         if let Err(e) = writer.write_all(&encode_buf) {
@@ -375,6 +382,11 @@ mod tests {
             "open_next_segment"
         );
         assert_eq!(WriterFatalReason::WriteAll.as_str(), "write_all");
+    }
+
+    #[test]
+    fn writer_rotation_metric_name_is_stable() {
+        assert_eq!(WAL_SEGMENT_ROTATIONS_METRIC, "wal_segment_rotations_total");
     }
 
     async fn wait_for_head(handle: &WriterHandle, expected: WalOffset) {
