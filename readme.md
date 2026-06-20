@@ -242,3 +242,12 @@ docker build -t smarthome-ingest .
 - **CD** (`.github/workflows/cd.yaml`) builds and pushes a Linux ARM64 image, then redeploys the ingest service on the self-hosted deployment runner
 
 Rust is pinned to **1.87.0** in CI.
+
+## License
+
+This project is open source and dual-licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+You may choose either license when using, modifying, or distributing this software.
