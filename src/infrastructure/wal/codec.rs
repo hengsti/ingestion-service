@@ -96,12 +96,9 @@ pub fn decode_for_recovery<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     if ensure_len_within_limit(len).is_err() {
-        let consumed = 4 + len;
-        return if discard_bytes(r, len)? {
-            Ok(DecodeOutcome::FrameCorrupt(consumed))
-        } else {
-            Ok(DecodeOutcome::CleanEof)
-        };
+        // Oversized frame length indicates corruption; treat it as a torn tail so recovery
+        // doesn't attempt to discard potentially huge payloads.
+        return Ok(DecodeOutcome::CleanEof);
     }
 
     payload.clear();
