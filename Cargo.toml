@@ -2,6 +2,7 @@
 name = "smarthome-ingest"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -21,7 +22,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 secrecy = { version = "0.8", features = ["alloc"] }
 urlencoding = "2"
+bincode = "1.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"

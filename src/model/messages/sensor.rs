@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct SensorMessage {
     pub device_id: String,
     pub room: String,
@@ -12,7 +12,7 @@ pub struct SensorMessage {
     pub data: SensorData,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct SensorData {
     pub temp_c: f64,
     pub rel_hum_perc: f64,

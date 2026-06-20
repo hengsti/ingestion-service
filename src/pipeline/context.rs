@@ -13,7 +13,6 @@ pub struct PipelineContext {
     payload_utf8: Option<String>,
     payload_json: Option<Value>,
     handled_message: Option<HandledMessage>,
-    line_protocol: Option<String>,
     dlq_reason: Option<String>,
     ignored_reason: Option<String>,
     started_at: Instant,
@@ -27,7 +26,6 @@ impl PipelineContext {
             payload_utf8: None,
             payload_json: None,
             handled_message: None,
-            line_protocol: None,
             dlq_reason: None,
             ignored_reason: None,
             started_at: Instant::now(),
@@ -81,15 +79,6 @@ impl PipelineContext {
         self.handled_message
             .as_ref()
             .ok_or_else(|| anyhow!("handled_message missing in pipeline context"))
-    }
-
-    pub fn set_line_protocol(&mut self, line: String) {
-        self.line_protocol = Some(line);
-    }
-
-    #[allow(dead_code)]
-    pub fn line_protocol(&self) -> Option<&str> {
-        self.line_protocol.as_deref()
     }
 
     pub fn mark_dlq(&mut self, reason: impl Into<String>) {

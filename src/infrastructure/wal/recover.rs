@@ -1,0 +1,228 @@
+use std::fs::OpenOptions;
+use std::io::BufReader;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+use crate::infrastructure::wal::codec;
+
+/// Scans `path` and returns the byte offset of the end of the last **complete**
+/// record, i.e. the length the active segment must be truncated to so that the
+/// next append lands immediately after the last durable record.
+///
+/// A crash can leave a partially written record at EOF (a torn length prefix or
+/// a short payload). Resuming the writer at `metadata().len()` would place the
+/// next record *after* those torn bytes, permanently mis-framing the reader.
+/// This scan finds the safe resume point instead.
+///
+/// Decoding stops on the first of:
+/// - `Ok(None)` — clean EOF or a torn tail (short read).
+/// - Decodable-corrupt record: A fully-framed record (valid length prefix and
+///   complete payload bytes) whose payload fails to bincode-deserialize. Recovery
+///   skips this record and continues scanning for subsequent valid records.
+/// - Torn payload: An incomplete frame (short read of either length prefix or
+///   payload) is treated as a torn tail and stops the scan.
+///
+/// Returns `0` for a missing or empty file.
+///
+/// # Errors
+/// Returns an error if the segment exists but cannot be opened or read, or if
+/// a torn payload is encountered (short read stops the scan).
+pub fn last_valid_offset(path: &Path) -> Result<u64> {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("opening WAL segment {}", path.display())),
+    };
+
+    let mut reader = BufReader::new(file);
+    let mut valid_len: u64 = 0;
+    let mut payload = Vec::new();
+
+    loop {
+        match codec::decode_for_recovery(&mut reader, &mut payload)? {
+            codec::DecodeOutcome::ValidRecord(_, consumed) => {
+                // Valid record: advance valid_len.
+                valid_len += consumed as u64;
+            }
+            codec::DecodeOutcome::CleanEof => {
+                // Clean EOF or torn tail: stop scanning.
+                break;
+            }
+            codec::DecodeOutcome::FrameCorrupt(consumed) => {
+                // Decodable-corrupt record: frame was complete but bincode failed.
+                // Skip this record and continue scanning for valid records after it.
+                valid_len += consumed as u64;
+            }
+        }
+    }
+
+    Ok(valid_len)
+}
+
+/// Physically truncates `path` to `len` bytes.
+///
+/// No fsync is issued — this matches the WAL's page-cache durability contract.
+/// Callers should only invoke this when `len` is strictly less than the current
+/// file length (a torn tail was detected).
+///
+/// # Errors
+/// Returns an error if the segment cannot be opened or resized.
+pub fn truncate_to(path: &Path, len: u64) -> Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening WAL segment for truncation {}", path.display()))?
+        .set_len(len)
+        .with_context(|| format!("truncating WAL segment {} to {len} bytes", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::wal::codec::encode_into;
+    use crate::infrastructure::wal::test_support::sample_event;
+    use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    /// Writes `n` framed records to a fresh segment file, returning its path and
+    /// the total number of bytes written.
+    fn write_records(dir: &Path, n: u64) -> (std::path::PathBuf, u64) {
+        let path = dir.join("00000000000000000001.log");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut total = 0u64;
+        for i in 0..n {
+            encode_into(&mut buf, &sample_event(i)).unwrap();
+            file.write_all(&buf).unwrap();
+            total += buf.len() as u64;
+        }
+        (path, total)
+    }
+
+    #[test]
+    fn test_last_valid_offset_missing_file_returns_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.log");
+        assert_eq!(last_valid_offset(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_last_valid_offset_empty_file_returns_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("00000000000000000001.log");
+        fs::File::create(&path).unwrap();
+        assert_eq!(last_valid_offset(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_last_valid_offset_clean_file_returns_full_length() {
+        let dir = tempdir().unwrap();
+        let (path, total) = write_records(dir.path(), 5);
+        assert_eq!(last_valid_offset(&path).unwrap(), total);
+    }
+
+    #[test]
+    fn test_last_valid_offset_torn_length_prefix_returns_offset_before_prefix() {
+        let dir = tempdir().unwrap();
+        let (path, total) = write_records(dir.path(), 3);
+
+        // Append a partial (2-byte) length prefix.
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&[0u8, 0u8]).unwrap();
+        drop(f);
+
+        assert_eq!(last_valid_offset(&path).unwrap(), total);
+    }
+
+    #[test]
+    fn test_last_valid_offset_full_prefix_partial_payload_returns_offset_before_prefix() {
+        let dir = tempdir().unwrap();
+        let (path, total) = write_records(dir.path(), 3);
+
+        // Append a complete length prefix promising 999 bytes but no payload.
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&999u32.to_le_bytes()).unwrap();
+        drop(f);
+
+        assert_eq!(last_valid_offset(&path).unwrap(), total);
+    }
+
+    #[test]
+    fn test_truncate_to_torn_tail_shrinks_file() {
+        let dir = tempdir().unwrap();
+        let (path, total) = write_records(dir.path(), 3);
+
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&999u32.to_le_bytes()).unwrap();
+        drop(f);
+        assert!(fs::metadata(&path).unwrap().len() > total);
+
+        truncate_to(&path, total).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), total);
+
+        // The truncated file decodes cleanly to exactly the valid length.
+        assert_eq!(last_valid_offset(&path).unwrap(), total);
+    }
+
+    #[test]
+    fn test_last_valid_offset_decodable_corrupt_record_skips_and_continues() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("00000000000000000001.log");
+
+        // Write 2 valid records
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut buf = Vec::new();
+        encode_into(&mut buf, &sample_event(0)).unwrap();
+        let valid1_size = buf.len();
+        file.write_all(&buf).unwrap();
+
+        encode_into(&mut buf, &sample_event(1)).unwrap();
+        let valid2_size = buf.len();
+        file.write_all(&buf).unwrap();
+
+        let valid_offset_before_corrupt = (valid1_size + valid2_size) as u64;
+
+        // Write a corrupt record (valid frame but invalid payload):
+        // A valid 4-byte length prefix followed by garbage data that won't
+        // deserialize as a WalEvent
+        let corrupt_len: u32 = 20;
+        file.write_all(&corrupt_len.to_le_bytes()).unwrap();
+        file.write_all(&[0xFF; 20]).unwrap(); // Garbage that bincode cannot deserialize
+        drop(file);
+
+        // Write 2 more valid records after the corrupt one
+        file = OpenOptions::new().append(true).open(&path).unwrap();
+        encode_into(&mut buf, &sample_event(2)).unwrap();
+        let valid3_size = buf.len();
+        file.write_all(&buf).unwrap();
+
+        encode_into(&mut buf, &sample_event(3)).unwrap();
+        let valid4_size = buf.len();
+        file.write_all(&buf).unwrap();
+        drop(file);
+
+        let final_valid_offset = valid_offset_before_corrupt
+            + 4
+            + corrupt_len as u64
+            + valid3_size as u64
+            + valid4_size as u64;
+
+        // Recovery should skip the corrupt record and return the offset of the last
+        // valid record (record 4), not truncate at the corrupt record boundary.
+        assert_eq!(last_valid_offset(&path).unwrap(), final_valid_offset);
+    }
+}

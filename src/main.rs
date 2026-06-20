@@ -12,9 +12,13 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
-use infrastructure::database::influx::InfluxWriter;
 use infrastructure::prometheus::MetricsServer;
 use infrastructure::router::{Route, Router};
+use infrastructure::sink::influx::InfluxSink;
+use infrastructure::sink::Sink;
+use infrastructure::wal::forwarder::run_forwarder;
+use infrastructure::wal::types::WalOptions;
+use infrastructure::wal::wal::Wal;
 use model::messages::message::MessageType;
 use pipeline::{
     context::PipelineContext,
@@ -26,7 +30,6 @@ use pipeline::{
     },
 };
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
-use secrecy::ExposeSecret;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinSet,
@@ -43,6 +46,26 @@ fn worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 8))
         .unwrap_or(4)
+}
+
+async fn recv_worker_job(
+    rx: &mut mpsc::Receiver<IngestJob>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<IngestJob> {
+    loop {
+        if *shutdown_rx.borrow() {
+            return rx.try_recv().ok();
+        }
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() {
+                    return rx.try_recv().ok();
+                }
+            }
+            job = rx.recv() => return job,
+        }
+    }
 }
 
 #[tokio::main]
@@ -114,26 +137,29 @@ async fn main() -> Result<()> {
     }
 
     // ------------------------------------------------------------
-    // Influx batcher
+    // WAL + InfluxDB sink + forwarder
     // ------------------------------------------------------------
-    let (influx_tx, influx_rx) = mpsc::channel::<String>(cfg.influx_queue_capacity);
+    let (wal, wal_sub) = Wal::open(WalOptions {
+        dir: cfg.wal_dir.clone(),
+        segment_bytes: cfg.wal_segment_bytes,
+        queue_capacity: cfg.wal_queue_capacity,
+    })
+    .await?;
+    let wal = Arc::new(wal);
 
-    let influx = InfluxWriter::new(
+    let sink: Arc<dyn Sink> = Arc::new(InfluxSink::new(
         &cfg.influx_url,
         &cfg.influx_org,
         &cfg.influx_bucket,
-        cfg.influx_token.expose_secret(),
-    )?;
+        cfg.influx_token.clone(),
+    )?);
 
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
 
-    let _influx_task = tokio::spawn(async move {
-        if let Err(err) = influx
-            .run_batcher(influx_rx, batch_size, flush_interval_ms)
-            .await
-        {
-            error!(error = %err, "influx batcher failed");
+    let forwarder_task = tokio::spawn(async move {
+        if let Err(err) = run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await {
+            error!(error = %err, "wal forwarder failed");
         }
     });
 
@@ -150,7 +176,7 @@ async fn main() -> Result<()> {
             .add_stage(TransformStage::new(router.clone()))
             .add_stage(ValidateBusinessStage::new()?)
             .add_stage(CacheUpdateStage::new(app_state.clone()))
-            .add_stage(PersistStage::new(influx_tx.clone()))
+            .add_stage(PersistStage::new(wal.clone()))
             .add_stage(ObserveStage::new())
             .with_failure_stage(DlqPublishStage::new(mqtt_client.clone(), dlq_topic.clone())),
     );
@@ -179,12 +205,9 @@ async fn main() -> Result<()> {
             info!(worker_id, "pipeline worker started");
 
             loop {
-                let job = tokio::select! {
-                    _ = shutdown_rx.changed() => break,
-                    job = rx.recv() => match job {
-                        Some(j) => j,
-                        None => break,
-                    },
+                let job = match recv_worker_job(&mut rx, &mut shutdown_rx).await {
+                    Some(j) => j,
+                    None => break,
                 };
 
                 let mut ctx = PipelineContext::new(job.topic.clone(), job.payload);
@@ -271,6 +294,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Drain the WAL forwarder before exiting. The writer task only stops once
+    // every `Arc<Wal>` sender is released: the pipeline holds one via the
+    // PersistStage and `wal` holds the other. Dropping both closes the writer's
+    // channel, so it flushes its final batch and the subscription terminates,
+    // letting the forwarder persist and commit any buffered records.
+    drop(pipeline);
+    drop(wal);
+
+    let mut forwarder_task = forwarder_task;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut forwarder_task).await {
+        Ok(Ok(())) => info!("wal forwarder drained cleanly"),
+        Ok(Err(err)) => error!(error = %err, "wal forwarder task panicked during drain"),
+        Err(_) => {
+            warn!("wal forwarder drain timed out after 5s; aborting and exiting");
+            forwarder_task.abort();
+        }
+    }
+
     info!("ingestion service stopped");
     Ok(())
 }
@@ -315,4 +356,51 @@ fn build_router(cfg: &Config) -> Result<Router> {
     }
 
     Ok(router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn recv_worker_job_after_shutdown_drains_queued_messages_before_stopping() {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(4);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        tx.try_send(IngestJob {
+            topic: "smarthome/dev-1/status".to_string(),
+            payload: Bytes::from_static(b"{\"device_id\":\"dev-1\"}"),
+        })
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+
+        let job = recv_worker_job(&mut rx, &mut shutdown_rx).await;
+        assert!(
+            job.is_some(),
+            "queued message must be drained after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_worker_job_after_shutdown_keeps_draining_until_queue_is_empty() {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(4);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        tx.try_send(IngestJob {
+            topic: "smarthome/dev-1/status".to_string(),
+            payload: Bytes::from_static(b"{\"device_id\":\"dev-1\"}"),
+        })
+        .unwrap();
+        tx.try_send(IngestJob {
+            topic: "smarthome/dev-2/status".to_string(),
+            payload: Bytes::from_static(b"{\"device_id\":\"dev-2\"}"),
+        })
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+
+        assert!(recv_worker_job(&mut rx, &mut shutdown_rx).await.is_some());
+        assert!(recv_worker_job(&mut rx, &mut shutdown_rx).await.is_some());
+        assert!(recv_worker_job(&mut rx, &mut shutdown_rx).await.is_none());
+    }
 }

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fmt::Write;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -28,31 +29,32 @@ impl Point {
         }
     }
 
-    pub fn to_line_protocol(&self) -> String {
-        let measurement = esc_measurement(&self.measurement);
+    /// Appends this point's InfluxDB line protocol to `out` without allocating
+    /// an intermediate per-point `String`. Used by the sink to build one batch
+    /// body buffer across many points.
+    pub fn write_line_protocol(&self, out: &mut String) {
+        out.push_str(&esc_measurement(&self.measurement));
 
-        let tag_string = if self.tags.is_empty() {
-            String::new()
-        } else {
-            let joined = self
-                .tags
-                .iter()
-                .map(|(k, v)| format!("{}={}", esc_tag_key(k), esc_tag_value(v)))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(",{}", joined)
-        };
+        for (k, v) in &self.tags {
+            out.push(',');
+            out.push_str(&esc_tag_key(k));
+            out.push('=');
+            out.push_str(&esc_tag_value(v));
+        }
 
-        let field_string = self
-            .fields
-            .iter()
-            .map(|(k, v)| format!("{}={}", esc_field_key(k), format_field_value(v)))
-            .collect::<Vec<_>>()
-            .join(",");
+        out.push(' ');
+        for (i, (k, v)) in self.fields.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&esc_field_key(k));
+            out.push('=');
+            out.push_str(&format_field_value(v));
+        }
 
-        match self.timestamp_ms {
-            Some(ts) => format!("{}{} {} {}", measurement, tag_string, field_string, ts),
-            None => format!("{}{} {}", measurement, tag_string, field_string),
+        if let Some(ts) = self.timestamp_ms {
+            // Infallible: writing into a String never errors.
+            let _ = write!(out, " {ts}");
         }
     }
 }

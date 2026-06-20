@@ -3,6 +3,7 @@ use secrecy::SecretString;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct Config {
@@ -21,9 +22,13 @@ pub struct Config {
     pub influx_token: SecretString,
 
     // batching
-    pub influx_queue_capacity: usize,
     pub batch_size: usize,
     pub flush_interval_ms: u64,
+
+    // Write-ahead log
+    pub wal_dir: PathBuf,
+    pub wal_segment_bytes: u64,
+    pub wal_queue_capacity: usize,
 
     // Ingest Event Queue
     pub input_queue_capacity: usize,
@@ -51,9 +56,11 @@ impl fmt::Debug for Config {
             .field("influx_org", &self.influx_org)
             .field("influx_bucket", &self.influx_bucket)
             .field("influx_token", &"[REDACTED]")
-            .field("influx_queue_capacity", &self.influx_queue_capacity)
             .field("batch_size", &self.batch_size)
             .field("flush_interval_ms", &self.flush_interval_ms)
+            .field("wal_dir", &self.wal_dir)
+            .field("wal_segment_bytes", &self.wal_segment_bytes)
+            .field("wal_queue_capacity", &self.wal_queue_capacity)
             .field("input_queue_capacity", &self.input_queue_capacity)
             .field(
                 "enforce_topic_device_match",
@@ -104,13 +111,6 @@ impl Config {
                 .context("INFLUX_TOKEN must be set (for InfluxDB v2 write API)")?,
         );
 
-        let influx_queue_capacity = match env_var("INFLUX_QUEUE_CAPACITY") {
-            Some(v) => v
-                .parse::<usize>()
-                .context("INFLUX_QUEUE_CAPACITY must be a valid usize")?,
-            None => 10_000,
-        };
-
         let batch_size = env_var("BATCH_SIZE")
             .context("BATCH_SIZE must be set")?
             .parse::<usize>()
@@ -120,6 +120,22 @@ impl Config {
             .context("FLUSH_INTERVAL_MS must be set")?
             .parse::<u64>()
             .context("FLUSH_INTERVAL_MS must be a valid u64")?;
+
+        let wal_dir = PathBuf::from(env_var("WAL_DIR").context("WAL_DIR must be set")?);
+
+        let wal_segment_bytes = match env_var("WAL_SEGMENT_BYTES") {
+            Some(v) => v
+                .parse::<u64>()
+                .context("WAL_SEGMENT_BYTES must be a valid u64")?,
+            None => 64 * 1024 * 1024,
+        };
+
+        let wal_queue_capacity = match env_var("WAL_QUEUE_CAPACITY") {
+            Some(v) => v
+                .parse::<usize>()
+                .context("WAL_QUEUE_CAPACITY must be a valid usize")?,
+            None => 16_384,
+        };
 
         let input_queue_capacity = match env_var("INPUT_QUEUE_CAPACITY") {
             Some(v) => v
@@ -158,9 +174,11 @@ impl Config {
             influx_org,
             influx_bucket,
             influx_token,
-            influx_queue_capacity,
             batch_size,
             flush_interval_ms,
+            wal_dir,
+            wal_segment_bytes,
+            wal_queue_capacity,
             input_queue_capacity,
             enforce_topic_device_match,
             metrics_bind,
