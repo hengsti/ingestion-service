@@ -1,11 +1,11 @@
 # Releasing & Deploying the Ingestion Service
 
-## CI — runs automatically
+## CI - runs automatically
 
 Every push and pull request to `master` runs formatting, clippy, and tests.
 No action required.
 
-## CD — runs only when you trigger it
+## CD - runs only when you trigger it
 
 ### Release a new version (recommended)
 
@@ -23,15 +23,15 @@ No action required.
 
 Use this to roll back or re-apply a previously built image without triggering a new build.
 
-1. Go to **Actions → CD / ingestion-service → Run workflow**
+1. Go to **Actions -> CD / ingestion-service -> Run workflow**
 2. Enter the existing image tag (e.g. `v1.2.3`) in the `image_tag` field
-3. Click **Run workflow** — the deploy job runs directly, build is skipped
+3. Click **Run workflow** - the deploy job runs directly, build is skipped
 
 ### Manual build + deploy (ad-hoc, no tag)
 
-1. Go to **Actions → CD / ingestion-service → Run workflow**
+1. Go to **Actions -> CD / ingestion-service -> Run workflow**
 2. Leave `image_tag` empty
-3. Click **Run workflow** — builds a `sha-<hex>` tagged image and deploys it
+3. Click **Run workflow** - builds a `sha-<hex>` tagged image and deploys it
 
 ## Image tags in GHCR
 
