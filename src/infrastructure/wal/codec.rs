@@ -129,6 +129,7 @@ fn ensure_len_within_limit(len: usize) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn discard_bytes<R: Read>(r: &mut R, mut remaining: usize) -> Result<bool> {
     let mut scratch = [0u8; 8192];
 
