@@ -50,7 +50,15 @@ impl Wal {
         };
 
         let read_start = match read_cursor(&options.dir)? {
-            Some(off) => off,
+            Some(off) => {
+                let first_id = segments.first().copied().unwrap_or(active_id);
+                if off.segment_id < first_id || off.segment_id > active_id {
+                    return Err(anyhow::anyhow!(
+                        "WAL cursor points outside available segments: cursor={off:?}, segments={segments:?}"
+                    ));
+                }
+                off
+            }
             None => WalOffset {
                 segment_id: segments.first().copied().unwrap_or(active_id),
                 byte_offset: 0,
