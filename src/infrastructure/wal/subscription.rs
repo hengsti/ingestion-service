@@ -200,6 +200,11 @@ impl WalSubscription {
 
         match len {
             Some(len) => {
+                const MAX_SKIP_BYTES: u64 = 1024 * 1024;
+                if u64::from(len) > MAX_SKIP_BYTES {
+                    warn!(segment_id, byte_offset, len, "WAL subscription: corrupt record length too large; cannot skip safely");
+                    return self.wait_or_advance().await;
+                }
                 self.cur_byte_offset += 4 + u64::from(len);
                 true
             }
