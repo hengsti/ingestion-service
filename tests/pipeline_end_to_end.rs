@@ -205,7 +205,7 @@ async fn unknown_topic_non_strict_mode_is_ignored() {
         .add_stage(PersistStage::new(wal))
         .add_stage(ObserveStage::new())
         .with_failure_stage(DlqPublishStage::new(
-            common::dlq_client(),
+            common::dlq_publisher(),
             "smarthome/_dlq/ingest",
         ));
 

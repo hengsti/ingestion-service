@@ -5,14 +5,58 @@ use std::env;
 use std::fmt;
 use std::path::PathBuf;
 
+/// Selects which input transport the service consumes from.
+///
+/// Only `Mqtt` is implemented today. Adding a variant here (e.g. `Kafka`) will
+/// force a compile error at every `match` on this type until it's handled —
+/// this is intentional, acting as a guardrail for future transports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSourceKind {
+    Mqtt,
+}
+
+impl InputSourceKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "mqtt" => Ok(Self::Mqtt),
+            other => {
+                bail!("unsupported INPUT_SOURCE '{other}': only 'mqtt' is currently implemented")
+            }
+        }
+    }
+}
+
+/// MQTT broker connection settings, populated only when `INPUT_SOURCE=mqtt`.
+#[derive(Clone)]
+pub struct MqttSourceConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub client_id: String,
+}
+
+impl fmt::Debug for MqttSourceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // username/password are intentionally omitted to avoid leaking secrets in logs.
+        f.debug_struct("MqttSourceConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
-    // MQTT
-    pub mqtt_host: String,
-    pub mqtt_port: u16,
-    pub mqtt_username: Option<String>,
-    pub mqtt_password: Option<String>,
-    pub mqtt_client_id: String,
+    // Input source selection
+    pub input_source: InputSourceKind,
+
+    // MQTT connection settings; only populated when input_source == Mqtt
+    pub mqtt: Option<MqttSourceConfig>,
+
+    // Topic routing/schema config; transport-agnostic (used by the Router regardless of
+    // which input source is active)
     pub mqtt_topics: HashMap<String, String>, // {"TOPIC NAME": "TOPIC STRING"}, e.g. {"MQTT_TOPIC_SENSOR": "home/sensor/+"}
 
     // InfluxDB v2 Write API
@@ -48,9 +92,8 @@ pub struct Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("mqtt_host", &self.mqtt_host)
-            .field("mqtt_port", &self.mqtt_port)
-            .field("mqtt_client_id", &self.mqtt_client_id)
+            .field("input_source", &self.input_source)
+            .field("mqtt", &self.mqtt)
             .field("mqtt_topics", &self.mqtt_topics)
             .field("influx_url", &self.influx_url)
             .field("influx_org", &self.influx_org)
@@ -76,17 +119,34 @@ impl fmt::Debug for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let mqtt_host = env_var("MQTT_HOST").context("MQTT_HOST is required")?;
-        let mqtt_port = env_var("MQTT_PORT")
-            .context("MQTT_PORT must be set")?
-            .parse::<u16>()
-            .context("MQTT_PORT must be a u16")?;
+        let input_source =
+            InputSourceKind::parse(&env_var("INPUT_SOURCE").context("INPUT_SOURCE must be set")?)?;
 
-        let mqtt_username = env_var("MQTT_USERNAME");
-        let mqtt_password = env_var("MQTT_PASSWORD");
+        let mqtt = match input_source {
+            InputSourceKind::Mqtt => {
+                let host =
+                    env_var("MQTT_HOST").context("MQTT_HOST is required when INPUT_SOURCE=mqtt")?;
+                let port = env_var("MQTT_PORT")
+                    .context("MQTT_PORT must be set when INPUT_SOURCE=mqtt")?
+                    .parse::<u16>()
+                    .context("MQTT_PORT must be a u16")?;
 
-        let mut mqtt_client_id = env_var("MQTT_CLIENT_ID").context("MQTT_CLIENT_ID must be set")?;
-        mqtt_client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
+                let username = env_var("MQTT_USERNAME");
+                let password = env_var("MQTT_PASSWORD");
+
+                let mut client_id = env_var("MQTT_CLIENT_ID")
+                    .context("MQTT_CLIENT_ID must be set when INPUT_SOURCE=mqtt")?;
+                client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
+
+                Some(MqttSourceConfig {
+                    host,
+                    port,
+                    username,
+                    password,
+                    client_id,
+                })
+            }
+        };
 
         let mut mqtt_topics = HashMap::new();
         for (k, v) in env::vars().filter(|(k, _)| k.starts_with("MQTT_TOPIC_")) {
@@ -164,11 +224,8 @@ impl Config {
             .context("CACHE_BUFFER must be a valid usize")?;
 
         Ok(Self {
-            mqtt_host,
-            mqtt_port,
-            mqtt_username,
-            mqtt_password,
-            mqtt_client_id,
+            input_source,
+            mqtt,
             mqtt_topics,
             influx_url,
             influx_org,
@@ -194,4 +251,36 @@ fn env_var(k: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_source_kind_parse_accepts_mqtt_case_insensitive() {
+        assert_eq!(
+            InputSourceKind::parse("mqtt").unwrap(),
+            InputSourceKind::Mqtt
+        );
+        assert_eq!(
+            InputSourceKind::parse("MQTT").unwrap(),
+            InputSourceKind::Mqtt
+        );
+        assert_eq!(
+            InputSourceKind::parse(" Mqtt ").unwrap(),
+            InputSourceKind::Mqtt
+        );
+    }
+
+    #[test]
+    fn input_source_kind_parse_rejects_unknown_value() {
+        let err = InputSourceKind::parse("kafka").unwrap_err();
+        assert!(err.to_string().contains("unsupported INPUT_SOURCE 'kafka'"));
+    }
+
+    #[test]
+    fn input_source_kind_parse_rejects_empty_value() {
+        assert!(InputSourceKind::parse("").is_err());
+    }
 }

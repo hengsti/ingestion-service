@@ -1,51 +1,24 @@
-use std::{future::Future, pin::Pin, time::Instant};
+use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
-use anyhow::Result;
-use rumqttc::AsyncClient;
-use serde_json::json;
-use tracing::{info, warn};
+use tracing::warn;
 
 use metrics::{counter, histogram};
 
+use crate::infrastructure::source::DlqPublisher;
 use crate::pipeline::{
     context::PipelineContext,
     stage::{PipelineStage, StageFlow, StageResult},
 };
 
-pub async fn publish_dlq(
-    client: &AsyncClient,
-    dlq_topic: &str,
-    src_topic: &str,
-    payload: &str,
-    err: &str,
-) -> Result<()> {
-    let dlq = json!({
-        "received_at": chrono::Utc::now().to_rfc3339(),
-        "src_topic": src_topic,
-        "error": err,
-        "payload_raw": payload,
-    });
-
-    info!(src_topic = %src_topic, error = %err, "publishing message to DLQ topic");
-
-    let bytes = serde_json::to_vec(&dlq)?;
-    client
-        .publish(dlq_topic, rumqttc::QoS::AtLeastOnce, false, bytes)
-        .await?;
-
-    Ok(())
-}
-
-#[derive(Clone)]
 pub struct DlqPublishStage {
-    client: AsyncClient,
+    publisher: Arc<dyn DlqPublisher>,
     dlq_topic: String,
 }
 
 impl DlqPublishStage {
-    pub fn new(client: AsyncClient, dlq_topic: impl Into<String>) -> Self {
+    pub fn new(publisher: Arc<dyn DlqPublisher>, dlq_topic: impl Into<String>) -> Self {
         Self {
-            client,
+            publisher,
             dlq_topic: dlq_topic.into(),
         }
     }
@@ -68,14 +41,10 @@ impl PipelineStage for DlqPublishStage {
             let start = Instant::now();
             let payload = ctx.payload_for_dlq();
 
-            if let Err(err) = publish_dlq(
-                &self.client,
-                &self.dlq_topic,
-                ctx.topic(),
-                &payload,
-                &reason,
-            )
-            .await
+            if let Err(err) = self
+                .publisher
+                .publish(&self.dlq_topic, ctx.topic(), &payload, &reason)
+                .await
             {
                 counter!("dlq_publish_errors_total").increment(1);
                 warn!(topic = %ctx.topic(), error = %err, "failed to publish to DLQ");
@@ -94,25 +63,27 @@ impl PipelineStage for DlqPublishStage {
 
 #[cfg(test)]
 mod tests {
-    use rumqttc::MqttOptions;
+    use rumqttc::{AsyncClient, MqttOptions};
 
     use super::*;
+    use crate::infrastructure::source::mqtt::MqttDlqPublisher;
     use crate::pipeline::{context::PipelineContext, stage::StageFlow};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    /// Returns a client whose eventloop receiver is alive so that `publish` queues successfully.
-    fn client_with_live_eventloop() -> (AsyncClient, rumqttc::EventLoop) {
+    /// Returns a publisher whose eventloop receiver is alive so that `publish` queues successfully.
+    fn publisher_with_live_eventloop() -> (Arc<dyn DlqPublisher>, rumqttc::EventLoop) {
         let opts = MqttOptions::new("test-dlq-ok", "localhost", 1883);
-        AsyncClient::new(opts, 10)
+        let (client, eventloop) = AsyncClient::new(opts, 10);
+        (Arc::new(MqttDlqPublisher::new(client)), eventloop)
     }
 
-    /// Returns a client whose eventloop has been dropped so that `publish` returns an error.
-    fn client_with_dropped_eventloop() -> AsyncClient {
+    /// Returns a publisher whose eventloop has been dropped so that `publish` returns an error.
+    fn publisher_with_dropped_eventloop() -> Arc<dyn DlqPublisher> {
         let opts = MqttOptions::new("test-dlq-err", "localhost", 1884);
         let (client, _eventloop) = AsyncClient::new(opts, 10);
         // _eventloop is dropped here → receiver gone → publish will fail
-        client
+        Arc::new(MqttDlqPublisher::new(client))
     }
 
     fn ctx_with_dlq_reason(reason: &str) -> PipelineContext {
@@ -125,8 +96,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_without_dlq_reason_returns_stop_without_publishing() {
-        let (client, _eventloop) = client_with_live_eventloop();
-        let stage = DlqPublishStage::new(client, "smarthome/_dlq/ingest");
+        let (publisher, _eventloop) = publisher_with_live_eventloop();
+        let stage = DlqPublishStage::new(publisher, "smarthome/_dlq/ingest");
         // Context has no dlq_reason — stage must return Stop immediately.
         let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
 
@@ -139,8 +110,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_dlq_reason_returns_stop_when_publish_succeeds() {
-        let (client, _eventloop) = client_with_live_eventloop();
-        let stage = DlqPublishStage::new(client, "smarthome/_dlq/ingest");
+        let (publisher, _eventloop) = publisher_with_live_eventloop();
+        let stage = DlqPublishStage::new(publisher, "smarthome/_dlq/ingest");
         let mut ctx = ctx_with_dlq_reason("schema validation failed");
 
         let result = stage.run(&mut ctx).await;
@@ -153,8 +124,8 @@ mod tests {
     #[tokio::test]
     async fn run_with_dlq_reason_returns_stop_even_when_publish_fails() {
         // The stage must absorb publish errors and never propagate them.
-        let client = client_with_dropped_eventloop();
-        let stage = DlqPublishStage::new(client, "smarthome/_dlq/ingest");
+        let publisher = publisher_with_dropped_eventloop();
+        let stage = DlqPublishStage::new(publisher, "smarthome/_dlq/ingest");
         let mut ctx = ctx_with_dlq_reason("schema validation failed");
 
         let result = stage.run(&mut ctx).await;
@@ -167,8 +138,8 @@ mod tests {
     #[tokio::test]
     async fn run_uses_configured_dlq_topic() {
         // Verify the stage accepts any DLQ topic string without panic.
-        let (client, _eventloop) = client_with_live_eventloop();
-        let stage = DlqPublishStage::new(client, "custom/dlq/topic");
+        let (publisher, _eventloop) = publisher_with_live_eventloop();
+        let stage = DlqPublishStage::new(publisher, "custom/dlq/topic");
         let mut ctx = ctx_with_dlq_reason("some error");
 
         let result = stage.run(&mut ctx).await;

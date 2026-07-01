@@ -13,14 +13,14 @@ use smarthome_ingest::infrastructure::cache::{http as cache_http, state::CacheSt
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn make_app(mqtt_ready: bool) -> axum::Router {
+fn make_app(source_ready: bool) -> axum::Router {
     let cache = CacheState::new(60_000, 64);
-    let ready = Arc::new(AtomicBool::new(mqtt_ready));
+    let ready = Arc::new(AtomicBool::new(source_ready));
     cache_http::router(cache, ready)
 }
 
-fn make_app_with_cache(cache: CacheState, mqtt_ready: bool) -> axum::Router {
-    let ready = Arc::new(AtomicBool::new(mqtt_ready));
+fn make_app_with_cache(cache: CacheState, source_ready: bool) -> axum::Router {
+    let ready = Arc::new(AtomicBool::new(source_ready));
     cache_http::router(cache, ready)
 }
 
@@ -51,7 +51,7 @@ async fn healthz_returns_200() {
 // ── /readyz ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn readyz_returns_503_when_mqtt_not_ready() {
+async fn readyz_returns_503_when_source_not_ready() {
     let app = make_app(false);
 
     let response = app
@@ -68,7 +68,7 @@ async fn readyz_returns_503_when_mqtt_not_ready() {
 }
 
 #[tokio::test]
-async fn readyz_returns_200_when_mqtt_ready() {
+async fn readyz_returns_200_when_source_ready() {
     let app = make_app(true);
 
     let response = app

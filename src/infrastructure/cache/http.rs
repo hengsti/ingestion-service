@@ -23,7 +23,7 @@ use tokio_stream::{
 use super::state::{CacheEvent, CacheState};
 use crate::model::messages::sensor::SensorData;
 
-pub fn router(state: CacheState, mqtt_ready: Arc<AtomicBool>) -> Router {
+pub fn router(state: CacheState, source_ready: Arc<AtomicBool>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -31,15 +31,15 @@ pub fn router(state: CacheState, mqtt_ready: Arc<AtomicBool>) -> Router {
         .route("/v1/state/{device_id}", get(get_state))
         .route("/v1/stream", get(stream_updates))
         .with_state(state)
-        .layer(Extension(mqtt_ready))
+        .layer(Extension(source_ready))
 }
 
 async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-async fn readyz(Extension(mqtt_ready): Extension<Arc<AtomicBool>>) -> StatusCode {
-    if mqtt_ready.load(Ordering::Relaxed) {
+async fn readyz(Extension(source_ready): Extension<Arc<AtomicBool>>) -> StatusCode {
+    if source_ready.load(Ordering::Relaxed) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
