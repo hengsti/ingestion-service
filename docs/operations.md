@@ -16,6 +16,7 @@ Run:
 docker run --rm \
   -p 8085:8085 \
   -p 9090:9090 \
+  -e INPUT_SOURCE=mqtt \
   -e MQTT_HOST=host.docker.internal \
   -e MQTT_PORT=1883 \
   -e MQTT_CLIENT_ID=smarthome-ingest \

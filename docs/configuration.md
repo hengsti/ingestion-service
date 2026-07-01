@@ -2,13 +2,23 @@
 
 All runtime configuration is supplied through environment variables. Empty strings are treated as unset because `Config::from_env` trims values and filters empty results.
 
-## MQTT
+## Input source
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `MQTT_HOST` | Yes | None | MQTT broker host |
-| `MQTT_PORT` | Yes | None | MQTT broker port as `u16` |
-| `MQTT_CLIENT_ID` | Yes | None | Base client id. The service appends `-<unix_timestamp>` at startup |
+| `INPUT_SOURCE` | Yes | None | Selects the input transport. Only `mqtt` is implemented today (case-insensitive) |
+
+The service ingests messages through a swappable `Source` abstraction (see `docs/architecture.md`). `INPUT_SOURCE` selects which implementation `build_source()` constructs at startup. Adding a new transport (e.g. Kafka) means adding a new `InputSourceKind` variant and a matching `Source`/`DlqPublisher` pair — no changes to `main.rs`'s wiring are required beyond that.
+
+## MQTT
+
+The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT_ID` connection variables below are **only required when `INPUT_SOURCE=mqtt`**. The `MQTT_TOPIC_*` variables stay unconditional regardless of `INPUT_SOURCE`, because topic-based routing/schema selection (the `Router`) is transport-agnostic — a future Kafka source would reuse the same topic concept.
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `MQTT_HOST` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker host |
+| `MQTT_PORT` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker port as `u16` |
+| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Base client id. The service appends `-<unix_timestamp>` at startup |
 | `MQTT_USERNAME` | No | None | Optional MQTT username |
 | `MQTT_PASSWORD` | No | None | Optional MQTT password |
 | `MQTT_TOPIC_SENSOR` | Expected | None | Sensor subscription and route, for example `smarthome/+/sensor` |
@@ -98,6 +108,7 @@ RUST_LOG=smarthome_ingest=debug cargo run --release
 ## Minimal Local Configuration
 
 ```bash
+INPUT_SOURCE=mqtt
 MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_CLIENT_ID=smarthome-ingest

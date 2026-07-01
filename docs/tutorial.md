@@ -25,6 +25,7 @@ Use topic patterns that put the device id in the first `+` segment. The service 
 PowerShell example:
 
 ```powershell
+$env:INPUT_SOURCE="mqtt"
 $env:MQTT_HOST="localhost"
 $env:MQTT_PORT="1883"
 $env:MQTT_CLIENT_ID="smarthome-ingest"
@@ -48,6 +49,7 @@ $env:CACHE_BUFFER="1024"
 POSIX shell example:
 
 ```bash
+export INPUT_SOURCE=mqtt
 export MQTT_HOST=localhost
 export MQTT_PORT=1883
 export MQTT_CLIENT_ID=smarthome-ingest

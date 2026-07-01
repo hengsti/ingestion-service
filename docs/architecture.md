@@ -4,46 +4,55 @@ This document explains how the service is put together and why each boundary exi
 
 ## Responsibilities
 
-`smarthome-ingest` owns the ingestion path between MQTT and InfluxDB:
+`smarthome-ingest` owns the ingestion path between an input source and InfluxDB:
 
-- Subscribe to configured MQTT telemetry topics.
+- Consume telemetry from a configurable input source (MQTT today; see [Input Source](#input-source)).
 - Decode and validate JSON payloads.
 - Normalize payloads into canonical Rust message structs.
 - Compute derived sensor fields.
 - Update an in-memory latest sensor cache.
 - Render InfluxDB line protocol.
 - Store line protocol in a local WAL before forwarding.
-- Publish rejected payloads to a DLQ topic.
+- Publish rejected payloads to a DLQ destination on the active input source.
 - Export HTTP state and Prometheus metrics.
 
-The service does not own MQTT broker lifecycle, InfluxDB lifecycle, device firmware, dashboards, or long-term query APIs.
+The service does not own the input broker lifecycle, InfluxDB lifecycle, device firmware, dashboards, or long-term query APIs.
 
 ## Runtime Components
 
 ```text
 Config
-  -> MQTT options and topic map
+  -> Input source selection (INPUT_SOURCE) and MQTT topic map
   -> Router with embedded schemas
   -> Cache state
   -> Metrics server
   -> WAL and WAL subscription
   -> Influx sink
-  -> Pipeline runner
+  -> Pipeline runner (with a DlqPublisher from the active source)
 ```
 
-`main.rs` wires these components together. It starts the cache API, metrics API, MQTT event loop, WAL forwarder, and worker pool.
+`main.rs` wires these components together. It starts the cache API, metrics API, the input source's event loop, the WAL forwarder, and the worker pool.
 
-## MQTT Ingestion
+## Input Source
 
-The service reads all environment variables whose names start with `MQTT_TOPIC_`.
+Input ingestion is decoupled behind a `Source` abstraction (`src/infrastructure/source/mod.rs`), mirroring the existing `Sink` trait used for InfluxDB output:
+
+- **`Source` trait** — owns a transport's connect/subscribe/event-loop and pushes decoded `IngestJob`s into a shared `IngestDispatcher`. `run` takes `self: Box<Self>` and a cloned shutdown `watch::Receiver<bool>`, matching the shutdown pattern already used by workers.
+- **`DlqPublisher` trait** — abstracts "publish a rejected message back out". It is coupled 1:1 with the active `Source`: `build_source()` returns both from one factory call, matched on `Config::input_source`.
+- **`IngestDispatcher`** — round-robins `IngestJob`s across the worker pool's per-worker bounded channels. It is handed to `Source::run` by value so a source never needs to know about worker count or pool internals, and there is no extra channel hop between the source and the workers.
+- **`MqttSource` / `MqttDlqPublisher`** (`src/infrastructure/source/mqtt.rs`) — the only implementation today. `MqttSource` holds just the `rumqttc::EventLoop` and a readiness flag; the `AsyncClient` handle used for subscribing is cloned into `MqttDlqPublisher` and the original handle dropped, since the event loop owns the actual network connection independent of client handle count.
+
+`INPUT_SOURCE` (env var) selects which source `build_source()` constructs. Only `mqtt` is implemented; adding a future transport (e.g. Kafka) means adding an `InputSourceKind` variant plus a matching `Source`/`DlqPublisher` pair — `main.rs`'s wiring does not need to change.
+
+The service reads all environment variables whose names start with `MQTT_TOPIC_`. These stay unconditional regardless of `INPUT_SOURCE` because topic-based routing/schema selection (the `Router`) is transport-agnostic:
 
 - `MQTT_TOPIC_SENSOR` maps to `MessageType::Sensor`.
 - `MQTT_TOPIC_STATUS` maps to `MessageType::Status`.
 - `MQTT_TOPIC_DLQ` is used only for DLQ publishing.
 
-The MQTT client subscribes to every configured `MQTT_TOPIC_*` value except keys ending in `DLQ`. The router only creates routes for `SENSOR` and `STATUS`. Avoid unknown non-DLQ `MQTT_TOPIC_*` keys unless you intentionally want to subscribe to topics that will not match a route.
+The MQTT source subscribes to every configured `MQTT_TOPIC_*` value except keys ending in `DLQ`. The router only creates routes for `SENSOR` and `STATUS`. Avoid unknown non-DLQ `MQTT_TOPIC_*` keys unless you intentionally want to subscribe to topics that will not match a route.
 
-Incoming MQTT publishes are dispatched round-robin into per-worker bounded channels. Worker count is based on available CPU parallelism and clamped to 2 through 8.
+Incoming messages are dispatched round-robin into per-worker bounded channels via `IngestDispatcher`. Worker count is based on available CPU parallelism and clamped to 2 through 8.
 
 If a worker queue is full, the message is dropped before the pipeline and `ingest_event_queue_full_total` is incremented. The DLQ is not used for this pre-pipeline drop.
 
@@ -120,12 +129,12 @@ After a successful sink write, the forwarder commits the WAL cursor up to the la
 
 ## Shutdown
 
-On Ctrl+C or HTTP task failure, the service:
+On Ctrl+C, HTTP task failure, or a fatal input source error, the service:
 
-1. Signals workers to stop accepting new work.
+1. Signals workers (and the input source) to stop accepting new work.
 2. Lets workers drain queued jobs.
 3. Drops the pipeline and WAL handles so the writer flushes and closes.
 4. Waits up to 5 seconds for the forwarder to drain its final batch.
 5. Aborts the forwarder if it cannot drain in time.
 
-This avoids intentionally dropping queued messages during normal shutdown, but it is still bounded by the 5 second final forwarder drain timeout.
+This avoids intentionally dropping queued messages during normal shutdown, but it is still bounded by the 5 second final forwarder drain timeout. A fatal input source error (e.g. broker unreachable) still exits the process non-zero, but only after this drain sequence runs — it flows through the same shutdown path as Ctrl+C rather than exiting immediately.

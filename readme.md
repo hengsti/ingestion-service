@@ -1,8 +1,8 @@
 # smarthome-ingest
 
-Performance-focused Rust service for ingesting smart home telemetry from MQTT, validating and transforming it, durably staging InfluxDB line protocol in a local write-ahead log (WAL), and forwarding batches to InfluxDB v2.
+Performance-focused Rust service for ingesting smart home telemetry from a configurable input source (MQTT today), validating and transforming it, durably staging InfluxDB line protocol in a local write-ahead log (WAL), and forwarding batches to InfluxDB v2.
 
-Invalid messages are published to an MQTT dead letter queue (DLQ). The latest sensor state is exposed through HTTP and Server-Sent Events (SSE), and Prometheus metrics are available for scraping.
+Invalid messages are published to a DLQ on the active input source (MQTT today). The latest sensor state is exposed through HTTP and Server-Sent Events (SSE), and Prometheus metrics are available for scraping.
 
 ![CI](https://github.com/hengsti/ingestion-service/actions/workflows/ci.yaml/badge.svg)
 ![CD](https://github.com/hengsti/ingestion-service/actions/workflows/cd.yaml/badge.svg)
@@ -10,13 +10,13 @@ Invalid messages are published to an MQTT dead letter queue (DLQ). The latest se
 
 ## What It Does
 
-- Consumes sensor and status payloads from MQTT.
+- Consumes sensor and status payloads via a swappable input source (only MQTT is implemented today, selected with `INPUT_SOURCE`).
 - Validates raw JSON with embedded schemas.
 - Normalizes messages into canonical Rust structs.
 - Computes sensor values such as dew point, heat index, and IAQ.
 - Writes pre-rendered InfluxDB line protocol to a local WAL.
 - Retries transient InfluxDB failures without advancing the WAL cursor.
-- Publishes rejected payloads to a configured MQTT DLQ topic.
+- Publishes rejected payloads to a DLQ destination on the active input source (an MQTT topic today).
 - Serves latest sensor state over HTTP and SSE.
 - Exposes Prometheus metrics and structured JSON logs.
 
@@ -24,11 +24,11 @@ Invalid messages are published to an MQTT dead letter queue (DLQ). The latest se
 
 ```mermaid
 graph LR
-    MQTT[MQTT broker] --> Q[Bounded worker queues]
+    MQTT[Input source: MQTT] --> Q[Bounded worker queues]
     Q --> W[Worker pool]
     W --> P[Pipeline stages]
     P -->|valid| WAL[Write-ahead log]
-    P -->|invalid| DLQ[MQTT DLQ topic]
+    P -->|invalid| DLQ[DLQ via input source]
     WAL --> F[WAL forwarder]
     F -->|batched writes| IDB[(InfluxDB v2)]
     P --> CACHE[Latest sensor cache]
@@ -40,11 +40,12 @@ For the full design, see [docs/architecture.md](docs/architecture.md) and [docs/
 
 ## Quick Start
 
-The service requires MQTT, InfluxDB v2, and a writable WAL directory.
+The service requires an input source (MQTT today), InfluxDB v2, and a writable WAL directory.
 
 Set the required environment:
 
 ```bash
+INPUT_SOURCE=mqtt
 MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_CLIENT_ID=smarthome-ingest
@@ -94,6 +95,7 @@ docker build -t smarthome-ingest .
 docker run --rm \
   -p 8085:8085 \
   -p 9090:9090 \
+  -e INPUT_SOURCE=mqtt \
   -e MQTT_HOST=host.docker.internal \
   -e MQTT_PORT=1883 \
   -e MQTT_CLIENT_ID=smarthome-ingest \
