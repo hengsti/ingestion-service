@@ -13,8 +13,6 @@ use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::prometheus::MetricsServer;
 use infrastructure::router::{Route, Router};
-use infrastructure::sink::influx::InfluxSink;
-use infrastructure::sink::Sink;
 use infrastructure::source::{build_source, IngestDispatcher, IngestJob};
 use infrastructure::wal::forwarder::run_forwarder;
 use infrastructure::wal::types::WalOptions;
@@ -34,6 +32,8 @@ use tokio::{
     task::JoinSet,
 };
 use tracing::{error, info, warn};
+
+use crate::infrastructure::sink::build_output;
 
 fn worker_count() -> usize {
     std::thread::available_parallelism()
@@ -123,12 +123,7 @@ async fn main() -> Result<()> {
     .await?;
     let wal = Arc::new(wal);
 
-    let sink: Arc<dyn Sink> = Arc::new(InfluxSink::new(
-        &cfg.influx_url,
-        &cfg.influx_org,
-        &cfg.influx_bucket,
-        cfg.influx_token.clone(),
-    )?);
+    let (encoder, sink) = build_output(&cfg)?;
 
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
@@ -157,7 +152,7 @@ async fn main() -> Result<()> {
             .add_stage(TransformStage::new(router.clone()))
             .add_stage(ValidateBusinessStage::new()?)
             .add_stage(CacheUpdateStage::new(app_state.clone()))
-            .add_stage(PersistStage::new(wal.clone()))
+            .add_stage(PersistStage::new(wal.clone(), encoder))
             .add_stage(ObserveStage::new())
             .with_failure_stage(DlqPublishStage::new(dlq_publisher, dlq_topic.clone())),
     );

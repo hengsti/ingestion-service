@@ -111,7 +111,7 @@ fn status_event(device_id: &str) -> WalEvent {
     WalEvent {
         topic: format!("smarthome/{device_id}/status"),
         ts_ms: 1_700_000_000_000,
-        line_protocol: format!(
+        payload: format!(
             "device_status,device_id={device_id},device_class=esp32p4-bme680 rssi=-65i 1700000000000"
         ),
     }

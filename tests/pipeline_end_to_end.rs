@@ -40,9 +40,9 @@ async fn valid_sensor_message_processes_end_to_end() {
         .expect("expected a sensor event in the WAL");
     assert_eq!(event.topic, "smarthome/esp32-1/sensor");
     assert!(
-        event.line_protocol.contains("bme680"),
+        event.payload.contains("bme680"),
         "expected a sensor line protocol, got: {:?}",
-        event.line_protocol
+        event.payload
     );
 
     assert!(
@@ -71,9 +71,9 @@ async fn valid_status_message_processes_end_to_end() {
         .await
         .expect("expected a status event in the WAL");
     assert!(
-        event.line_protocol.contains("device_status"),
+        event.payload.contains("device_status"),
         "expected a status line protocol, got: {:?}",
-        event.line_protocol
+        event.payload
     );
 }
 
@@ -202,7 +202,7 @@ async fn unknown_topic_non_strict_mode_is_ignored() {
         .add_stage(TransformStage::new(non_strict_router_clone))
         .add_stage(ValidateBusinessStage::new().unwrap())
         .add_stage(CacheUpdateStage::new(cache))
-        .add_stage(PersistStage::new(wal))
+        .add_stage(PersistStage::new(wal, common::influx_encoder()))
         .add_stage(ObserveStage::new())
         .with_failure_stage(DlqPublishStage::new(
             common::dlq_publisher(),

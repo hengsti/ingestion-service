@@ -29,7 +29,7 @@ impl WalOffset {
 pub struct WalEvent {
     pub topic: String,
     pub ts_ms: i64,
-    pub line_protocol: String,
+    pub payload: String,
 }
 
 #[derive(Debug, Clone)]

@@ -155,7 +155,7 @@ mod tests {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
+            payload: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();
@@ -167,7 +167,7 @@ mod tests {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
+            payload: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();
@@ -176,7 +176,7 @@ mod tests {
         let (decoded_event, consumed) = decode_from(&mut cursor).unwrap().unwrap();
         assert_eq!(event.ts_ms, decoded_event.ts_ms);
         assert_eq!(event.topic, decoded_event.topic);
-        assert_eq!(event.line_protocol, decoded_event.line_protocol);
+        assert_eq!(event.payload, decoded_event.payload);
         assert_eq!(consumed, cursor.position() as usize);
     }
 
@@ -185,7 +185,7 @@ mod tests {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
+            payload: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();
@@ -195,7 +195,7 @@ mod tests {
         let (decoded_event, consumed) = decode_from(&mut cursor).unwrap().unwrap();
         assert_eq!(event.ts_ms, decoded_event.ts_ms);
         assert_eq!(event.topic, decoded_event.topic);
-        assert_eq!(event.line_protocol, decoded_event.line_protocol);
+        assert_eq!(event.payload, decoded_event.payload);
         assert_eq!(consumed, encoded_len);
     }
 
@@ -211,14 +211,12 @@ mod tests {
         let event_a = WalEvent {
             topic: String::from("topic-a"),
             ts_ms: 1,
-            line_protocol: String::from("device_status,device_id=device-a rssi=-42i 1"),
+            payload: String::from("device_status,device_id=device-a rssi=-42i 1"),
         };
         let event_b = WalEvent {
             topic: String::from("topic-b-longer-than-a"),
             ts_ms: 2,
-            line_protocol: String::from(
-                "device_status,device_id=device-b-longer-than-a rssi=-42i 2",
-            ),
+            payload: String::from("device_status,device_id=device-b-longer-than-a rssi=-42i 2"),
         };
 
         let mut wire = Vec::new();
@@ -251,7 +249,7 @@ mod tests {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
-            line_protocol: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
+            payload: String::from("device_status,device_id=device-123 rssi=-42i 123456789"),
         };
         let mut buf = Vec::new();
         encode_into(&mut buf, &event).unwrap();

@@ -26,6 +26,27 @@ impl InputSourceKind {
     }
 }
 
+/// Selects which output sink the service persists ingested messages to.
+///
+/// Only `Influx` is implemented today. Adding a variant here (e.g. `Kafka`) will
+/// force a compile error at every `match` on this type until it's handled —
+/// this is intentional, acting as a guardrail for future sinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSinkKind {
+    Influx,
+}
+
+impl OutputSinkKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "influx" => Ok(Self::Influx),
+            other => {
+                bail!("unsupported OUTPUT_SINK '{other}': only 'influx' is currently implemented")
+            }
+        }
+    }
+}
+
 /// MQTT broker connection settings, populated only when `INPUT_SOURCE=mqtt`.
 #[derive(Clone)]
 pub struct MqttSourceConfig {
@@ -47,6 +68,26 @@ impl fmt::Debug for MqttSourceConfig {
     }
 }
 
+/// InfluxDB connection settings, populated only when `OUTPUT_SINK=influx`.
+#[derive(Clone)]
+pub struct InfluxSinkConfig {
+    pub url: String,
+    pub org: String,
+    pub bucket: String,
+    pub token: SecretString,
+}
+
+impl fmt::Debug for InfluxSinkConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InfluxSinkConfig")
+            .field("url", &self.url)
+            .field("org", &self.org)
+            .field("bucket", &self.bucket)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     // Input source selection
@@ -59,11 +100,11 @@ pub struct Config {
     // which input source is active)
     pub mqtt_topics: HashMap<String, String>, // {"TOPIC NAME": "TOPIC STRING"}, e.g. {"MQTT_TOPIC_SENSOR": "home/sensor/+"}
 
-    // InfluxDB v2 Write API
-    pub influx_url: String, // e.g. http://influxdb:8086
-    pub influx_org: String,
-    pub influx_bucket: String,
-    pub influx_token: SecretString,
+    // Output sink selection
+    pub output_sink: OutputSinkKind,
+
+    // InfluxDB connection settings; only populated when output_sink == Influx
+    pub influx: Option<InfluxSinkConfig>,
 
     // batching
     pub batch_size: usize,
@@ -95,10 +136,8 @@ impl fmt::Debug for Config {
             .field("input_source", &self.input_source)
             .field("mqtt", &self.mqtt)
             .field("mqtt_topics", &self.mqtt_topics)
-            .field("influx_url", &self.influx_url)
-            .field("influx_org", &self.influx_org)
-            .field("influx_bucket", &self.influx_bucket)
-            .field("influx_token", &"[REDACTED]")
+            .field("output_sink", &self.output_sink)
+            .field("influx", &self.influx)
             .field("batch_size", &self.batch_size)
             .field("flush_interval_ms", &self.flush_interval_ms)
             .field("wal_dir", &self.wal_dir)
@@ -157,19 +196,28 @@ impl Config {
             bail!("At least one MQTT_TOPIC_<NAME> environment variable must be set");
         }
 
-        let influx_url = env_var("INFLUX_URL").context("INFLUX_URL must be set")?;
-        if !influx_url.starts_with("http://") && !influx_url.starts_with("https://") {
-            bail!(
-                "INFLUX_URL must start with http:// or https://, got: {}",
-                influx_url
-            );
-        }
-        let influx_org = env_var("INFLUX_ORG").context("INFLUX_ORG must be set")?;
-        let influx_bucket = env_var("INFLUX_BUCKET").context("INFLUX_BUCKET must be set")?;
-        let influx_token = SecretString::new(
-            env_var("INFLUX_TOKEN")
-                .context("INFLUX_TOKEN must be set (for InfluxDB v2 write API)")?,
-        );
+        let output_sink =
+            OutputSinkKind::parse(&env_var("OUTPUT_SINK").context("OUTPUT_SINK must be set")?)?;
+
+        let influx = match output_sink {
+            OutputSinkKind::Influx => {
+                let url = env_var("INFLUX_URL")
+                    .context("INFLUX_URL is required when OUTPUT_SINK=influx")?;
+                let org = env_var("INFLUX_ORG")
+                    .context("INFLUX_ORG is required when OUTPUT_SINK=influx")?;
+                let bucket = env_var("INFLUX_BUCKET")
+                    .context("INFLUX_BUCKET is required when OUTPUT_SINK=influx")?;
+                let token = env_var("INFLUX_TOKEN")
+                    .context("INFLUX_TOKEN is required when OUTPUT_SINK=influx")?;
+
+                Some(InfluxSinkConfig {
+                    url,
+                    org,
+                    bucket,
+                    token: SecretString::new(token),
+                })
+            }
+        };
 
         let batch_size = env_var("BATCH_SIZE")
             .context("BATCH_SIZE must be set")?
@@ -227,10 +275,8 @@ impl Config {
             input_source,
             mqtt,
             mqtt_topics,
-            influx_url,
-            influx_org,
-            influx_bucket,
-            influx_token,
+            output_sink,
+            influx,
             batch_size,
             flush_interval_ms,
             wal_dir,
@@ -282,5 +328,32 @@ mod tests {
     #[test]
     fn input_source_kind_parse_rejects_empty_value() {
         assert!(InputSourceKind::parse("").is_err());
+    }
+
+    #[test]
+    fn output_source_kind_parse_accepts_influx_case_insensitive() {
+        assert_eq!(
+            OutputSinkKind::parse("influx").unwrap(),
+            OutputSinkKind::Influx
+        );
+        assert_eq!(
+            OutputSinkKind::parse("INFLUX").unwrap(),
+            OutputSinkKind::Influx
+        );
+        assert_eq!(
+            OutputSinkKind::parse(" Influx ").unwrap(),
+            OutputSinkKind::Influx
+        );
+    }
+
+    #[test]
+    fn output_source_kind_parse_rejects_unknown_value() {
+        let err = OutputSinkKind::parse("kafka").unwrap_err();
+        assert!(err.to_string().contains("unsupported OUTPUT_SINK 'kafka'"));
+    }
+
+    #[test]
+    fn output_source_kind_parse_rejects_empty_value() {
+        assert!(OutputSinkKind::parse("").is_err());
     }
 }

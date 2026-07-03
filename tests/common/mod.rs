@@ -10,6 +10,7 @@ use smarthome_ingest::{
     infrastructure::{
         cache::state::CacheState,
         router::{Route, Router},
+        sink::{influx::InfluxEncoder, Encoder},
         source::{mqtt::MqttDlqPublisher, DlqPublisher},
         wal::{
             subscription::WalSubscription,
@@ -78,6 +79,12 @@ pub async fn open_temp_wal() -> (Arc<Wal>, WalSubscription, TempDir) {
     (Arc::new(wal), sub, tmp)
 }
 
+/// An `Arc<dyn Encoder>` wrapping [`InfluxEncoder`], for building pipelines
+/// against the trait-based encoding seam instead of a raw sink-specific call.
+pub fn influx_encoder() -> Arc<dyn Encoder> {
+    Arc::new(InfluxEncoder)
+}
+
 /// Builds the full ingest pipeline persisting to a temporary WAL.
 ///
 /// Returns the runner, the WAL subscription (to assert on persisted events),
@@ -93,7 +100,7 @@ pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, T
         .add_stage(TransformStage::new(router.clone()))
         .add_stage(ValidateBusinessStage::new().unwrap())
         .add_stage(CacheUpdateStage::new(cache.clone()))
-        .add_stage(PersistStage::new(wal))
+        .add_stage(PersistStage::new(wal, influx_encoder()))
         .add_stage(ObserveStage::new())
         .with_failure_stage(DlqPublishStage::new(
             dlq_publisher(),
