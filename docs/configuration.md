@@ -32,18 +32,28 @@ Unknown `MQTT_TOPIC_*` keys are not routed. They are still subscribed if they do
 
 ## InfluxDB
 
+The variables below are **only required when `OUTPUT_SINK=influx`** (see [Output sink](#output-sink)).
+
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `INFLUX_URL` | Yes | None | Base URL. Must start with `http://` or `https://` |
-| `INFLUX_ORG` | Yes | None | InfluxDB organization |
-| `INFLUX_BUCKET` | Yes | None | InfluxDB bucket |
-| `INFLUX_TOKEN` | Yes | None | InfluxDB v2 write token. Stored as `SecretString` and redacted from `Debug` output |
+| `INFLUX_URL` | Only if `OUTPUT_SINK=influx` | None | Base URL. Must start with `http://` or `https://` |
+| `INFLUX_ORG` | Only if `OUTPUT_SINK=influx` | None | InfluxDB organization |
+| `INFLUX_BUCKET` | Only if `OUTPUT_SINK=influx` | None | InfluxDB bucket |
+| `INFLUX_TOKEN` | Only if `OUTPUT_SINK=influx` | None | InfluxDB v2 write token. Stored as `SecretString` and redacted from `Debug` output |
 
 The write endpoint is built as:
 
 ```text
 <INFLUX_URL>/api/v2/write?org=<urlencoded org>&bucket=<urlencoded bucket>&precision=ms
 ```
+
+## Output sink
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `OUTPUT_SINK` | Yes | None | Selects the output destination. Only `influx` is implemented today (case-insensitive) |
+
+The service persists messages through a swappable `Sink`/`Encoder` pair (see `docs/architecture.md`). `OUTPUT_SINK` selects which implementation `build_output()` constructs at startup. Adding a new sink (e.g. Kafka) means adding a new `OutputSinkKind` variant and a matching `Sink`/`Encoder` pair — no changes to `main.rs`'s wiring are required beyond that.
 
 ## Batching
 
@@ -115,6 +125,7 @@ MQTT_CLIENT_ID=smarthome-ingest
 MQTT_TOPIC_SENSOR=smarthome/+/sensor
 MQTT_TOPIC_STATUS=smarthome/+/status
 MQTT_TOPIC_DLQ=smarthome/_dlq/ingest
+OUTPUT_SINK=influx
 INFLUX_URL=http://localhost:8086
 INFLUX_ORG=smarthome
 INFLUX_BUCKET=sensors

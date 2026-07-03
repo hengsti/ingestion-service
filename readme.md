@@ -14,7 +14,7 @@ Invalid messages are published to a DLQ on the active input source (MQTT today).
 - Validates raw JSON with embedded schemas.
 - Normalizes messages into canonical Rust structs.
 - Computes sensor values such as dew point, heat index, and IAQ.
-- Writes pre-rendered InfluxDB line protocol to a local WAL.
+- Writes a pre-rendered wire-format payload to a local WAL via a swappable output sink (only InfluxDB is implemented today, selected with `OUTPUT_SINK`).
 - Retries transient InfluxDB failures without advancing the WAL cursor.
 - Publishes rejected payloads to a DLQ destination on the active input source (an MQTT topic today).
 - Serves latest sensor state over HTTP and SSE.
@@ -52,6 +52,7 @@ MQTT_CLIENT_ID=smarthome-ingest
 MQTT_TOPIC_SENSOR=smarthome/+/sensor
 MQTT_TOPIC_STATUS=smarthome/+/status
 MQTT_TOPIC_DLQ=smarthome/_dlq/ingest
+OUTPUT_SINK=influx
 INFLUX_URL=http://localhost:8086
 INFLUX_ORG=smarthome
 INFLUX_BUCKET=sensors
@@ -102,6 +103,7 @@ docker run --rm \
   -e MQTT_TOPIC_SENSOR=smarthome/+/sensor \
   -e MQTT_TOPIC_STATUS=smarthome/+/status \
   -e MQTT_TOPIC_DLQ=smarthome/_dlq/ingest \
+  -e OUTPUT_SINK=influx \
   -e INFLUX_URL=http://host.docker.internal:8086 \
   -e INFLUX_ORG=smarthome \
   -e INFLUX_BUCKET=sensors \

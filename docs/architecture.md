@@ -11,8 +11,8 @@ This document explains how the service is put together and why each boundary exi
 - Normalize payloads into canonical Rust message structs.
 - Compute derived sensor fields.
 - Update an in-memory latest sensor cache.
-- Render InfluxDB line protocol.
-- Store line protocol in a local WAL before forwarding.
+- Render the wire-format payload via the active output sink's `Encoder` (InfluxDB line protocol today; see [Output Sink](#output-sink)).
+- Store the rendered payload in a local WAL before forwarding.
 - Publish rejected payloads to a DLQ destination on the active input source.
 - Export HTTP state and Prometheus metrics.
 
@@ -27,8 +27,8 @@ Config
   -> Cache state
   -> Metrics server
   -> WAL and WAL subscription
-  -> Influx sink
-  -> Pipeline runner (with a DlqPublisher from the active source)
+  -> Output sink selection (OUTPUT_SINK) and matching encoder
+  -> Pipeline runner (with a DlqPublisher from the active source, and an Encoder from the active sink)
 ```
 
 `main.rs` wires these components together. It starts the cache API, metrics API, the input source's event loop, the WAL forwarder, and the worker pool.
@@ -67,7 +67,7 @@ Each worker creates a `PipelineContext` and runs a fixed sequential pipeline:
 | 3 | `transform` | Trims strings, computes derived sensor fields, fills status defaults, deserializes to canonical Rust structs |
 | 4 | `validate_business` | Validates canonical messages against stricter business schemas |
 | 5 | `cache_update` | Updates latest sensor cache for sensor messages only |
-| 6 | `persist` | Renders InfluxDB line protocol and appends it to the WAL |
+| 6 | `persist` | Renders the active sink's payload format via `Encoder` and appends it to the WAL |
 | 7 | `observe` | Emits processed-message metrics |
 | Failure | `dlq_publish` | Publishes DLQ JSON when a previous stage marks the context for DLQ |
 
@@ -100,22 +100,35 @@ Raw schemas accept device payloads at the boundary. Business schemas validate th
 
 ## Persistence Path
 
-The persist stage converts canonical messages into InfluxDB line protocol:
+The persist stage renders canonical messages into the active sink's wire format via its `Encoder` (InfluxDB line protocol today; see [Output Sink](#output-sink) for how the format is chosen):
 
 - Sensors use measurement `bme680`.
 - Status messages use measurement `device_status`.
 
-The rendered line is stored in a `WalEvent`:
+The rendered payload is stored in a `WalEvent`:
 
 ```rust
 pub struct WalEvent {
     pub topic: String,
     pub ts_ms: i64,
-    pub line_protocol: String,
+    pub payload: String,
 }
 ```
 
 `ts_ms` is the ingest time of the WAL event. The InfluxDB point timestamp comes from the payload `time_ms` only when `time_valid=true` and `time_ms > 0`; otherwise InfluxDB assigns server time.
+
+## Output Sink
+
+Output persistence is decoupled behind `Sink` and `Encoder` abstractions (`src/infrastructure/sink/mod.rs`), mirroring the `Source`/`DlqPublisher` pattern used for input:
+
+- **`Sink` trait** — writes a batch of `WalEvent`s to the destination store. `write` returns a boxed `Send` future so the trait is object-safe (`Arc<dyn Sink>`); the WAL forwarder is generic over it and has no InfluxDB-specific knowledge.
+- **`Encoder` trait** — turns a canonical `HandledMessage` into the wire-format payload a `WalEvent` carries. `encode` is a plain sync method (no `Box::pin` allocation) because it never performs I/O — it runs once per message on the pipeline's hot path, before the WAL append.
+- **`build_output(cfg) -> Result<(Arc<dyn Encoder>, Arc<dyn Sink>)>`** — one factory call, matched on `Config::output_sink`, that builds a sink and its matching encoder together so they can never mismatch (same reasoning as `build_source`/`DlqPublisher`).
+- **`InfluxSink` / `InfluxEncoder`** (`src/infrastructure/sink/influx.rs`) — the only implementation today. `InfluxSink` posts batched line protocol to InfluxDB v2's write endpoint with a bounded retry loop; `InfluxEncoder` renders `SensorMessage`/`StatusMessage` into line protocol via `Point`.
+
+`OUTPUT_SINK` (env var) selects which sink `build_output()` constructs. Only `influx` is implemented; adding a future sink (e.g. Kafka) means adding an `OutputSinkKind` variant plus a matching `Sink`/`Encoder` pair — `main.rs`'s wiring does not need to change beyond the one `build_output` match arm.
+
+`PersistStage` holds the active `Arc<dyn Encoder>` and calls it to render the payload before appending to the WAL, so the pipeline stage stays sink-agnostic — it never imports InfluxDB-specific code.
 
 ## Forwarding Path
 

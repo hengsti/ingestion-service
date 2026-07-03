@@ -20,7 +20,7 @@ Maximum WAL record payload length is 1 MiB.
 |---|---|
 | `topic` | Source MQTT topic |
 | `ts_ms` | Ingest time when the WAL event was created |
-| `line_protocol` | Complete InfluxDB line protocol line |
+| `payload` | Complete InfluxDB line protocol line |
 
 ## Files
 
