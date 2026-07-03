@@ -111,8 +111,10 @@ impl DlqPublisher for MqttDlqPublisher {
     }
 }
 
-/// Builds an [`MqttSource`] + [`MqttDlqPublisher`] pair: connects, subscribes
-/// to every configured non-DLQ `MQTT_TOPIC_*` route, and returns both handles.
+/// Builds an [`MqttSource`] + [`MqttDlqPublisher`] pair, queues subscriptions
+/// for every configured non-DLQ `MQTT_TOPIC_*` route, and returns both handles.
+/// The network connection is established once the source starts polling the
+/// returned event loop.
 ///
 /// # Errors
 /// Returns an error if `cfg.mqtt` is `None` (should not happen — `Config::from_env`
@@ -163,7 +165,7 @@ mod tests {
     fn client_with_dropped_eventloop() -> AsyncClient {
         let opts = TestMqttOptions::new("test-mqtt-source-err", "localhost", 1884);
         let (client, _eventloop) = AsyncClient::new(opts, 10);
-        // _eventloop is dropped here → receiver gone → publish will fail
+        // Dropping the event loop closes the receiver, so `publish` fails.
         client
     }
 

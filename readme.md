@@ -1,6 +1,6 @@
 # smarthome-ingest
 
-Performance-focused Rust service for ingesting smart home telemetry from a configurable input source (MQTT today), validating and transforming it, durably staging InfluxDB line protocol in a local write-ahead log (WAL), and forwarding batches to InfluxDB v2.
+Performance-focused Rust service for ingesting smart home telemetry from a configurable input source (MQTT today), validating and transforming it, durably staging the active sink payload in a local write-ahead log (WAL), and forwarding batches to the configured output sink (InfluxDB v2 today).
 
 Invalid messages are published to a DLQ on the active input source (MQTT today). The latest sensor state is exposed through HTTP and Server-Sent Events (SSE), and Prometheus metrics are available for scraping.
 

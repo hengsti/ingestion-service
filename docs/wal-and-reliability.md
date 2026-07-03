@@ -1,10 +1,10 @@
 # WAL and Reliability
 
-The WAL is the service boundary between ingestion and InfluxDB availability. It lets MQTT ingestion continue while InfluxDB is unavailable, subject to local disk capacity and bounded input queues.
+The WAL is the service boundary between ingestion and output-sink availability. It lets ingestion continue while the active sink is unavailable, subject to local disk capacity and bounded input queues.
 
 ## Data Stored
 
-The persist stage stores already-rendered InfluxDB line protocol, not raw JSON.
+The persist stage stores already-rendered sink payloads, not raw JSON. With the current `InfluxEncoder`, that payload is a single InfluxDB line-protocol line.
 
 Each WAL record is a bincode-serialized `WalEvent` framed as:
 
@@ -18,9 +18,9 @@ Maximum WAL record payload length is 1 MiB.
 
 | Field | Meaning |
 |---|---|
-| `topic` | Source MQTT topic |
+| `topic` | Source topic string (MQTT today) |
 | `ts_ms` | Ingest time when the WAL event was created |
-| `payload` | Complete InfluxDB line protocol line |
+| `payload` | Complete sink payload (InfluxDB line protocol today) |
 
 ## Files
 
@@ -127,9 +127,9 @@ Cursor commit failures after a successful or permanent sink result are retried i
 
 ## Delivery Semantics
 
-The service aims for at-least-once delivery from WAL to InfluxDB for retryable failures.
+The service aims for at-least-once delivery from the WAL to the active sink for retryable failures.
 
-Cases to understand:
+With the current `InfluxSink`, cases to understand are:
 
 - If InfluxDB is temporarily unavailable, the forwarder holds the batch and does not advance the cursor.
 - If the process crashes before committing a successfully written batch, the batch can be replayed after restart.
@@ -140,7 +140,7 @@ The WAL is not a general event archive. Committed older segments are deleted.
 
 ## Operational Implications
 
-- Put `WAL_DIR` on persistent storage with enough capacity for expected InfluxDB outage duration.
+- Put `WAL_DIR` on persistent storage with enough capacity for the expected sink outage duration.
 - Alert on `wal_forwarder_retry_outage_active == 1`.
 - Alert on sustained growth of WAL segment files.
 - Investigate `wal_forwarder_drop_total` immediately; it means data was discarded as permanently unwritable.

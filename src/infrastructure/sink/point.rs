@@ -111,7 +111,7 @@ impl PointBuilder {
         self
     }
 
-    /// Timestamp in milliseconds. If you don't call this, InfluxDB will use server time.
+    /// Timestamp in milliseconds. If you don't call this, InfluxDB uses server time.
     pub fn timestamp_ms(mut self, timestamp_ms: i64) -> Self {
         self.timestamp_ms = Some(timestamp_ms);
         self
@@ -133,7 +133,7 @@ impl PointBuilder {
     }
 }
 
-// ---------- Escaping helpers (Influx line protocol) ----------
+// Escaping helpers for Influx line protocol.
 
 fn esc_measurement(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -163,8 +163,7 @@ fn esc_string_field(s: &str) -> String {
 fn format_field_value(v: &FieldValue) -> String {
     match v {
         FieldValue::Float(x) => {
-            // Keep as normal float representation; Influx accepts this.
-            // Optional: clamp/round outside if desired.
+            // Rust's default float formatting is valid Influx line protocol.
             format!("{}", x)
         }
         FieldValue::Int(x) => format!("{}i", x),

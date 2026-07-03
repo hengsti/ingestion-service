@@ -59,7 +59,7 @@ The service persists messages through a swappable `Sink`/`Encoder` pair (see `do
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `BATCH_SIZE` | Yes | None | Maximum WAL entries per InfluxDB write |
+| `BATCH_SIZE` | Yes | None | Maximum WAL entries per sink write |
 | `FLUSH_INTERVAL_MS` | Yes | None | Time trigger for partial WAL batches |
 
 Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a smaller `FLUSH_INTERVAL_MS` for lower end-to-end latency.
@@ -72,13 +72,13 @@ Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a sma
 | `WAL_SEGMENT_BYTES` | No | `67108864` | Segment rotation threshold in bytes |
 | `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer |
 
-Use persistent local storage for `WAL_DIR` in production. The WAL buffers InfluxDB outages and replays uncommitted records after restart.
+Use persistent local storage for `WAL_DIR` in production. The WAL buffers sink outages (InfluxDB today) and replays uncommitted records after restart.
 
 ## Input Queue
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `INPUT_QUEUE_CAPACITY` | No | `16384` | Total MQTT ingest queue capacity distributed across workers |
+| `INPUT_QUEUE_CAPACITY` | No | `16384` | Total ingest queue capacity distributed across workers |
 
 The service divides `INPUT_QUEUE_CAPACITY` by worker count to create one bounded queue per worker. Keep this value at least as large as the maximum worker count, which is 8, so every worker receives a non-zero channel capacity.
 

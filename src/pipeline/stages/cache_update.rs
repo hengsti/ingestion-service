@@ -66,8 +66,6 @@ mod tests {
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-
     fn cache() -> CacheState {
         CacheState::new(60_000, 16)
     }
@@ -117,8 +115,6 @@ mod tests {
         ctx
     }
 
-    // ── run(): return values ──────────────────────────────────────────────────
-
     #[tokio::test]
     async fn run_on_sensor_message_returns_continue() {
         let cache = cache();
@@ -155,8 +151,6 @@ mod tests {
         assert!(!ctx.should_publish_dlq());
     }
 
-    // ── run(): cache state after sensor update ────────────────────────────────
-
     #[tokio::test]
     async fn run_stores_sensor_data_in_cache_retrievable_by_device_id() {
         let cache = cache();
@@ -173,12 +167,10 @@ mod tests {
     async fn run_normalizes_device_id_to_lowercase_in_cache() {
         let cache = cache();
         let stage = CacheUpdateStage::new(cache.clone());
-        // Message uses uppercase device_id.
         let mut ctx = ctx_with_message(sensor_message("ESP32-1", 20.0));
 
         stage.run(&mut ctx).await.unwrap();
 
-        // Must be findable by the lowercase key.
         assert!(
             cache.snapshot_sensor("esp32-1").is_some(),
             "device not found under lowercased key"
@@ -190,11 +182,9 @@ mod tests {
         let cache = cache();
         let stage = CacheUpdateStage::new(cache.clone());
 
-        // First update.
         let mut ctx1 = ctx_with_message(sensor_message("esp32-1", 20.0));
         stage.run(&mut ctx1).await.unwrap();
 
-        // Second update with different temp.
         let mut ctx2 = ctx_with_message(sensor_message("esp32-1", 30.0));
         stage.run(&mut ctx2).await.unwrap();
 
@@ -220,8 +210,6 @@ mod tests {
         assert_eq!(all.len(), 2, "expected two separate cache entries");
     }
 
-    // ── run(): status messages do not pollute sensor cache ────────────────────
-
     #[tokio::test]
     async fn run_on_status_message_does_not_insert_into_sensor_cache() {
         let cache = cache();
@@ -235,8 +223,6 @@ mod tests {
             "status message must not write to sensor cache"
         );
     }
-
-    // ── run(): broadcast event ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn run_broadcasts_cache_event_for_sensor_update() {

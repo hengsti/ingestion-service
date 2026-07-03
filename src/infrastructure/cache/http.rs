@@ -23,6 +23,7 @@ use tokio_stream::{
 use super::state::{CacheEvent, CacheState};
 use crate::model::messages::sensor::SensorData;
 
+/// Builds the cache HTTP API router.
 pub fn router(state: CacheState, source_ready: Arc<AtomicBool>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -130,7 +131,6 @@ async fn stream_updates(
                 last_seen_ms,
                 value,
             }) => {
-                // Event-type for SSE-Clients
                 let payload = SseSensorEvent {
                     kind: "sensor",
                     device_id,
@@ -138,7 +138,6 @@ async fn stream_updates(
                     value,
                 };
 
-                // JSON payload (HomeKit-Bridge kann direkt konsumieren)
                 let json = match serde_json::to_string(&payload) {
                     Ok(s) => s,
                     Err(_) => return None,
@@ -146,9 +145,8 @@ async fn stream_updates(
 
                 Some(Ok(Event::default().event("sensor").data(json)))
             }
-            // Receiver war zu langsam -> Events wurden gedropped
             Err(BroadcastStreamRecvError::Lagged(_)) => {
-                // Optional: Client kann dann einmal /v1/state pollen
+                // Lagging subscribers can recover by polling `/v1/state`.
                 Some(Ok(Event::default()
                     .event("lagged")
                     .data("{\"hint\":\"poll /v1/state\"}")))

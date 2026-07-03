@@ -88,43 +88,25 @@ impl fmt::Debug for InfluxSinkConfig {
     }
 }
 
+/// Runtime configuration loaded from environment variables.
 #[derive(Clone)]
 pub struct Config {
-    // Input source selection
     pub input_source: InputSourceKind,
-
-    // MQTT connection settings; only populated when input_source == Mqtt
+    /// Present when `input_source` is [`InputSourceKind::Mqtt`].
     pub mqtt: Option<MqttSourceConfig>,
-
-    // Topic routing/schema config; transport-agnostic (used by the Router regardless of
-    // which input source is active)
-    pub mqtt_topics: HashMap<String, String>, // {"TOPIC NAME": "TOPIC STRING"}, e.g. {"MQTT_TOPIC_SENSOR": "home/sensor/+"}
-
-    // Output sink selection
+    /// Route definitions loaded from `MQTT_TOPIC_*` environment variables.
+    pub mqtt_topics: HashMap<String, String>,
     pub output_sink: OutputSinkKind,
-
-    // InfluxDB connection settings; only populated when output_sink == Influx
+    /// Present when `output_sink` is [`OutputSinkKind::Influx`].
     pub influx: Option<InfluxSinkConfig>,
-
-    // batching
     pub batch_size: usize,
     pub flush_interval_ms: u64,
-
-    // Write-ahead log
     pub wal_dir: PathBuf,
     pub wal_segment_bytes: u64,
     pub wal_queue_capacity: usize,
-
-    // Ingest Event Queue
     pub input_queue_capacity: usize,
-
-    // optional checks
     pub enforce_topic_device_match: bool,
-
-    // Metrics
     pub metrics_bind: String,
-
-    // Cache
     pub cache_ttl_ms: u64,
     pub cache_bind: String,
     pub cache_buffer: usize,

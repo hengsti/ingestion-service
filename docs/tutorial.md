@@ -32,6 +32,7 @@ $env:MQTT_CLIENT_ID="smarthome-ingest"
 $env:MQTT_TOPIC_SENSOR="smarthome/+/sensor"
 $env:MQTT_TOPIC_STATUS="smarthome/+/status"
 $env:MQTT_TOPIC_DLQ="smarthome/_dlq/ingest"
+$env:OUTPUT_SINK="influx"
 $env:INFLUX_URL="http://localhost:8086"
 $env:INFLUX_ORG="smarthome"
 $env:INFLUX_BUCKET="sensors"
@@ -56,6 +57,7 @@ export MQTT_CLIENT_ID=smarthome-ingest
 export MQTT_TOPIC_SENSOR='smarthome/+/sensor'
 export MQTT_TOPIC_STATUS='smarthome/+/status'
 export MQTT_TOPIC_DLQ='smarthome/_dlq/ingest'
+export OUTPUT_SINK=influx
 export INFLUX_URL='http://localhost:8086'
 export INFLUX_ORG=smarthome
 export INFLUX_BUCKET=sensors
@@ -80,8 +82,8 @@ The service starts:
 
 - The cache HTTP API on `CACHE_BIND`.
 - The Prometheus endpoint on `METRICS_BIND`.
-- The MQTT connection and subscriptions for non-DLQ MQTT topics.
-- The WAL writer and InfluxDB forwarder.
+- The current MQTT source connection and subscriptions for non-DLQ topics.
+- The WAL writer and sink forwarder (InfluxDB today).
 - A worker pool with 2 to 8 workers, based on available CPU parallelism.
 
 ## 4. Publish a Sensor Payload
@@ -112,8 +114,8 @@ Expected results:
 - The message passes raw schema validation.
 - The transform stage adds `dew_point_c`, `heat_index_c`, `iaq_score`, and `iaq_text`.
 - The latest sensor state appears in the cache API.
-- A `bme680` line protocol record is appended to the WAL.
-- The WAL forwarder eventually writes the line to InfluxDB.
+- The active encoder renders a `bme680` line-protocol record and appends it to the WAL.
+- The WAL forwarder eventually writes the batch to the active sink (InfluxDB today).
 
 ## 5. Query the Cache
 
@@ -158,4 +160,4 @@ curl -i http://localhost:8085/readyz
 curl http://localhost:9090/metrics
 ```
 
-`/healthz` returns `200` when the HTTP server is alive. `/readyz` returns `200` after MQTT has acknowledged the connection and `503` before that.
+`/healthz` returns `200` when the HTTP server is alive. `/readyz` returns `200` after the current MQTT source has acknowledged the connection and `503` before that.

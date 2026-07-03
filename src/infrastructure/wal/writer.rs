@@ -407,10 +407,8 @@ mod tests {
         let event = sample_event(1);
         handle.tx.send(req(event.clone())).unwrap();
 
-        // Drop sender so writer task flushes + exits.
         drop(handle.tx);
 
-        // Give the task time to flush and close.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let bytes = fs::read(segment_path(dir.path(), 1)).unwrap();
@@ -469,7 +467,6 @@ mod tests {
         handle.tx.send(req(sample_event(1))).unwrap();
         handle.tx.send(req(sample_event(2))).unwrap();
 
-        // Wait until head has advanced into segment 2.
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if handle.head.load().segment_id >= 2 {

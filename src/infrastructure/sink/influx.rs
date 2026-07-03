@@ -29,7 +29,7 @@ impl Encoder for InfluxEncoder {
     }
 }
 
-/// InfluxDB v2 sink: converts WAL events to line protocol and writes them with a bounded retry loop.
+/// Writes WAL payload batches to the InfluxDB v2 write API with bounded retries.
 pub struct InfluxSink {
     client: Client,
     write_url: String,
@@ -51,7 +51,6 @@ impl InfluxSink {
             .build()
             .context("Failed to build reqwest client")?;
 
-        // InfluxDB v2 write endpoint
         let write_url = format!(
             "{}/api/v2/write?org={}&bucket={}&precision=ms",
             url.trim_end_matches('/'),
@@ -67,7 +66,7 @@ impl InfluxSink {
     }
 }
 
-/// Converts a batch of WAL events into a newline-delimited InfluxDB line-protocol body.
+/// Joins WAL payloads into a newline-delimited Influx write body.
 fn build_body(batch: &[WalEvent]) -> String {
     let mut body = String::new();
     for event in batch {
@@ -181,7 +180,7 @@ pub fn sensor_to_point(msg: &SensorMessage) -> Point {
         .field_f64("altitude_m", msg.data.altitude_m)
         .field_bool("time_valid", msg.time_valid);
 
-    // Timestamp only used if the message is valid and non-zero, otherwise InfluxDB will use the server time.
+    // Use the device timestamp only when it is marked valid and non-zero.
     if msg.time_valid && msg.time_ms > 0 {
         b = b.timestamp_ms(msg.time_ms);
     }

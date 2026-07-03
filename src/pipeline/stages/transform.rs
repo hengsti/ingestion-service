@@ -70,7 +70,7 @@ impl TransformStage {
         Self::set_f64_in_object(data, "iaq_score", iaq_score)?;
         data.insert("iaq_text".to_string(), Value::String(iaq_text));
 
-        // keep raw values canonical as well
+        // Rewrite the raw numeric fields into canonical JSON number form as well.
         Self::set_f64_in_object(data, "pressure_hpa", pressure_hpa)?;
         Self::set_f64_in_object(data, "altitude_m", altitude_m)?;
 
@@ -331,8 +331,6 @@ mod tests {
     const SENSOR_SCHEMA: &str = include_str!("../../../schema/sensor.schema.json");
     const STATUS_SCHEMA: &str = include_str!("../../../schema/status.schema.json");
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-
     fn sensor_router() -> Arc<Router> {
         let route = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
         Arc::new(Router::new().add_route(route))
@@ -385,8 +383,6 @@ mod tests {
         ctx
     }
 
-    // ── calc_dew_point_c ──────────────────────────────────────────────────────
-
     #[test]
     fn calc_dew_point_c_returns_expected_value_for_typical_conditions() {
         // At 20 °C and 50 % RH the dew point is approximately 9.27 °C.
@@ -401,8 +397,6 @@ mod tests {
         let result = TransformStage::calc_dew_point_c(temp, 100.0);
         assert!((result - temp).abs() < 0.001, "got {result}");
     }
-
-    // ── calc_heat_index_c ─────────────────────────────────────────────────────
 
     #[test]
     fn calc_heat_index_c_uses_steadman_formula_below_80f() {
@@ -438,8 +432,6 @@ mod tests {
         assert!(result > without_adjustment, "got {result}");
     }
 
-    // ── calc_iaq_score ────────────────────────────────────────────────────────
-
     #[test]
     fn calc_iaq_score_is_100_at_optimal_humidity_and_max_gas() {
         // Humidity in [38,42] → hum_score = 25; gas at upper limit → gas_score = 75.
@@ -473,8 +465,6 @@ mod tests {
             "hum score should decrease as humidity rises above 42 %"
         );
     }
-
-    // ── calc_iaq_text ─────────────────────────────────────────────────────────
 
     #[test]
     fn calc_iaq_text_good_when_score_above_89_8() {
@@ -527,8 +517,6 @@ mod tests {
         );
     }
 
-    // ── transform_sensor_payload: derived fields ──────────────────────────────
-
     #[test]
     fn transform_sensor_payload_adds_all_derived_fields() {
         let stage = TransformStage::new(sensor_router());
@@ -555,8 +543,6 @@ mod tests {
         assert_eq!(payload["device_id"], json!("esp32-1"));
         assert_eq!(payload["room"], json!("living_room"));
     }
-
-    // ── transform_sensor_payload: validation bounds ───────────────────────────
 
     #[test]
     fn transform_sensor_payload_returns_err_when_data_missing() {
@@ -648,8 +634,6 @@ mod tests {
         assert!(stage.transform_sensor_payload(&mut payload).is_ok());
     }
 
-    // ── transform_status_payload ──────────────────────────────────────────────
-
     #[test]
     fn transform_status_payload_succeeds_on_valid_payload() {
         let stage = TransformStage::new(sensor_router());
@@ -698,8 +682,6 @@ mod tests {
         assert_eq!(payload["free_mem"], json!(200_000_i64));
         assert_eq!(payload["ssid"], json!("HomeNet"));
     }
-
-    // ── run(): stage-level behavior ───────────────────────────────────────────
 
     #[tokio::test]
     async fn run_on_valid_sensor_payload_sets_handled_message_and_returns_continue() {

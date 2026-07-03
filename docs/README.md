@@ -1,6 +1,6 @@
 # smarthome-ingest Documentation
 
-`smarthome-ingest` is a Rust service that consumes smart home telemetry from MQTT, validates and normalizes it, stores pre-rendered InfluxDB line protocol in a local write-ahead log (WAL), and forwards batches to InfluxDB v2. Invalid messages are published to an MQTT dead letter queue (DLQ). The latest sensor values are also exposed through HTTP and Server-Sent Events (SSE).
+`smarthome-ingest` is a Rust service that consumes smart home telemetry from a configurable input source (MQTT today), validates and normalizes it, stores pre-rendered sink payloads in a local write-ahead log (WAL), and forwards batches to a configurable output sink (InfluxDB v2 today). Invalid messages are published to a DLQ on the active input source. The latest sensor values are also exposed through HTTP and Server-Sent Events (SSE).
 
 This documentation follows the Diataxis model:
 
@@ -24,37 +24,37 @@ These docs are written for:
 
 | Path | Purpose |
 |---|---|
-| `src/main.rs` | Runtime wiring: config, MQTT client, workers, pipeline, WAL, HTTP, metrics, shutdown |
+| `src/main.rs` | Runtime wiring: config, input source, workers, pipeline, WAL, output sink, HTTP, metrics, shutdown |
 | `src/config.rs` | Environment variable parsing and validation |
 | `src/model/` | MQTT topic matching and canonical message structs |
 | `src/pipeline/` | Sequential processing pipeline and stages |
+| `src/infrastructure/source/` | `Source`/`DlqPublisher` traits and the MQTT implementation |
 | `src/infrastructure/router.rs` | Topic to schema and message type routing |
 | `src/infrastructure/schema.rs` | Embedded JSON Schema compilation and validation |
 | `src/infrastructure/cache/` | Latest sensor state cache and HTTP/SSE API |
-| `src/infrastructure/database/` | InfluxDB line protocol point builder |
-| `src/infrastructure/sink/` | InfluxDB v2 write sink and sink error classification |
+| `src/infrastructure/sink/` | `Sink`/`Encoder` traits, the InfluxDB implementation, and the line protocol point builder |
 | `src/infrastructure/wal/` | WAL writer, reader subscription, cursor, recovery, and forwarder |
 | `schema/` | Raw and business JSON Schemas embedded at compile time |
-| `tests/` | Integration tests for pipeline, cache API, batching, and Influx forwarding |
+| `tests/` | Integration tests for pipeline, cache API, batching, and sink forwarding |
 | `.github/workflows/` | CI and CD workflows |
 
 ## Runtime Flow
 
 ```text
-MQTT broker
+Input source (MQTT today)
   -> bounded worker queues
   -> decode
   -> raw validation
   -> transform
   -> business validation
   -> cache update
-  -> WAL append
+  -> WAL append (payload rendered by the active sink's Encoder)
   -> metrics observation
   -> WAL forwarder
-  -> InfluxDB v2
+  -> output sink (InfluxDB v2 today)
 ```
 
-Failures before persistence are routed to the configured MQTT DLQ when a pipeline stage marks the message for DLQ. Messages dropped before entering the pipeline, for example because a worker queue is full, are counted in metrics but are not published to the DLQ.
+Failures before persistence are routed to the DLQ via the active input source when a pipeline stage marks the message for DLQ. Messages dropped before entering the pipeline, for example because a worker queue is full, are counted in metrics but are not published to the DLQ.
 
 ## Rust Compatibility
 

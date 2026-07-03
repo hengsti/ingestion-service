@@ -118,8 +118,6 @@ mod tests {
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-
     fn valid_sensor_msg() -> SensorMessage {
         SensorMessage {
             device_id: "esp32-1".to_string(),
@@ -193,8 +191,6 @@ mod tests {
             .map(|entry| entry.event)
     }
 
-    // ── run(): success paths ──────────────────────────────────────────────────
-
     #[tokio::test]
     async fn run_on_sensor_message_appends_to_wal_and_returns_continue() {
         let dir = tempdir().unwrap();
@@ -235,8 +231,6 @@ mod tests {
             expected_line_protocol(&HandledMessage::Status(valid_status_msg()))
         );
     }
-
-    // ── run(): queue error paths ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn run_marks_dlq_with_queue_full_when_wal_queue_is_saturated() {
@@ -290,7 +284,6 @@ mod tests {
         let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
         let stage = PersistStage::new(wal, encoder);
 
-        // First append writes segment 1.
         let mut first = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
         assert!(matches!(
             stage.run(&mut first).await,
@@ -323,8 +316,6 @@ mod tests {
         assert!(ctx.should_publish_dlq());
         assert_eq!(ctx.dlq_reason(), Some("wal queue closed"));
     }
-
-    // ── run(): missing handled_message ────────────────────────────────────────
 
     #[tokio::test]
     async fn run_without_handled_message_returns_error() {

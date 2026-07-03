@@ -1,6 +1,6 @@
 # Development Guide
 
-This guide helps contributors modify the Rust code safely.
+Contributor notes for changing the Rust service safely.
 
 ## Toolchain
 
@@ -30,15 +30,15 @@ cargo doc --all-features --no-deps
 
 | Area | Files | Notes |
 |---|---|---|
-| Runtime wiring | `src/main.rs` | Owns task startup, MQTT loop, worker dispatch, shutdown |
+| Runtime wiring | `src/main.rs` | Owns task startup, source/sink wiring, worker dispatch, shutdown |
 | Config | `src/config.rs` | Environment parsing and defaults |
 | Messages | `src/model/messages/` | Canonical Rust structs |
 | Topic matching | `src/model/topic.rs` | MQTT wildcard matching and device id extraction |
 | Pipeline | `src/pipeline/` | Stage trait, runner, context, and stage implementations |
 | Routing/schema | `src/infrastructure/router.rs`, `src/infrastructure/schema.rs` | Topic route and JSON Schema validation |
+| Input source | `src/infrastructure/source/` | `Source`/`DlqPublisher`, MQTT implementation, and ingest dispatch |
 | Cache API | `src/infrastructure/cache/` | Latest sensor state and HTTP/SSE API |
-| Influx mapping | `src/infrastructure/database/` | Line protocol point builder |
-| Sink | `src/infrastructure/sink/` | InfluxDB write API and retry classification |
+| Output sink | `src/infrastructure/sink/` | `Sink`/`Encoder`, Influx sink, and line-protocol point builder |
 | WAL | `src/infrastructure/wal/` | Segment writer, subscription, cursor, recovery, forwarder |
 
 ## Test Layout
@@ -74,7 +74,7 @@ Many modules also contain unit tests next to implementation code.
 7. Update `TransformStage` if normalization or derived fields are needed.
 8. Update `ValidateBusinessStage` to load and apply the business schema.
 9. Update `CacheUpdateStage` if the new type should appear in the cache API.
-10. Update `PersistStage` and `src/infrastructure/database/influx.rs` to render line protocol.
+10. Update the active encoder implementation, currently `src/infrastructure/sink/influx.rs`, to render the new message type.
 11. Add tests for routing, transform, business validation, persistence, and end-to-end behavior.
 12. Update docs in `docs/messages-and-routing.md`, `docs/http-and-metrics.md`, and `docs/configuration.md`.
 
@@ -107,7 +107,7 @@ Add or update tests in the relevant WAL module and `tests/batcher.rs`.
 
 ## Change InfluxDB Mapping
 
-Influx line protocol is built through `PointBuilder`.
+The current Influx encoder builds line protocol through `PointBuilder` in `src/infrastructure/sink/point.rs`.
 
 Rules:
 

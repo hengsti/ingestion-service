@@ -5,11 +5,9 @@ use std::{net::SocketAddr, time::Duration};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-/// Prometheus endpoint for Telegraf scraping.
+/// Background Prometheus exporter for Telegraf scraping.
 ///
-/// - GET /metrics -> Prometheus text exposition format
-///
-/// Starts in the background and installs the global `metrics` recorder.
+/// Exposes `GET /metrics` and installs the global `metrics` recorder.
 pub struct MetricsServer {
     _http_task: JoinHandle<()>,
     _upkeep_task: JoinHandle<()>,

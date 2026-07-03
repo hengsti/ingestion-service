@@ -71,9 +71,7 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     info!(?cfg, "starting ingestion service");
 
-    // ------------------------------------------------------------
-    // Cache / HTTP state
-    // ------------------------------------------------------------
+    // Cache / HTTP state.
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
     let source_ready = Arc::new(AtomicBool::new(false));
 
@@ -92,19 +90,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ------------------------------------------------------------
-    // Metrics server
-    // ------------------------------------------------------------
+    // Metrics server.
     let _metrics_server = MetricsServer::start(&cfg.metrics_bind).await?;
 
-    // ------------------------------------------------------------
-    // Router / schema routes
-    // ------------------------------------------------------------
+    // Router / schema routes.
     let router = Arc::new(build_router(&cfg)?);
 
-    // ------------------------------------------------------------
-    // DLQ topic
-    // ------------------------------------------------------------
+    // DLQ topic.
     let dlq_topic = cfg
         .mqtt_topics
         .iter()
@@ -112,9 +104,7 @@ async fn main() -> Result<()> {
         .map(|(_, v)| v.clone())
         .context("MQTT_TOPIC_DLQ not configured")?;
 
-    // ------------------------------------------------------------
-    // WAL + InfluxDB sink + forwarder
-    // ------------------------------------------------------------
+    // WAL, configured sink, and forwarder.
     let (wal, wal_sub) = Wal::open(WalOptions {
         dir: cfg.wal_dir.clone(),
         segment_bytes: cfg.wal_segment_bytes,
@@ -134,14 +124,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ------------------------------------------------------------
-    // Input source
-    // ------------------------------------------------------------
+    // Input source.
     let (source, dlq_publisher) = build_source(&cfg, source_ready.clone()).await?;
 
-    // ------------------------------------------------------------
-    // Pipeline
-    // ------------------------------------------------------------
+    // Pipeline.
     let pipeline = Arc::new(
         PipelineRunner::new()
             .add_stage(DecodeStage::new())
@@ -159,9 +145,7 @@ async fn main() -> Result<()> {
 
     info!("pipeline initialized");
 
-    // ------------------------------------------------------------
-    // Worker queue — one channel per worker, round-robin dispatch
-    // ------------------------------------------------------------
+    // Worker queue: one channel per worker, round-robin dispatch.
     let worker_total = worker_count();
     let per_worker_cap = cfg.input_queue_capacity / worker_total;
     info!(workers = worker_total, "starting pipeline workers");
@@ -199,16 +183,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ------------------------------------------------------------
-    // Input source task — dispatches into the worker queue via IngestDispatcher
-    // ------------------------------------------------------------
+    // Source task dispatches into the worker queue via `IngestDispatcher`.
     let dispatcher = IngestDispatcher::new(job_txs.clone());
     let mut source_task = tokio::spawn(source.run(dispatcher, shutdown_rx.clone()));
 
-    // ------------------------------------------------------------
-    // Main consume loop — waits for whichever of ctrl-c, the HTTP task, or the
-    // input source finishes first, then signals shutdown.
-    // ------------------------------------------------------------
+    // Wait for ctrl-c, the HTTP task, or the input source, then signal shutdown.
     let mut fatal_source_err: Option<anyhow::Error> = None;
     let mut source_task_handled = false;
 

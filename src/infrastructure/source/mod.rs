@@ -111,8 +111,6 @@ mod tests {
 
     use super::*;
 
-    // ── IngestDispatcher: round-robin distribution ──────────────────────────
-
     #[tokio::test]
     async fn ingest_dispatcher_dispatch_round_robins_across_senders() {
         let (tx_a, mut rx_a) = mpsc::channel::<IngestJob>(4);
@@ -139,8 +137,6 @@ mod tests {
         assert_eq!(received_b, vec!["topic/1", "topic/3"]);
     }
 
-    // ── IngestDispatcher: queue-full behavior ───────────────────────────────
-
     #[tokio::test]
     async fn ingest_dispatcher_dispatch_drops_job_and_increments_metric_when_queue_full() {
         let (tx, mut rx) = mpsc::channel::<IngestJob>(1);
@@ -150,7 +146,6 @@ mod tests {
             topic: "topic/first".to_string(),
             payload: Bytes::from_static(b"{}"),
         });
-        // Second dispatch targets the same (only) sender, whose queue is now full.
         dispatcher.dispatch(IngestJob {
             topic: "topic/second".to_string(),
             payload: Bytes::from_static(b"{}"),
@@ -162,7 +157,6 @@ mod tests {
             .expect("channel must yield the first job");
         assert_eq!(first.topic, "topic/first");
 
-        // The second job was dropped: nothing else arrives.
         let second = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
         assert!(second.is_err(), "no second job should have been queued");
     }

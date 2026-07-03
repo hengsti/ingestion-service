@@ -1,10 +1,10 @@
 # Architecture
 
-This document explains how the service is put together and why each boundary exists.
+This document describes the runtime structure and why each boundary exists.
 
 ## Responsibilities
 
-`smarthome-ingest` owns the ingestion path between an input source and InfluxDB:
+`smarthome-ingest` owns the ingestion path between an input source and an output sink (InfluxDB today):
 
 - Consume telemetry from a configurable input source (MQTT today; see [Input Source](#input-source)).
 - Decode and validate JSON payloads.
@@ -35,7 +35,7 @@ Config
 
 ## Input Source
 
-Input ingestion is decoupled behind a `Source` abstraction (`src/infrastructure/source/mod.rs`), mirroring the existing `Sink` trait used for InfluxDB output:
+Input ingestion is decoupled behind a `Source` abstraction (`src/infrastructure/source/mod.rs`), mirroring the `Sink`/`Encoder` boundary used for output:
 
 - **`Source` trait** — owns a transport's connect/subscribe/event-loop and pushes decoded `IngestJob`s into a shared `IngestDispatcher`. `run` takes `self: Box<Self>` and a cloned shutdown `watch::Receiver<bool>`, matching the shutdown pattern already used by workers.
 - **`DlqPublisher` trait** — abstracts "publish a rejected message back out". It is coupled 1:1 with the active `Source`: `build_source()` returns both from one factory call, matched on `Config::input_source`.
