@@ -42,15 +42,17 @@ Input ingestion is decoupled behind a `Source` abstraction (`src/infrastructure/
 - **`IngestDispatcher`** — round-robins `IngestJob`s across the worker pool's per-worker bounded channels. It is handed to `Source::run` by value so a source never needs to know about worker count or pool internals, and there is no extra channel hop between the source and the workers.
 - **`MqttSource` / `MqttDlqPublisher`** (`src/infrastructure/source/mqtt.rs`) — the only implementation today. `MqttSource` holds just the `rumqttc::EventLoop` and a readiness flag; the `AsyncClient` handle used for subscribing is cloned into `MqttDlqPublisher` and the original handle dropped, since the event loop owns the actual network connection independent of client handle count.
 
-`INPUT_SOURCE` (env var) selects which source `build_source()` constructs. Only `mqtt` is implemented; adding a future transport (e.g. Kafka) means adding an `InputSourceKind` variant plus a matching `Source`/`DlqPublisher` pair — `main.rs`'s wiring does not need to change.
+`INPUT_SOURCE` (env var) selects which source `build_source()` constructs. Only `mqtt` is implemented; adding a future transport (e.g. Kafka) means adding an `InputSourceKind` variant plus a matching `Source`/`DlqPublisher` pair — `main.rs`'s wiring does not need to change, including topic/route configuration (see below).
 
-The service reads all environment variables whose names start with `MQTT_TOPIC_`. These stay unconditional regardless of `INPUT_SOURCE` because topic-based routing/schema selection (the `Router`) is transport-agnostic:
+Topic/route definitions are populated by whichever input source is active, the same way `MqttSourceConfig`/`InfluxSinkConfig` are conditionally built. Today only `mqtt` is implemented, so `Config::from_env` scans `MQTT_TOPIC_*` environment variables inside the `InputSourceKind::Mqtt` arm and stores them in `Config::topic_routes`, keyed by message-type suffix rather than the raw env var name:
 
-- `MQTT_TOPIC_SENSOR` maps to `MessageType::Sensor`.
-- `MQTT_TOPIC_STATUS` maps to `MessageType::Status`.
-- `MQTT_TOPIC_DLQ` is used only for DLQ publishing.
+- `MQTT_TOPIC_SENSOR` is stored under key `SENSOR`, which `build_router` maps to `MessageType::Sensor`.
+- `MQTT_TOPIC_STATUS` is stored under key `STATUS`, which `build_router` maps to `MessageType::Status`.
+- `MQTT_TOPIC_DLQ` is stored under key `DLQ`, used only for DLQ publishing.
 
-The MQTT source subscribes to every configured `MQTT_TOPIC_*` value except keys ending in `DLQ`. The router only creates routes for `SENSOR` and `STATUS`. Avoid unknown non-DLQ `MQTT_TOPIC_*` keys unless you intentionally want to subscribe to topics that will not match a route.
+`Router`/`Route`/`TopicPattern` only ever see the generic `topic_routes` map — they have no knowledge of environment variable naming or which source populated it. A future source (e.g. Kafka) would add its own conditional arm producing the same `topic_routes` shape from its own env var convention (e.g. `KAFKA_TOPIC_*`), with zero changes needed to `Router`, `build_router`, or any pipeline stage.
+
+The MQTT source subscribes to every configured route except the `DLQ` key. The router only creates routes for `SENSOR` and `STATUS`. Avoid unknown non-DLQ `MQTT_TOPIC_*` keys unless you intentionally want to subscribe to topics that will not match a route.
 
 Incoming messages are dispatched round-robin into per-worker bounded channels via `IngestDispatcher`. Worker count is based on available CPU parallelism and clamped to 2 through 8.
 

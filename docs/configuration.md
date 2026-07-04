@@ -12,7 +12,7 @@ The service ingests messages through a swappable `Source` abstraction (see `docs
 
 ## MQTT
 
-The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT_ID` connection variables below are **only required when `INPUT_SOURCE=mqtt`**. The `MQTT_TOPIC_*` variables stay unconditional regardless of `INPUT_SOURCE`, because topic-based routing/schema selection (the `Router`) is transport-agnostic — a future Kafka source would reuse the same topic concept.
+The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT_ID` / `MQTT_TOPIC_*` variables below are **only required when `INPUT_SOURCE=mqtt`** — `Config::from_env` parses all of them, including topic/route definitions, inside the `InputSourceKind::Mqtt` arm. `MQTT_TOPIC_*` values are stored generically as `Config::topic_routes` (keyed by suffix, e.g. `SENSOR`/`STATUS`/`DLQ`), which the transport-agnostic `Router` consumes without any knowledge of MQTT or environment variable naming — a future Kafka source would populate the same `topic_routes` map from its own `KAFKA_TOPIC_*` convention.
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
