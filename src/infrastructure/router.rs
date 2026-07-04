@@ -6,12 +6,12 @@ use crate::infrastructure::schema::JsonSchema;
 use crate::model::messages::message::{HandledMessage, MessageType};
 use crate::model::messages::sensor::SensorMessage;
 use crate::model::messages::status::StatusMessage;
-use crate::model::topic::MqttTopicPattern;
+use crate::model::topic::TopicPattern;
 
 /// A single route combining pattern matching, schema validation, and expected message type.
 pub struct Route {
     pub message_type: MessageType,
-    pattern: MqttTopicPattern,
+    pattern: TopicPattern,
     schema: JsonSchema,
 }
 
@@ -19,7 +19,7 @@ impl Route {
     pub fn new(message_type: MessageType, schema_str: &str, topic_pattern: &str) -> Result<Self> {
         Ok(Self {
             message_type,
-            pattern: MqttTopicPattern::new(topic_pattern)?,
+            pattern: TopicPattern::new(topic_pattern)?,
             schema: JsonSchema::new(schema_str)?,
         })
     }

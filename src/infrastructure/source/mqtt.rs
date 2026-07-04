@@ -138,7 +138,7 @@ pub async fn build(
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
-    for (_, topic) in cfg.mqtt_topics.iter().filter(|(k, _)| !k.ends_with("DLQ")) {
+    for (_, topic) in cfg.topic_routes.iter().filter(|(k, _)| !k.ends_with("DLQ")) {
         client.subscribe(topic, QoS::AtLeastOnce).await?;
         info!(topic = %topic, "subscribed to MQTT topic");
     }

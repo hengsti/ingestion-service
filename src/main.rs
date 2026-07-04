@@ -98,11 +98,10 @@ async fn main() -> Result<()> {
 
     // DLQ topic.
     let dlq_topic = cfg
-        .mqtt_topics
-        .iter()
-        .find(|(k, _)| k.ends_with("DLQ"))
-        .map(|(_, v)| v.clone())
-        .context("MQTT_TOPIC_DLQ not configured")?;
+        .topic_routes
+        .get("DLQ")
+        .cloned()
+        .context("DLQ route not configured (e.g. MQTT_TOPIC_DLQ)")?;
 
     // WAL, configured sink, and forwarder.
     let (wal, wal_sub) = Wal::open(WalOptions {
@@ -284,22 +283,13 @@ async fn main() -> Result<()> {
 fn build_router(cfg: &Config) -> Result<Router> {
     let mut router = Router::new().strict(true);
 
-    for (key, topic) in cfg
-        .mqtt_topics
-        .iter()
-        .filter(|(k, _)| k.starts_with("MQTT_TOPIC_"))
-    {
-        let message_type_name = key
-            .strip_prefix("MQTT_TOPIC_")
-            .expect("prefix already filtered")
-            .to_uppercase();
-
+    for (message_type_name, topic) in cfg.topic_routes.iter() {
         let message_type = match message_type_name.as_str() {
             "SENSOR" => MessageType::Sensor,
             "STATUS" => MessageType::Status,
             "DLQ" => continue,
             other => {
-                warn!(config_key = %key, message_type = %other, "unknown MQTT topic config key; skipping");
+                warn!(config_key = %message_type_name, message_type = %other, "unknown topic config key; skipping");
                 continue;
             }
         };
@@ -313,10 +303,10 @@ fn build_router(cfg: &Config) -> Result<Router> {
         router = router.add_route(Route::new(message_type, schema, topic)?);
 
         info!(
-            config_key = %key,
+            config_key = %message_type_name,
             message_type = %message_type_name,
             topic = %topic,
-            "configured route for MQTT topic"
+            "configured route"
         );
     }
 

@@ -94,8 +94,10 @@ pub struct Config {
     pub input_source: InputSourceKind,
     /// Present when `input_source` is [`InputSourceKind::Mqtt`].
     pub mqtt: Option<MqttSourceConfig>,
-    /// Route definitions loaded from `MQTT_TOPIC_*` environment variables.
-    pub mqtt_topics: HashMap<String, String>,
+    /// Route definitions (message-type suffix → topic/route string), populated
+    /// by whichever input source is active. Today only `Mqtt` populates this,
+    /// scanning `MQTT_TOPIC_*` env vars — see `InputSourceKind::Mqtt` below.
+    pub topic_routes: HashMap<String, String>,
     pub output_sink: OutputSinkKind,
     /// Present when `output_sink` is [`OutputSinkKind::Influx`].
     pub influx: Option<InfluxSinkConfig>,
@@ -117,7 +119,7 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("input_source", &self.input_source)
             .field("mqtt", &self.mqtt)
-            .field("mqtt_topics", &self.mqtt_topics)
+            .field("topic_routes", &self.topic_routes)
             .field("output_sink", &self.output_sink)
             .field("influx", &self.influx)
             .field("batch_size", &self.batch_size)
@@ -143,7 +145,7 @@ impl Config {
         let input_source =
             InputSourceKind::parse(&env_var("INPUT_SOURCE").context("INPUT_SOURCE must be set")?)?;
 
-        let mqtt = match input_source {
+        let (mqtt, topic_routes) = match input_source {
             InputSourceKind::Mqtt => {
                 let host =
                     env_var("MQTT_HOST").context("MQTT_HOST is required when INPUT_SOURCE=mqtt")?;
@@ -159,24 +161,23 @@ impl Config {
                     .context("MQTT_CLIENT_ID must be set when INPUT_SOURCE=mqtt")?;
                 client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
 
-                Some(MqttSourceConfig {
-                    host,
-                    port,
-                    username,
-                    password,
-                    client_id,
-                })
+                let topic_routes = strip_prefixed(env::vars(), "MQTT_TOPIC_");
+                if topic_routes.is_empty() {
+                    bail!("At least one MQTT_TOPIC_<NAME> environment variable must be set");
+                }
+
+                (
+                    Some(MqttSourceConfig {
+                        host,
+                        port,
+                        username,
+                        password,
+                        client_id,
+                    }),
+                    topic_routes,
+                )
             }
         };
-
-        let mut mqtt_topics = HashMap::new();
-        for (k, v) in env::vars().filter(|(k, _)| k.starts_with("MQTT_TOPIC_")) {
-            mqtt_topics.insert(k, v);
-        }
-
-        if mqtt_topics.is_empty() {
-            bail!("At least one MQTT_TOPIC_<NAME> environment variable must be set");
-        }
 
         let output_sink =
             OutputSinkKind::parse(&env_var("OUTPUT_SINK").context("OUTPUT_SINK must be set")?)?;
@@ -256,7 +257,7 @@ impl Config {
         Ok(Self {
             input_source,
             mqtt,
-            mqtt_topics,
+            topic_routes,
             output_sink,
             influx,
             batch_size,
@@ -279,6 +280,14 @@ fn env_var(k: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn strip_prefixed(
+    vars: impl Iterator<Item = (String, String)>,
+    prefix: &str,
+) -> HashMap<String, String> {
+    vars.filter_map(|(k, v)| k.strip_prefix(prefix).map(|suffix| (suffix.to_string(), v)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -337,5 +346,33 @@ mod tests {
     #[test]
     fn output_source_kind_parse_rejects_empty_value() {
         assert!(OutputSinkKind::parse("").is_err());
+    }
+
+    #[test]
+    fn strip_prefixed_extracts_suffix_and_ignores_other_keys() {
+        let vars = vec![
+            (
+                "MQTT_TOPIC_SENSOR".to_string(),
+                "smarthome/+/sensor".to_string(),
+            ),
+            (
+                "MQTT_TOPIC_DLQ".to_string(),
+                "smarthome/_dlq/ingest".to_string(),
+            ),
+            ("MQTT_HOST".to_string(), "mqtt.example.com".to_string()),
+        ];
+
+        let result = strip_prefixed(vars.into_iter(), "MQTT_TOPIC_");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get("SENSOR").map(String::as_str),
+            Some("smarthome/+/sensor")
+        );
+        assert_eq!(
+            result.get("DLQ").map(String::as_str),
+            Some("smarthome/_dlq/ingest")
+        );
+        assert!(!result.contains_key("HOST"));
     }
 }
