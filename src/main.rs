@@ -9,13 +9,11 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::prometheus::MetricsServer;
 use infrastructure::router::{Route, Router};
-use infrastructure::sink::influx::InfluxSink;
-use infrastructure::sink::Sink;
+use infrastructure::source::{build_source, IngestDispatcher, IngestJob};
 use infrastructure::wal::forwarder::run_forwarder;
 use infrastructure::wal::types::WalOptions;
 use infrastructure::wal::wal::Wal;
@@ -29,18 +27,13 @@ use pipeline::{
         validate_business::ValidateBusinessStage, validate_raw::ValidateRawStage,
     },
 };
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinSet,
 };
 use tracing::{error, info, warn};
 
-#[derive(Debug)]
-struct IngestJob {
-    topic: String,
-    payload: Bytes,
-}
+use crate::infrastructure::sink::build_output;
 
 fn worker_count() -> usize {
     std::thread::available_parallelism()
@@ -78,18 +71,16 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     info!(?cfg, "starting ingestion service");
 
-    // ------------------------------------------------------------
-    // Cache / HTTP state
-    // ------------------------------------------------------------
+    // Cache / HTTP state.
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
-    let mqtt_ready = Arc::new(AtomicBool::new(false));
+    let source_ready = Arc::new(AtomicBool::new(false));
 
     let http_state = app_state.clone();
     let cache_bind = cfg.cache_bind.clone();
-    let mqtt_ready_http = mqtt_ready.clone();
+    let source_ready_http = source_ready.clone();
 
     let mut _http_task = tokio::spawn(async move {
-        let app = http::router(http_state, mqtt_ready_http);
+        let app = http::router(http_state, source_ready_http);
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
@@ -99,46 +90,20 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ------------------------------------------------------------
-    // Metrics server
-    // ------------------------------------------------------------
+    // Metrics server.
     let _metrics_server = MetricsServer::start(&cfg.metrics_bind).await?;
 
-    // ------------------------------------------------------------
-    // Router / schema routes
-    // ------------------------------------------------------------
+    // Router / schema routes.
     let router = Arc::new(build_router(&cfg)?);
 
-    // ------------------------------------------------------------
-    // DLQ topic
-    // ------------------------------------------------------------
+    // DLQ topic.
     let dlq_topic = cfg
-        .mqtt_topics
-        .iter()
-        .find(|(k, _)| k.ends_with("DLQ"))
-        .map(|(_, v)| v.clone())
-        .context("MQTT_TOPIC_DLQ not configured")?;
+        .topic_routes
+        .get("DLQ")
+        .cloned()
+        .context("DLQ route not configured (e.g. MQTT_TOPIC_DLQ)")?;
 
-    // ------------------------------------------------------------
-    // MQTT
-    // ------------------------------------------------------------
-    let mut mqttoptions = MqttOptions::new(&cfg.mqtt_client_id, &cfg.mqtt_host, cfg.mqtt_port);
-    mqttoptions.set_keep_alive(std::time::Duration::from_secs(30));
-
-    if let (Some(username), Some(password)) = (&cfg.mqtt_username, &cfg.mqtt_password) {
-        mqttoptions.set_credentials(username, password);
-    }
-
-    let (mqtt_client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-
-    for (_, topic) in cfg.mqtt_topics.iter().filter(|(k, _)| !k.ends_with("DLQ")) {
-        mqtt_client.subscribe(topic, QoS::AtLeastOnce).await?;
-        info!(topic = %topic, "subscribed to MQTT topic");
-    }
-
-    // ------------------------------------------------------------
-    // WAL + InfluxDB sink + forwarder
-    // ------------------------------------------------------------
+    // WAL, configured sink, and forwarder.
     let (wal, wal_sub) = Wal::open(WalOptions {
         dir: cfg.wal_dir.clone(),
         segment_bytes: cfg.wal_segment_bytes,
@@ -147,12 +112,7 @@ async fn main() -> Result<()> {
     .await?;
     let wal = Arc::new(wal);
 
-    let sink: Arc<dyn Sink> = Arc::new(InfluxSink::new(
-        &cfg.influx_url,
-        &cfg.influx_org,
-        &cfg.influx_bucket,
-        cfg.influx_token.clone(),
-    )?);
+    let (encoder, sink) = build_output(&cfg)?;
 
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
@@ -163,9 +123,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ------------------------------------------------------------
-    // Pipeline
-    // ------------------------------------------------------------
+    // Input source.
+    let (source, dlq_publisher) = build_source(&cfg, source_ready.clone()).await?;
+
+    // Pipeline.
     let pipeline = Arc::new(
         PipelineRunner::new()
             .add_stage(DecodeStage::new())
@@ -176,16 +137,14 @@ async fn main() -> Result<()> {
             .add_stage(TransformStage::new(router.clone()))
             .add_stage(ValidateBusinessStage::new()?)
             .add_stage(CacheUpdateStage::new(app_state.clone()))
-            .add_stage(PersistStage::new(wal.clone()))
+            .add_stage(PersistStage::new(wal.clone(), encoder))
             .add_stage(ObserveStage::new())
-            .with_failure_stage(DlqPublishStage::new(mqtt_client.clone(), dlq_topic.clone())),
+            .with_failure_stage(DlqPublishStage::new(dlq_publisher, dlq_topic.clone())),
     );
 
     info!("pipeline initialized");
 
-    // ------------------------------------------------------------
-    // Worker queue — one channel per worker, round-robin dispatch
-    // ------------------------------------------------------------
+    // Worker queue: one channel per worker, round-robin dispatch.
     let worker_total = worker_count();
     let per_worker_cap = cfg.input_queue_capacity / worker_total;
     info!(workers = worker_total, "starting pipeline workers");
@@ -223,63 +182,65 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ------------------------------------------------------------
-    // Main consume loop
-    // ------------------------------------------------------------
-    let mut dispatch_idx: usize = 0;
-    loop {
-        tokio::select! {
-            res = tokio::signal::ctrl_c() => {
-                match res {
-                    Ok(()) => info!("shutdown signal received"),
-                    Err(err) => error!(error = %err, "failed to listen for ctrl-c"),
-                }
-                let _ = shutdown_tx.send(true);
-                break;
+    // Source task dispatches into the worker queue via `IngestDispatcher`.
+    let dispatcher = IngestDispatcher::new(job_txs.clone());
+    let mut source_task = tokio::spawn(source.run(dispatcher, shutdown_rx.clone()));
+
+    // Wait for ctrl-c, the HTTP task, or the input source, then signal shutdown.
+    let mut fatal_source_err: Option<anyhow::Error> = None;
+    let mut source_task_handled = false;
+
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => {
+            match res {
+                Ok(()) => info!("shutdown signal received"),
+                Err(err) => error!(error = %err, "failed to listen for ctrl-c"),
             }
+            let _ = shutdown_tx.send(true);
+        }
 
-            res = &mut _http_task => {
-                match res {
-                    Ok(()) => error!("HTTP server stopped unexpectedly"),
-                    Err(err) => error!(error = %err, "HTTP server task panicked"),
-                }
-                let _ = shutdown_tx.send(true);
-                break;
+        res = &mut _http_task => {
+            match res {
+                Ok(()) => error!("HTTP server stopped unexpectedly"),
+                Err(err) => error!(error = %err, "HTTP server task panicked"),
             }
+            let _ = shutdown_tx.send(true);
+        }
 
-            event = eventloop.poll() => {
-                let event = match event {
-                    Ok(ev) => ev,
-                    Err(err) => {
-                        mqtt_ready.store(false, Ordering::Relaxed);
-                        return Err(err).context("MQTT poll failed");
-                    }
-                };
+        res = &mut source_task => {
+            source_task_handled = true;
+            let _ = shutdown_tx.send(true);
 
-                match &event {
-                    Event::Incoming(Incoming::ConnAck(_)) => {
-                        mqtt_ready.store(true, Ordering::Relaxed);
-                        info!("MQTT connected");
-                    }
-                    Event::Incoming(Incoming::Disconnect) => {
-                        mqtt_ready.store(false, Ordering::Relaxed);
-                    }
-                    _ => {}
+            match res {
+                Ok(Ok(())) => info!("input source stopped"),
+                Ok(Err(err)) => {
+                    source_ready.store(false, Ordering::Relaxed);
+                    error!(error = %err, "input source failed");
+                    fatal_source_err = Some(err);
                 }
-
-                if let Event::Incoming(Incoming::Publish(publish)) = event {
-                    let job = IngestJob {
-                        topic: publish.topic,
-                        payload: publish.payload,
-                    };
-
-                    let idx = dispatch_idx % worker_total;
-                    dispatch_idx = dispatch_idx.wrapping_add(1);
-                    if let Err(err) = job_txs[idx].try_send(job) {
-                        metrics::counter!("ingest_event_queue_full_total").increment(1);
-                        warn!(error = %err, "event queue full; dropping incoming MQTT message before pipeline");
-                    }
+                Err(join_err) => {
+                    source_ready.store(false, Ordering::Relaxed);
+                    error!(error = %join_err, "input source task panicked");
+                    fatal_source_err = Some(join_err.into());
                 }
+            }
+        }
+    }
+
+    // Join the source task if shutdown was triggered by ctrl-c or the HTTP
+    // task, so its senders drop before the worker channels close below.
+    if !source_task_handled {
+        match source_task.await {
+            Ok(Ok(())) => info!("input source stopped"),
+            Ok(Err(err)) => {
+                source_ready.store(false, Ordering::Relaxed);
+                error!(error = %err, "input source failed");
+                fatal_source_err = Some(err);
+            }
+            Err(join_err) => {
+                source_ready.store(false, Ordering::Relaxed);
+                error!(error = %join_err, "input source task panicked");
+                fatal_source_err = Some(join_err.into());
             }
         }
     }
@@ -294,11 +255,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Drain the WAL forwarder before exiting. The writer task only stops once
-    // every `Arc<Wal>` sender is released: the pipeline holds one via the
-    // PersistStage and `wal` holds the other. Dropping both closes the writer's
-    // channel, so it flushes its final batch and the subscription terminates,
-    // letting the forwarder persist and commit any buffered records.
+    // Drop both `Arc<Wal>` handles (pipeline's and main's) so the writer
+    // closes its channel, flushes, and lets the forwarder drain.
     drop(pipeline);
     drop(wal);
 
@@ -313,28 +271,25 @@ async fn main() -> Result<()> {
     }
 
     info!("ingestion service stopped");
-    Ok(())
+
+    // A fatal input-source error still exits the process non-zero, but only
+    // after workers and the WAL have drained cleanly above.
+    match fatal_source_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn build_router(cfg: &Config) -> Result<Router> {
     let mut router = Router::new().strict(true);
 
-    for (key, topic) in cfg
-        .mqtt_topics
-        .iter()
-        .filter(|(k, _)| k.starts_with("MQTT_TOPIC_"))
-    {
-        let message_type_name = key
-            .strip_prefix("MQTT_TOPIC_")
-            .expect("prefix already filtered")
-            .to_uppercase();
-
+    for (message_type_name, topic) in cfg.topic_routes.iter() {
         let message_type = match message_type_name.as_str() {
             "SENSOR" => MessageType::Sensor,
             "STATUS" => MessageType::Status,
             "DLQ" => continue,
             other => {
-                warn!(config_key = %key, message_type = %other, "unknown MQTT topic config key; skipping");
+                warn!(config_key = %message_type_name, message_type = %other, "unknown topic config key; skipping");
                 continue;
             }
         };
@@ -348,10 +303,10 @@ fn build_router(cfg: &Config) -> Result<Router> {
         router = router.add_route(Route::new(message_type, schema, topic)?);
 
         info!(
-            config_key = %key,
+            config_key = %message_type_name,
             message_type = %message_type_name,
             topic = %topic,
-            "configured route for MQTT topic"
+            "configured route"
         );
     }
 

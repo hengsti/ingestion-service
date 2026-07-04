@@ -4,7 +4,7 @@ use serde_json::Value;
 
 const BASE_SCHEMA: &str = include_str!("../../schema/base.schema.json");
 
-/// Shared JSON-Schema wrapper
+/// Compiled JSON Schema validator with the shared base schema preloaded.
 pub struct JsonSchema {
     schema: JsonSchemaValidator,
 }
@@ -34,7 +34,7 @@ impl JsonSchema {
         }
 
         let mut msgs = Vec::new();
-        // Collect up to 10 errors
+        // Cap the error list so DLQ reasons stay readable.
         for err in self.schema.iter_errors(instance).take(10) {
             msgs.push(format!("{}", err));
         }

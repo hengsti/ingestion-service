@@ -33,7 +33,7 @@ pub struct CacheState {
 
 impl CacheState {
     pub fn new(ttl_ms: u64, buffer_size: usize) -> Self {
-        // Buffer for buffer_size events; if the buffer is full, old events will be dropped.
+        // Lagging subscribers may miss older updates once the broadcast buffer wraps.
         let (event_tx, _) = broadcast::channel::<CacheEvent>(buffer_size);
 
         Self {
@@ -159,7 +159,6 @@ mod tests {
 
         cache.update_sensor(&sensor_msg("dev-a", None));
         cache.update_sensor(&sensor_msg("dev-b", None));
-        // Third device — one of the first two must be evicted.
         cache.update_sensor(&sensor_msg("dev-c", None));
 
         let all = cache.snapshot_all_sensors();
@@ -175,7 +174,6 @@ mod tests {
         // Seed two entries with known last_seen_ms values by manipulating the map directly.
         let cache = CacheState::new(60_000, 2);
 
-        // Insert dev-old with a deliberately old timestamp.
         {
             let mut map = cache.sensors.write().unwrap();
             map.insert(
@@ -194,7 +192,6 @@ mod tests {
             );
         }
 
-        // Adding a third device must evict dev-old (smallest last_seen_ms).
         cache.update_sensor(&sensor_msg("dev-c", None));
 
         assert!(
@@ -217,7 +214,6 @@ mod tests {
 
         cache.update_sensor(&sensor_msg("dev-a", None));
         cache.update_sensor(&sensor_msg("dev-b", None));
-        // Update an already-present device — must not evict anything.
         cache.update_sensor(&sensor_msg("dev-a", None));
 
         let all = cache.snapshot_all_sensors();

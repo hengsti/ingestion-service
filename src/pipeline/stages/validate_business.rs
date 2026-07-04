@@ -119,8 +119,6 @@ mod tests {
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-
     fn stage() -> ValidateBusinessStage {
         ValidateBusinessStage::new().unwrap()
     }
@@ -170,14 +168,10 @@ mod tests {
         ctx
     }
 
-    // ── validate_handled_message: sensor success ──────────────────────────────
-
     #[test]
     fn validate_handled_message_accepts_valid_sensor() {
         assert!(stage().validate_handled_message(&valid_sensor()).is_ok());
     }
-
-    // ── validate_handled_message: sensor violations ───────────────────────────
 
     #[test]
     fn validate_handled_message_rejects_sensor_with_empty_device_id() {
@@ -258,8 +252,6 @@ mod tests {
             .is_err());
     }
 
-    // ── validate_handled_message: sensor boundaries (must pass) ──────────────
-
     #[test]
     fn validate_handled_message_accepts_sensor_with_rel_hum_at_100() {
         let HandledMessage::Sensor(mut msg) = valid_sensor() else {
@@ -293,14 +285,10 @@ mod tests {
             .is_ok());
     }
 
-    // ── validate_handled_message: status success ──────────────────────────────
-
     #[test]
     fn validate_handled_message_accepts_valid_status() {
         assert!(stage().validate_handled_message(&valid_status()).is_ok());
     }
-
-    // ── validate_handled_message: status violations ───────────────────────────
 
     #[test]
     fn validate_handled_message_rejects_status_with_empty_device_id() {
@@ -345,8 +333,6 @@ mod tests {
             .validate_handled_message(&HandledMessage::Status(msg))
             .is_err());
     }
-
-    // ── run(): stage-level behavior ───────────────────────────────────────────
 
     #[tokio::test]
     async fn run_on_valid_sensor_returns_continue() {

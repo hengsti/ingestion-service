@@ -109,8 +109,6 @@ mod tests {
     use crate::pipeline::stage::StageFlow;
     use serde_json::json;
 
-    // --- decode_payload: success paths ---
-
     #[test]
     fn decode_payload_returns_string_and_json_for_valid_payload() {
         let raw = br#"{"device_id":"esp32-1","temp_c":22.4}"#;
@@ -164,8 +162,6 @@ mod tests {
             Err(err) => panic!("expected Ok, got Err: {err:?}"),
         }
     }
-
-    // --- decode_payload: error paths ---
 
     #[test]
     fn decode_payload_returns_utf8_error_for_non_utf8_payload() {
@@ -234,8 +230,6 @@ mod tests {
         }
     }
 
-    // --- decode_payload: size guard ---
-
     #[test]
     fn decode_payload_rejects_oversized_payload_with_actual_size() {
         let size = MAX_PAYLOAD_BYTES + 1;
@@ -254,8 +248,6 @@ mod tests {
 
         assert!(matches!(result, Err(DecodeError::Json { .. })));
     }
-
-    // --- run(): context state after each path ---
 
     #[tokio::test]
     async fn run_on_valid_payload_sets_context_and_returns_continue() {
@@ -306,7 +298,7 @@ mod tests {
         assert!(matches!(result, Ok(StageFlow::Stop)));
         assert!(ctx.should_publish_dlq());
         assert_eq!(ctx.dlq_reason().unwrap(), "payload not valid JSON");
-        // utf8 string must be set even on json failure (used by DLQ stage)
+        // Keep the UTF-8 payload for the DLQ stage even when JSON parsing fails.
         assert_eq!(ctx.payload_utf8().unwrap(), r#"{"device_id":"esp32-1""#);
     }
 }

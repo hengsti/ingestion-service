@@ -1,9 +1,16 @@
 pub mod influx;
+pub mod point;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use anyhow::{Context, Result};
+
+use crate::config::{Config, OutputSinkKind};
+use crate::infrastructure::sink::influx::InfluxSink;
 use crate::infrastructure::wal::types::WalEvent;
+use crate::model::messages::message::HandledMessage;
 
 /// Classifies a sink write failure so the forwarder can decide whether to hold
 /// the batch (and the WAL cursor) or drop it.
@@ -50,4 +57,37 @@ pub trait Sink: Send + Sync {
         &'a self,
         batch: &'a [WalEvent],
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
+}
+
+/// Turns a canonical message into the wire-format payload a `WalEvent` carries.
+/// Implementations must not block or perform I/O — this runs on the pipeline's
+/// hot path, once per message, before the WAL append.
+pub trait Encoder: Send + Sync {
+    /// Appends the encoded payload for `message` to `out`. `out` is reused
+    /// across calls by `PersistStage` to avoid a per-message allocation
+    /// (mirrors `Point::write_line_protocol`'s existing convention).
+    fn encode(&self, message: &HandledMessage, out: &mut String);
+}
+
+/// Builds the configured output sink and its matching encoder.
+///
+/// # Errors
+/// Returns an error if `Config::output_sink` names an unsupported sink, or if
+/// the underlying client cannot be constructed.
+pub fn build_output(cfg: &Config) -> Result<(Arc<dyn Encoder>, Arc<dyn Sink>)> {
+    match cfg.output_sink {
+        OutputSinkKind::Influx => {
+            let influx_cfg = cfg
+                .influx
+                .as_ref()
+                .context("influx config missing for OutputSinkKind::Influx")?;
+            let sink: Arc<dyn Sink> = Arc::new(InfluxSink::new(
+                &influx_cfg.url,
+                &influx_cfg.org,
+                &influx_cfg.bucket,
+                influx_cfg.token.clone(),
+            )?);
+            Ok((Arc::new(influx::InfluxEncoder), sink))
+        }
+    }
 }

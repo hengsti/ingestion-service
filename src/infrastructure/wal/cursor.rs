@@ -60,14 +60,11 @@ mod tests {
         let dir = tempdir()?;
         let cursor_path = dir.path().join("commit.cursor");
 
-        // Test non-existent cursor file
         assert!(read_cursor(dir.path())?.is_none());
 
-        // Test empty cursor file
         File::create(&cursor_path)?;
         assert!(read_cursor(dir.path())?.is_none());
 
-        // Test valid cursor file
         let offset = WalOffset {
             segment_id: 42,
             byte_offset: 100,
@@ -108,10 +105,8 @@ mod tests {
         let mut file = File::create(&cursor_path_tmp)?;
         file.write_all(&offset1.to_bytes())?;
 
-        // Now write the second offset using the write_cursor function
         write_cursor(dir.path(), offset2)?;
 
-        // The final cursor should be offset2, not offset1
         assert_eq!(read_cursor(dir.path())?, Some(offset2));
         Ok(())
     }

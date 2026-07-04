@@ -23,7 +23,8 @@ use tokio_stream::{
 use super::state::{CacheEvent, CacheState};
 use crate::model::messages::sensor::SensorData;
 
-pub fn router(state: CacheState, mqtt_ready: Arc<AtomicBool>) -> Router {
+/// Builds the cache HTTP API router.
+pub fn router(state: CacheState, source_ready: Arc<AtomicBool>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -31,15 +32,15 @@ pub fn router(state: CacheState, mqtt_ready: Arc<AtomicBool>) -> Router {
         .route("/v1/state/{device_id}", get(get_state))
         .route("/v1/stream", get(stream_updates))
         .with_state(state)
-        .layer(Extension(mqtt_ready))
+        .layer(Extension(source_ready))
 }
 
 async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-async fn readyz(Extension(mqtt_ready): Extension<Arc<AtomicBool>>) -> StatusCode {
-    if mqtt_ready.load(Ordering::Relaxed) {
+async fn readyz(Extension(source_ready): Extension<Arc<AtomicBool>>) -> StatusCode {
+    if source_ready.load(Ordering::Relaxed) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -130,7 +131,6 @@ async fn stream_updates(
                 last_seen_ms,
                 value,
             }) => {
-                // Event-type for SSE-Clients
                 let payload = SseSensorEvent {
                     kind: "sensor",
                     device_id,
@@ -138,7 +138,6 @@ async fn stream_updates(
                     value,
                 };
 
-                // JSON payload (HomeKit-Bridge kann direkt konsumieren)
                 let json = match serde_json::to_string(&payload) {
                     Ok(s) => s,
                     Err(_) => return None,
@@ -146,9 +145,8 @@ async fn stream_updates(
 
                 Some(Ok(Event::default().event("sensor").data(json)))
             }
-            // Receiver war zu langsam -> Events wurden gedropped
             Err(BroadcastStreamRecvError::Lagged(_)) => {
-                // Optional: Client kann dann einmal /v1/state pollen
+                // Lagging subscribers can recover by polling `/v1/state`.
                 Some(Ok(Event::default()
                     .event("lagged")
                     .data("{\"hint\":\"poll /v1/state\"}")))

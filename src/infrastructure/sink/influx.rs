@@ -9,11 +9,27 @@ use reqwest::{Client, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::infrastructure::{
-    sink::{Sink, SinkError},
+    sink::{point::Point, Encoder, Sink, SinkError},
     wal::types::WalEvent,
 };
+use crate::model::messages::{
+    message::HandledMessage, sensor::SensorMessage, status::StatusMessage,
+};
 
-/// InfluxDB v2 sink: converts WAL events to line protocol and writes them with a bounded retry loop.
+/// Renders canonical messages as InfluxDB line protocol, pairing 1:1 with
+/// [`InfluxSink`] (both are constructed together for a given output sink).
+pub struct InfluxEncoder;
+
+impl Encoder for InfluxEncoder {
+    fn encode(&self, message: &HandledMessage, out: &mut String) {
+        match message {
+            HandledMessage::Sensor(s) => sensor_to_point(s).write_line_protocol(out),
+            HandledMessage::Status(s) => status_to_point(s).write_line_protocol(out),
+        }
+    }
+}
+
+/// Writes WAL payload batches to the InfluxDB v2 write API with bounded retries.
 pub struct InfluxSink {
     client: Client,
     write_url: String,
@@ -35,7 +51,6 @@ impl InfluxSink {
             .build()
             .context("Failed to build reqwest client")?;
 
-        // InfluxDB v2 write endpoint
         let write_url = format!(
             "{}/api/v2/write?org={}&bucket={}&precision=ms",
             url.trim_end_matches('/'),
@@ -51,14 +66,14 @@ impl InfluxSink {
     }
 }
 
-/// Converts a batch of WAL events into a newline-delimited InfluxDB line-protocol body.
+/// Joins WAL payloads into a newline-delimited Influx write body.
 fn build_body(batch: &[WalEvent]) -> String {
     let mut body = String::new();
     for event in batch {
         if !body.is_empty() {
             body.push('\n');
         }
-        body.push_str(&event.line_protocol);
+        body.push_str(&event.payload);
     }
     body
 }
@@ -148,6 +163,51 @@ fn is_permanent_status(status: StatusCode) -> bool {
         && status != StatusCode::TOO_MANY_REQUESTS
 }
 
+pub fn sensor_to_point(msg: &SensorMessage) -> Point {
+    let mut b = Point::build("bme680")
+        .tag("device_id", &msg.device_id)
+        .tag("room", &msg.room)
+        .tag("device_class", &msg.device_class)
+        .tag("fw_version", &msg.fw_version)
+        .field_f64("temp_c", msg.data.temp_c)
+        .field_f64("rel_hum_perc", msg.data.rel_hum_perc)
+        .field_f64("pressure_hpa", msg.data.pressure_hpa)
+        .field_f64("gas_ohm", msg.data.gas_ohm)
+        .field_f64("iaq_score", msg.data.iaq_score)
+        .field_str("iaq_text", &msg.data.iaq_text)
+        .field_f64("dew_point_c", msg.data.dew_point_c)
+        .field_f64("heat_index_c", msg.data.heat_index_c)
+        .field_f64("altitude_m", msg.data.altitude_m)
+        .field_bool("time_valid", msg.time_valid);
+
+    // Use the device timestamp only when it is marked valid and non-zero.
+    if msg.time_valid && msg.time_ms > 0 {
+        b = b.timestamp_ms(msg.time_ms);
+    }
+
+    b.build()
+}
+
+pub fn status_to_point(msg: &StatusMessage) -> Point {
+    let mut b = Point::build("device_status")
+        .tag("device_id", &msg.device_id)
+        .tag("device_class", &msg.device_class)
+        .tag("fw_version", &msg.fw_version)
+        .tag("ip", &msg.ip)
+        .field_str("time_iso", &msg.time_iso)
+        .field_bool("time_valid", msg.time_valid)
+        .field_i64("uptime", msg.uptime)
+        .field_i64("free_mem", msg.free_mem)
+        .field_str("ssid", &msg.ssid)
+        .field_i64("rssi", msg.rssi);
+
+    if msg.time_valid && msg.time_ms > 0 {
+        b = b.timestamp_ms(msg.time_ms);
+    }
+
+    b.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,7 +216,7 @@ mod tests {
         WalEvent {
             topic: "smarthome/dev-1/sensor".to_string(),
             ts_ms: 1_700_000_000_000,
-            line_protocol: "bme680,device_id=dev-1 temp_c=21.5 1700000000000".to_string(),
+            payload: "bme680,device_id=dev-1 temp_c=21.5 1700000000000".to_string(),
         }
     }
 
@@ -164,7 +224,7 @@ mod tests {
         WalEvent {
             topic: "smarthome/dev-1/status".to_string(),
             ts_ms: 1_700_000_000_000,
-            line_protocol: "device_status,device_id=dev-1 rssi=-55i 1700000000000".to_string(),
+            payload: "device_status,device_id=dev-1 rssi=-55i 1700000000000".to_string(),
         }
     }
 
@@ -174,7 +234,7 @@ mod tests {
 
         let body = build_body(&batch);
 
-        let expected = format!("{}\n{}", batch[0].line_protocol, batch[1].line_protocol);
+        let expected = format!("{}\n{}", batch[0].payload, batch[1].payload);
 
         assert_eq!(body, expected);
         assert_eq!(body.lines().count(), 2);

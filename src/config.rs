@@ -5,41 +5,110 @@ use std::env;
 use std::fmt;
 use std::path::PathBuf;
 
+/// Selects which input transport the service consumes from.
+///
+/// Only `Mqtt` is implemented today. Adding a variant here (e.g. `Kafka`) will
+/// force a compile error at every `match` on this type until it's handled —
+/// this is intentional, acting as a guardrail for future transports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSourceKind {
+    Mqtt,
+}
+
+impl InputSourceKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "mqtt" => Ok(Self::Mqtt),
+            other => {
+                bail!("unsupported INPUT_SOURCE '{other}': only 'mqtt' is currently implemented")
+            }
+        }
+    }
+}
+
+/// Selects which output sink the service persists ingested messages to.
+///
+/// Only `Influx` is implemented today. Adding a variant here (e.g. `Kafka`) will
+/// force a compile error at every `match` on this type until it's handled —
+/// this is intentional, acting as a guardrail for future sinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSinkKind {
+    Influx,
+}
+
+impl OutputSinkKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "influx" => Ok(Self::Influx),
+            other => {
+                bail!("unsupported OUTPUT_SINK '{other}': only 'influx' is currently implemented")
+            }
+        }
+    }
+}
+
+/// MQTT broker connection settings, populated only when `INPUT_SOURCE=mqtt`.
+#[derive(Clone)]
+pub struct MqttSourceConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub client_id: String,
+}
+
+impl fmt::Debug for MqttSourceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // username/password are intentionally omitted to avoid leaking secrets in logs.
+        f.debug_struct("MqttSourceConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+/// InfluxDB connection settings, populated only when `OUTPUT_SINK=influx`.
+#[derive(Clone)]
+pub struct InfluxSinkConfig {
+    pub url: String,
+    pub org: String,
+    pub bucket: String,
+    pub token: SecretString,
+}
+
+impl fmt::Debug for InfluxSinkConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InfluxSinkConfig")
+            .field("url", &self.url)
+            .field("org", &self.org)
+            .field("bucket", &self.bucket)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Runtime configuration loaded from environment variables.
 #[derive(Clone)]
 pub struct Config {
-    // MQTT
-    pub mqtt_host: String,
-    pub mqtt_port: u16,
-    pub mqtt_username: Option<String>,
-    pub mqtt_password: Option<String>,
-    pub mqtt_client_id: String,
-    pub mqtt_topics: HashMap<String, String>, // {"TOPIC NAME": "TOPIC STRING"}, e.g. {"MQTT_TOPIC_SENSOR": "home/sensor/+"}
-
-    // InfluxDB v2 Write API
-    pub influx_url: String, // e.g. http://influxdb:8086
-    pub influx_org: String,
-    pub influx_bucket: String,
-    pub influx_token: SecretString,
-
-    // batching
+    pub input_source: InputSourceKind,
+    /// Present when `input_source` is [`InputSourceKind::Mqtt`].
+    pub mqtt: Option<MqttSourceConfig>,
+    /// Route definitions (message-type suffix → topic/route string), populated
+    /// by whichever input source is active. Today only `Mqtt` populates this,
+    /// scanning `MQTT_TOPIC_*` env vars — see `InputSourceKind::Mqtt` below.
+    pub topic_routes: HashMap<String, String>,
+    pub output_sink: OutputSinkKind,
+    /// Present when `output_sink` is [`OutputSinkKind::Influx`].
+    pub influx: Option<InfluxSinkConfig>,
     pub batch_size: usize,
     pub flush_interval_ms: u64,
-
-    // Write-ahead log
     pub wal_dir: PathBuf,
     pub wal_segment_bytes: u64,
     pub wal_queue_capacity: usize,
-
-    // Ingest Event Queue
     pub input_queue_capacity: usize,
-
-    // optional checks
     pub enforce_topic_device_match: bool,
-
-    // Metrics
     pub metrics_bind: String,
-
-    // Cache
     pub cache_ttl_ms: u64,
     pub cache_bind: String,
     pub cache_buffer: usize,
@@ -48,14 +117,11 @@ pub struct Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("mqtt_host", &self.mqtt_host)
-            .field("mqtt_port", &self.mqtt_port)
-            .field("mqtt_client_id", &self.mqtt_client_id)
-            .field("mqtt_topics", &self.mqtt_topics)
-            .field("influx_url", &self.influx_url)
-            .field("influx_org", &self.influx_org)
-            .field("influx_bucket", &self.influx_bucket)
-            .field("influx_token", &"[REDACTED]")
+            .field("input_source", &self.input_source)
+            .field("mqtt", &self.mqtt)
+            .field("topic_routes", &self.topic_routes)
+            .field("output_sink", &self.output_sink)
+            .field("influx", &self.influx)
             .field("batch_size", &self.batch_size)
             .field("flush_interval_ms", &self.flush_interval_ms)
             .field("wal_dir", &self.wal_dir)
@@ -76,40 +142,65 @@ impl fmt::Debug for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let mqtt_host = env_var("MQTT_HOST").context("MQTT_HOST is required")?;
-        let mqtt_port = env_var("MQTT_PORT")
-            .context("MQTT_PORT must be set")?
-            .parse::<u16>()
-            .context("MQTT_PORT must be a u16")?;
+        let input_source =
+            InputSourceKind::parse(&env_var("INPUT_SOURCE").context("INPUT_SOURCE must be set")?)?;
 
-        let mqtt_username = env_var("MQTT_USERNAME");
-        let mqtt_password = env_var("MQTT_PASSWORD");
+        let (mqtt, topic_routes) = match input_source {
+            InputSourceKind::Mqtt => {
+                let host =
+                    env_var("MQTT_HOST").context("MQTT_HOST is required when INPUT_SOURCE=mqtt")?;
+                let port = env_var("MQTT_PORT")
+                    .context("MQTT_PORT must be set when INPUT_SOURCE=mqtt")?
+                    .parse::<u16>()
+                    .context("MQTT_PORT must be a u16")?;
 
-        let mut mqtt_client_id = env_var("MQTT_CLIENT_ID").context("MQTT_CLIENT_ID must be set")?;
-        mqtt_client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
+                let username = env_var("MQTT_USERNAME");
+                let password = env_var("MQTT_PASSWORD");
 
-        let mut mqtt_topics = HashMap::new();
-        for (k, v) in env::vars().filter(|(k, _)| k.starts_with("MQTT_TOPIC_")) {
-            mqtt_topics.insert(k, v);
-        }
+                let mut client_id = env_var("MQTT_CLIENT_ID")
+                    .context("MQTT_CLIENT_ID must be set when INPUT_SOURCE=mqtt")?;
+                client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
 
-        if mqtt_topics.is_empty() {
-            bail!("At least one MQTT_TOPIC_<NAME> environment variable must be set");
-        }
+                let topic_routes = strip_prefixed(env::vars(), "MQTT_TOPIC_");
+                if topic_routes.is_empty() {
+                    bail!("At least one MQTT_TOPIC_<NAME> environment variable must be set");
+                }
 
-        let influx_url = env_var("INFLUX_URL").context("INFLUX_URL must be set")?;
-        if !influx_url.starts_with("http://") && !influx_url.starts_with("https://") {
-            bail!(
-                "INFLUX_URL must start with http:// or https://, got: {}",
-                influx_url
-            );
-        }
-        let influx_org = env_var("INFLUX_ORG").context("INFLUX_ORG must be set")?;
-        let influx_bucket = env_var("INFLUX_BUCKET").context("INFLUX_BUCKET must be set")?;
-        let influx_token = SecretString::new(
-            env_var("INFLUX_TOKEN")
-                .context("INFLUX_TOKEN must be set (for InfluxDB v2 write API)")?,
-        );
+                (
+                    Some(MqttSourceConfig {
+                        host,
+                        port,
+                        username,
+                        password,
+                        client_id,
+                    }),
+                    topic_routes,
+                )
+            }
+        };
+
+        let output_sink =
+            OutputSinkKind::parse(&env_var("OUTPUT_SINK").context("OUTPUT_SINK must be set")?)?;
+
+        let influx = match output_sink {
+            OutputSinkKind::Influx => {
+                let url = env_var("INFLUX_URL")
+                    .context("INFLUX_URL is required when OUTPUT_SINK=influx")?;
+                let org = env_var("INFLUX_ORG")
+                    .context("INFLUX_ORG is required when OUTPUT_SINK=influx")?;
+                let bucket = env_var("INFLUX_BUCKET")
+                    .context("INFLUX_BUCKET is required when OUTPUT_SINK=influx")?;
+                let token = env_var("INFLUX_TOKEN")
+                    .context("INFLUX_TOKEN is required when OUTPUT_SINK=influx")?;
+
+                Some(InfluxSinkConfig {
+                    url,
+                    org,
+                    bucket,
+                    token: SecretString::new(token),
+                })
+            }
+        };
 
         let batch_size = env_var("BATCH_SIZE")
             .context("BATCH_SIZE must be set")?
@@ -164,16 +255,11 @@ impl Config {
             .context("CACHE_BUFFER must be a valid usize")?;
 
         Ok(Self {
-            mqtt_host,
-            mqtt_port,
-            mqtt_username,
-            mqtt_password,
-            mqtt_client_id,
-            mqtt_topics,
-            influx_url,
-            influx_org,
-            influx_bucket,
-            influx_token,
+            input_source,
+            mqtt,
+            topic_routes,
+            output_sink,
+            influx,
             batch_size,
             flush_interval_ms,
             wal_dir,
@@ -194,4 +280,99 @@ fn env_var(k: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn strip_prefixed(
+    vars: impl Iterator<Item = (String, String)>,
+    prefix: &str,
+) -> HashMap<String, String> {
+    vars.filter_map(|(k, v)| k.strip_prefix(prefix).map(|suffix| (suffix.to_string(), v)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_source_kind_parse_accepts_mqtt_case_insensitive() {
+        assert_eq!(
+            InputSourceKind::parse("mqtt").unwrap(),
+            InputSourceKind::Mqtt
+        );
+        assert_eq!(
+            InputSourceKind::parse("MQTT").unwrap(),
+            InputSourceKind::Mqtt
+        );
+        assert_eq!(
+            InputSourceKind::parse(" Mqtt ").unwrap(),
+            InputSourceKind::Mqtt
+        );
+    }
+
+    #[test]
+    fn input_source_kind_parse_rejects_unknown_value() {
+        let err = InputSourceKind::parse("kafka").unwrap_err();
+        assert!(err.to_string().contains("unsupported INPUT_SOURCE 'kafka'"));
+    }
+
+    #[test]
+    fn input_source_kind_parse_rejects_empty_value() {
+        assert!(InputSourceKind::parse("").is_err());
+    }
+
+    #[test]
+    fn output_source_kind_parse_accepts_influx_case_insensitive() {
+        assert_eq!(
+            OutputSinkKind::parse("influx").unwrap(),
+            OutputSinkKind::Influx
+        );
+        assert_eq!(
+            OutputSinkKind::parse("INFLUX").unwrap(),
+            OutputSinkKind::Influx
+        );
+        assert_eq!(
+            OutputSinkKind::parse(" Influx ").unwrap(),
+            OutputSinkKind::Influx
+        );
+    }
+
+    #[test]
+    fn output_source_kind_parse_rejects_unknown_value() {
+        let err = OutputSinkKind::parse("kafka").unwrap_err();
+        assert!(err.to_string().contains("unsupported OUTPUT_SINK 'kafka'"));
+    }
+
+    #[test]
+    fn output_source_kind_parse_rejects_empty_value() {
+        assert!(OutputSinkKind::parse("").is_err());
+    }
+
+    #[test]
+    fn strip_prefixed_extracts_suffix_and_ignores_other_keys() {
+        let vars = vec![
+            (
+                "MQTT_TOPIC_SENSOR".to_string(),
+                "smarthome/+/sensor".to_string(),
+            ),
+            (
+                "MQTT_TOPIC_DLQ".to_string(),
+                "smarthome/_dlq/ingest".to_string(),
+            ),
+            ("MQTT_HOST".to_string(), "mqtt.example.com".to_string()),
+        ];
+
+        let result = strip_prefixed(vars.into_iter(), "MQTT_TOPIC_");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get("SENSOR").map(String::as_str),
+            Some("smarthome/+/sensor")
+        );
+        assert_eq!(
+            result.get("DLQ").map(String::as_str),
+            Some("smarthome/_dlq/ingest")
+        );
+        assert!(!result.contains_key("HOST"));
+    }
 }

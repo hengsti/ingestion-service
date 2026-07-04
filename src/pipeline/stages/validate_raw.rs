@@ -88,11 +88,8 @@ mod tests {
         pipeline::stage::StageFlow,
     };
 
-    // ── schema strings ────────────────────────────────────────────────────────
     const SENSOR_SCHEMA: &str = include_str!("../../../schema/sensor.schema.json");
     const STATUS_SCHEMA: &str = include_str!("../../../schema/status.schema.json");
-
-    // ── helpers ───────────────────────────────────────────────────────────────
 
     /// Router with a single sensor route on `smarthome/+/sensor`.
     fn sensor_router() -> Arc<Router> {
@@ -132,8 +129,6 @@ mod tests {
         ctx
     }
 
-    // ── run(): success ────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn run_on_valid_sensor_payload_returns_continue() {
         let stage = ValidateRawStage::new(sensor_router(), false);
@@ -146,8 +141,6 @@ mod tests {
         assert!(ctx.ignored_reason().is_none());
     }
 
-    // ── run(): ignored (non-strict router, no matching route) ─────────────────
-
     #[tokio::test]
     async fn run_on_unknown_topic_with_non_strict_router_marks_ignored_and_stops() {
         let stage = ValidateRawStage::new(non_strict_sensor_router(), false);
@@ -159,8 +152,6 @@ mod tests {
         assert!(!ctx.should_publish_dlq());
         assert_eq!(ctx.ignored_reason(), Some("no matching route"));
     }
-
-    // ── run(): DLQ paths ──────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn run_on_unknown_topic_with_strict_router_marks_dlq_and_stops() {
@@ -177,7 +168,6 @@ mod tests {
     #[tokio::test]
     async fn run_on_schema_invalid_payload_marks_dlq_and_stops() {
         let stage = ValidateRawStage::new(sensor_router(), false);
-        // Missing all required fields.
         let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", json!({"device_id": "esp32-1"}));
 
         let result = stage.run(&mut ctx).await;
@@ -205,7 +195,6 @@ mod tests {
     async fn run_with_device_id_mismatch_when_enforced_marks_dlq_and_stops() {
         let stage = ValidateRawStage::new(sensor_router(), true);
         let mut payload = valid_sensor_payload();
-        // Topic says "esp32-1" but payload claims "esp32-2".
         payload["device_id"] = json!("esp32-2");
         let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", payload);
 
@@ -215,8 +204,6 @@ mod tests {
         assert!(ctx.should_publish_dlq());
         assert!(ctx.dlq_reason().unwrap().contains("raw validation failed"));
     }
-
-    // ── run(): enforce_topic_device_match=false bypasses device_id check ──────
 
     #[tokio::test]
     async fn run_with_device_id_mismatch_when_not_enforced_returns_continue() {
@@ -231,8 +218,6 @@ mod tests {
         assert!(!ctx.should_publish_dlq());
     }
 
-    // ── run(): missing payload_json in context ────────────────────────────────
-
     #[tokio::test]
     async fn run_without_payload_json_in_context_returns_error() {
         let stage = ValidateRawStage::new(sensor_router(), false);
@@ -244,8 +229,6 @@ mod tests {
         assert!(result.is_err());
         assert!(!ctx.should_publish_dlq());
     }
-
-    // ── run(): status route ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn run_on_valid_status_payload_returns_continue() {

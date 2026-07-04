@@ -1,21 +1,21 @@
 use anyhow::{bail, Result};
 
-/// MQTT topic filter that supports `+` (single level) and `#` (multi level) wildcards.
+/// Topic filter that supports `+` (single level) and `#` (multi level) wildcards.
 #[derive(Debug, Clone)]
-pub struct MqttTopicPattern {
-    segments: Vec<MqttSeg>,
+pub struct TopicPattern {
+    segments: Vec<Segment>,
     /// Best-effort: treat the first `+` segment as the device_id position.
     device_id_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MqttSeg {
+enum Segment {
     Lit(String),
     One,
     Multi,
 }
 
-impl MqttTopicPattern {
+impl TopicPattern {
     pub fn new(raw: &str) -> Result<Self> {
         let raw = raw.trim().trim_matches('/').to_string();
         if raw.is_empty() {
@@ -36,19 +36,19 @@ impl MqttTopicPattern {
                     if device_id_index.is_none() {
                         device_id_index = Some(i);
                     }
-                    segments.push(MqttSeg::One);
+                    segments.push(Segment::One);
                 }
                 "#" => {
                     if i != parts.len() - 1 {
                         bail!("'#' must be the last segment in topic pattern: '{}'", raw);
                     }
-                    segments.push(MqttSeg::Multi);
+                    segments.push(Segment::Multi);
                 }
-                lit => segments.push(MqttSeg::Lit(lit.to_string())),
+                lit => segments.push(Segment::Lit(lit.to_string())),
             }
         }
 
-        // Convention fallback: "smarthome/<device_id>/..." even if MQTT filter uses a concrete device id.
+        // Convention fallback: "smarthome/<device_id>/..." even if TopicPattern uses a concrete device id.
         if device_id_index.is_none() && parts.len() >= 2 && parts[0] == "smarthome" {
             device_id_index = Some(1);
         }
@@ -66,11 +66,11 @@ impl MqttTopicPattern {
         let mut ti = 0usize;
         for (pi, pseg) in self.segments.iter().enumerate() {
             match pseg {
-                MqttSeg::Multi => {
+                Segment::Multi => {
                     // '#' matches the rest; allowed only at the end.
                     return pi == self.segments.len() - 1;
                 }
-                MqttSeg::One => {
+                Segment::One => {
                     if ti >= t_parts.len() {
                         return false;
                     }
@@ -79,7 +79,7 @@ impl MqttTopicPattern {
                     }
                     ti += 1;
                 }
-                MqttSeg::Lit(lit) => {
+                Segment::Lit(lit) => {
                     if ti >= t_parts.len() {
                         return false;
                     }

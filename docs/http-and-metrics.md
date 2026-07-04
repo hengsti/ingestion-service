@@ -7,7 +7,7 @@ The service exposes two HTTP servers:
 
 ## Cache API
 
-The cache stores only latest sensor states. Status messages are persisted to InfluxDB but are not exposed through the cache API.
+The cache stores only latest sensor states. Status messages are forwarded to the active sink (InfluxDB today) but are not exposed through the cache API.
 
 ### `GET /healthz`
 
@@ -19,16 +19,16 @@ Returns:
 
 | Status | Meaning |
 |---:|---|
-| `200` | MQTT connection has received `ConnAck` |
-| `503` | MQTT is not ready |
+| `200` | Active input source is ready (`ConnAck` for the current MQTT source) |
+| `503` | Active input source is not ready |
 
-If MQTT polling returns an error, the main task exits with context `MQTT poll failed`.
+With the current MQTT source, readiness flips to `200` after `ConnAck`. If event-loop polling fails, the main task exits with context `MQTT poll failed`.
 
 ### `GET /v1/state`
 
 Returns all cached sensor states.
 
-Response:
+Example response:
 
 ```json
 {
@@ -61,7 +61,7 @@ Response:
 
 Returns a single cached sensor state or `null`.
 
-Response:
+Example response:
 
 ```json
 {
@@ -131,12 +131,12 @@ The metrics recorder runs upkeep every 10 seconds.
 
 ## Important Metrics
 
-### MQTT and Decode
+### Input and Decode
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `mqtt_messages_received_total` | counter | none | Messages that entered the decode stage |
-| `ingest_event_queue_full_total` | counter | none | MQTT messages dropped before pipeline because a worker queue was full |
+| `mqtt_messages_received_total` | counter | none | Messages that entered the decode stage from the current MQTT source |
+| `ingest_event_queue_full_total` | counter | none | Incoming messages dropped before pipeline because a worker queue was full |
 | `ingest_decode_payload_bytes` | histogram | none | Raw payload size |
 | `ingest_decode_success_total` | counter | none | Payloads decoded as JSON |
 | `ingest_incoming_oversized_total` | counter | none | Payloads larger than 64 KiB |
@@ -177,7 +177,7 @@ The metrics recorder runs upkeep every 10 seconds.
 | `dlq_publish_errors_total` | counter | none | DLQ publish failures |
 | `ingest_dlq_publish_duration_seconds` | histogram | `result` | DLQ publish duration |
 
-### Pipeline and Influx
+### Pipeline and Influx Sink
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|

@@ -2,13 +2,23 @@
 
 All runtime configuration is supplied through environment variables. Empty strings are treated as unset because `Config::from_env` trims values and filters empty results.
 
-## MQTT
+## Input source
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `MQTT_HOST` | Yes | None | MQTT broker host |
-| `MQTT_PORT` | Yes | None | MQTT broker port as `u16` |
-| `MQTT_CLIENT_ID` | Yes | None | Base client id. The service appends `-<unix_timestamp>` at startup |
+| `INPUT_SOURCE` | Yes | None | Selects the input transport. Only `mqtt` is implemented today (case-insensitive) |
+
+The service ingests messages through a swappable `Source` abstraction (see `docs/architecture.md`). `INPUT_SOURCE` selects which implementation `build_source()` constructs at startup. Adding a new transport (e.g. Kafka) means adding a new `InputSourceKind` variant and a matching `Source`/`DlqPublisher` pair — no changes to `main.rs`'s wiring are required beyond that.
+
+## MQTT
+
+The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT_ID` / `MQTT_TOPIC_*` variables below are **only required when `INPUT_SOURCE=mqtt`** — `Config::from_env` parses all of them, including topic/route definitions, inside the `InputSourceKind::Mqtt` arm. `MQTT_TOPIC_*` values are stored generically as `Config::topic_routes` (keyed by suffix, e.g. `SENSOR`/`STATUS`/`DLQ`), which the transport-agnostic `Router` consumes without any knowledge of MQTT or environment variable naming — a future Kafka source would populate the same `topic_routes` map from its own `KAFKA_TOPIC_*` convention.
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `MQTT_HOST` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker host |
+| `MQTT_PORT` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker port as `u16` |
+| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Base client id. The service appends `-<unix_timestamp>` at startup |
 | `MQTT_USERNAME` | No | None | Optional MQTT username |
 | `MQTT_PASSWORD` | No | None | Optional MQTT password |
 | `MQTT_TOPIC_SENSOR` | Expected | None | Sensor subscription and route, for example `smarthome/+/sensor` |
@@ -22,12 +32,14 @@ Unknown `MQTT_TOPIC_*` keys are not routed. They are still subscribed if they do
 
 ## InfluxDB
 
+The variables below are **only required when `OUTPUT_SINK=influx`** (see [Output sink](#output-sink)).
+
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `INFLUX_URL` | Yes | None | Base URL. Must start with `http://` or `https://` |
-| `INFLUX_ORG` | Yes | None | InfluxDB organization |
-| `INFLUX_BUCKET` | Yes | None | InfluxDB bucket |
-| `INFLUX_TOKEN` | Yes | None | InfluxDB v2 write token. Stored as `SecretString` and redacted from `Debug` output |
+| `INFLUX_URL` | Only if `OUTPUT_SINK=influx` | None | Base URL. Must start with `http://` or `https://` |
+| `INFLUX_ORG` | Only if `OUTPUT_SINK=influx` | None | InfluxDB organization |
+| `INFLUX_BUCKET` | Only if `OUTPUT_SINK=influx` | None | InfluxDB bucket |
+| `INFLUX_TOKEN` | Only if `OUTPUT_SINK=influx` | None | InfluxDB v2 write token. Stored as `SecretString` and redacted from `Debug` output |
 
 The write endpoint is built as:
 
@@ -35,11 +47,19 @@ The write endpoint is built as:
 <INFLUX_URL>/api/v2/write?org=<urlencoded org>&bucket=<urlencoded bucket>&precision=ms
 ```
 
+## Output sink
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `OUTPUT_SINK` | Yes | None | Selects the output destination. Only `influx` is implemented today (case-insensitive) |
+
+The service persists messages through a swappable `Sink`/`Encoder` pair (see `docs/architecture.md`). `OUTPUT_SINK` selects which implementation `build_output()` constructs at startup. Adding a new sink (e.g. Kafka) means adding a new `OutputSinkKind` variant and a matching `Sink`/`Encoder` pair — no changes to `main.rs`'s wiring are required beyond that.
+
 ## Batching
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `BATCH_SIZE` | Yes | None | Maximum WAL entries per InfluxDB write |
+| `BATCH_SIZE` | Yes | None | Maximum WAL entries per sink write |
 | `FLUSH_INTERVAL_MS` | Yes | None | Time trigger for partial WAL batches |
 
 Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a smaller `FLUSH_INTERVAL_MS` for lower end-to-end latency.
@@ -52,13 +72,13 @@ Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a sma
 | `WAL_SEGMENT_BYTES` | No | `67108864` | Segment rotation threshold in bytes |
 | `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer |
 
-Use persistent local storage for `WAL_DIR` in production. The WAL buffers InfluxDB outages and replays uncommitted records after restart.
+Use persistent local storage for `WAL_DIR` in production. The WAL buffers sink outages (InfluxDB today) and replays uncommitted records after restart.
 
 ## Input Queue
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `INPUT_QUEUE_CAPACITY` | No | `16384` | Total MQTT ingest queue capacity distributed across workers |
+| `INPUT_QUEUE_CAPACITY` | No | `16384` | Total ingest queue capacity distributed across workers |
 
 The service divides `INPUT_QUEUE_CAPACITY` by worker count to create one bounded queue per worker. Keep this value at least as large as the maximum worker count, which is 8, so every worker receives a non-zero channel capacity.
 
@@ -98,12 +118,14 @@ RUST_LOG=smarthome_ingest=debug cargo run --release
 ## Minimal Local Configuration
 
 ```bash
+INPUT_SOURCE=mqtt
 MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_CLIENT_ID=smarthome-ingest
 MQTT_TOPIC_SENSOR=smarthome/+/sensor
 MQTT_TOPIC_STATUS=smarthome/+/status
 MQTT_TOPIC_DLQ=smarthome/_dlq/ingest
+OUTPUT_SINK=influx
 INFLUX_URL=http://localhost:8086
 INFLUX_ORG=smarthome
 INFLUX_BUCKET=sensors

@@ -6,7 +6,7 @@ use tracing::warn;
 use metrics::{counter, histogram};
 
 use crate::{
-    infrastructure::database::influx::{sensor_to_point, status_to_point},
+    infrastructure::sink::Encoder,
     infrastructure::wal::{
         types::{AppendDurableError, WalEvent},
         wal::Wal,
@@ -21,11 +21,12 @@ use crate::{
 #[derive(Clone)]
 pub struct PersistStage {
     wal: Arc<Wal>,
+    encoder: Arc<dyn Encoder>,
 }
 
 impl PersistStage {
-    pub fn new(wal: Arc<Wal>) -> Self {
-        Self { wal }
+    pub fn new(wal: Arc<Wal>, encoder: Arc<dyn Encoder>) -> Self {
+        Self { wal, encoder }
     }
 }
 
@@ -42,22 +43,17 @@ impl PipelineStage for PersistStage {
             let start = Instant::now();
 
             let message = ctx.handled_message()?;
-            let mut line_protocol = String::new();
             let kind = match message {
-                HandledMessage::Sensor(sensor) => {
-                    sensor_to_point(sensor).write_line_protocol(&mut line_protocol);
-                    "sensor"
-                }
-                HandledMessage::Status(status) => {
-                    status_to_point(status).write_line_protocol(&mut line_protocol);
-                    "status"
-                }
+                HandledMessage::Sensor(_) => "sensor",
+                HandledMessage::Status(_) => "status",
             };
+            let mut payload = String::new();
+            self.encoder.encode(message, &mut payload);
 
             let event = WalEvent {
                 topic: ctx.topic().to_string(),
                 ts_ms: chrono::Utc::now().timestamp_millis(),
-                line_protocol,
+                payload,
             };
 
             match self.wal.append_durable(event).await {
@@ -108,7 +104,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        infrastructure::database::influx::{sensor_to_point, status_to_point},
+        infrastructure::sink::influx::{sensor_to_point, status_to_point},
         infrastructure::wal::{
             segment::segment_path,
             subscription::WalSubscription,
@@ -121,8 +117,6 @@ mod tests {
         },
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
-
-    // ── helpers ───────────────────────────────────────────────────────────────
 
     fn valid_sensor_msg() -> SensorMessage {
         SensorMessage {
@@ -197,13 +191,12 @@ mod tests {
             .map(|entry| entry.event)
     }
 
-    // ── run(): success paths ──────────────────────────────────────────────────
-
     #[tokio::test]
     async fn run_on_sensor_message_appends_to_wal_and_returns_continue() {
         let dir = tempdir().unwrap();
         let (wal, mut sub) = open_wal(dir.path(), 16).await;
-        let stage = PersistStage::new(wal);
+        let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
+        let stage = PersistStage::new(wal, encoder);
         let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
 
         let result = stage.run(&mut ctx).await;
@@ -214,7 +207,7 @@ mod tests {
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
         assert_eq!(event.topic, "smarthome/esp32-1/sensor");
         assert_eq!(
-            event.line_protocol,
+            event.payload,
             expected_line_protocol(&HandledMessage::Sensor(valid_sensor_msg()))
         );
     }
@@ -223,7 +216,8 @@ mod tests {
     async fn run_on_status_message_appends_to_wal_and_returns_continue() {
         let dir = tempdir().unwrap();
         let (wal, mut sub) = open_wal(dir.path(), 16).await;
-        let stage = PersistStage::new(wal);
+        let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
+        let stage = PersistStage::new(wal, encoder);
         let mut ctx = ctx_with_message(HandledMessage::Status(valid_status_msg()));
 
         let result = stage.run(&mut ctx).await;
@@ -233,18 +227,17 @@ mod tests {
 
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
         assert_eq!(
-            event.line_protocol,
+            event.payload,
             expected_line_protocol(&HandledMessage::Status(valid_status_msg()))
         );
     }
-
-    // ── run(): queue error paths ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn run_marks_dlq_with_queue_full_when_wal_queue_is_saturated() {
         let dir = tempdir().unwrap();
         let (wal, _sub) = open_wal(dir.path(), 1).await;
-        let stage = PersistStage::new(wal.clone());
+        let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
+        let stage = PersistStage::new(wal.clone(), encoder);
 
         // Keep the WAL channel under pressure with best-effort non-durable appends
         // from a separate producer so this durable append can observe `Full`.
@@ -254,7 +247,7 @@ mod tests {
                 let _ = flood_wal.try_append(WalEvent {
                     topic: format!("smarthome/dev-{i}/status"),
                     ts_ms: i as i64,
-                    line_protocol: format!(
+                    payload: format!(
                         "device_status,device_id=dev-{i},device_class=test rssi=-50i {i}"
                     ),
                 });
@@ -288,9 +281,9 @@ mod tests {
         .await
         .expect("wal open");
         let wal = Arc::new(wal);
-        let stage = PersistStage::new(wal);
+        let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
+        let stage = PersistStage::new(wal, encoder);
 
-        // First append writes segment 1.
         let mut first = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
         assert!(matches!(
             stage.run(&mut first).await,
@@ -324,13 +317,12 @@ mod tests {
         assert_eq!(ctx.dlq_reason(), Some("wal queue closed"));
     }
 
-    // ── run(): missing handled_message ────────────────────────────────────────
-
     #[tokio::test]
     async fn run_without_handled_message_returns_error() {
         let dir = tempdir().unwrap();
         let (wal, _sub) = open_wal(dir.path(), 16).await;
-        let stage = PersistStage::new(wal);
+        let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
+        let stage = PersistStage::new(wal, encoder);
         let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
 
         let result = stage.run(&mut ctx).await;

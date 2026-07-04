@@ -224,7 +224,6 @@ mod tests {
     async fn test_commit_halfway_reopen_resumes_subscription_at_committed_offset() {
         let dir = tempdir().unwrap();
 
-        // Phase 1: append 10, consume 5, commit at the 5th's `offset_after`.
         let resume_at = {
             let (wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 32)).await.unwrap();
             for i in 0..10 {
@@ -245,7 +244,6 @@ mod tests {
             cutoff
         };
 
-        // Phase 2: reopen — the remaining 5 events should be yielded.
         let (_wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 32)).await.unwrap();
         for i in 5..10 {
             let entry = recv_one(&mut sub, 500)
@@ -286,7 +284,6 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // Drain until we see an entry in segment >= 2, then commit to that offset.
         let mut commit_at = None;
         for _ in 0..50 {
             let entry = recv_one(&mut sub, 500).await.unwrap();
@@ -310,7 +307,6 @@ mod tests {
     async fn test_open_torn_trailing_record_stops_replay_cleanly() {
         let dir = tempdir().unwrap();
 
-        // Append one good record, then close the WAL.
         {
             let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
             wal.try_append(sample_event(1)).unwrap();
@@ -319,13 +315,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Manually corrupt the segment with a length prefix and no payload.
         let path = dir.path().join("00000000000000000001.log");
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(&999u32.to_le_bytes()).unwrap();
         drop(f);
 
-        // Reopen: exactly the good record should be yielded; nothing more.
         let (_wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
         let good = recv_one(&mut sub, 500).await.expect("good record");
         assert_eq!(good.event.ts_ms, sample_event(1).ts_ms);
@@ -339,7 +333,6 @@ mod tests {
     async fn test_open_torn_tail_heals_and_subsequent_append_replays_cleanly() {
         let dir = tempdir().unwrap();
 
-        // Append one good record, then close the WAL.
         {
             let (wal, _sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
             wal.try_append(sample_event(1)).unwrap();
@@ -348,7 +341,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Corrupt the segment with a length prefix and no payload (torn tail).
         let path = dir.path().join("00000000000000000001.log");
         {
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
@@ -365,8 +357,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Reopen and replay: exactly the two good records, monotonic offsets,
-        // then a clean block.
         let (_wal, mut sub) = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.unwrap();
 
         let first = recv_one(&mut sub, 500).await.expect("first good record");

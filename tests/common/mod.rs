@@ -10,6 +10,8 @@ use smarthome_ingest::{
     infrastructure::{
         cache::state::CacheState,
         router::{Route, Router},
+        sink::{influx::InfluxEncoder, Encoder},
+        source::{mqtt::MqttDlqPublisher, DlqPublisher},
         wal::{
             subscription::WalSubscription,
             types::{WalEvent, WalOptions},
@@ -55,6 +57,12 @@ pub fn dlq_client() -> AsyncClient {
     client
 }
 
+/// An `Arc<dyn DlqPublisher>` wrapping [`dlq_client`], for building pipelines
+/// against the trait-based DLQ seam instead of a raw MQTT client.
+pub fn dlq_publisher() -> Arc<dyn DlqPublisher> {
+    Arc::new(MqttDlqPublisher::new(dlq_client()))
+}
+
 /// Opens a fresh WAL backed by a temporary directory.
 ///
 /// The returned `TempDir` must be kept alive for the lifetime of the test —
@@ -69,6 +77,12 @@ pub async fn open_temp_wal() -> (Arc<Wal>, WalSubscription, TempDir) {
     .await
     .expect("open WAL");
     (Arc::new(wal), sub, tmp)
+}
+
+/// An `Arc<dyn Encoder>` wrapping [`InfluxEncoder`], for building pipelines
+/// against the trait-based encoding seam instead of a raw sink-specific call.
+pub fn influx_encoder() -> Arc<dyn Encoder> {
+    Arc::new(InfluxEncoder)
 }
 
 /// Builds the full ingest pipeline persisting to a temporary WAL.
@@ -86,9 +100,12 @@ pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, T
         .add_stage(TransformStage::new(router.clone()))
         .add_stage(ValidateBusinessStage::new().unwrap())
         .add_stage(CacheUpdateStage::new(cache.clone()))
-        .add_stage(PersistStage::new(wal))
+        .add_stage(PersistStage::new(wal, influx_encoder()))
         .add_stage(ObserveStage::new())
-        .with_failure_stage(DlqPublishStage::new(dlq_client(), "smarthome/_dlq/ingest"));
+        .with_failure_stage(DlqPublishStage::new(
+            dlq_publisher(),
+            "smarthome/_dlq/ingest",
+        ));
 
     (pipeline, sub, cache, tmp)
 }

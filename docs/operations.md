@@ -1,7 +1,5 @@
 # Operations Guide
 
-This guide covers common operating tasks.
-
 ## Run with Docker
 
 Build:
@@ -16,12 +14,14 @@ Run:
 docker run --rm \
   -p 8085:8085 \
   -p 9090:9090 \
+  -e INPUT_SOURCE=mqtt \
   -e MQTT_HOST=host.docker.internal \
   -e MQTT_PORT=1883 \
   -e MQTT_CLIENT_ID=smarthome-ingest \
   -e MQTT_TOPIC_SENSOR=smarthome/+/sensor \
   -e MQTT_TOPIC_STATUS=smarthome/+/status \
   -e MQTT_TOPIC_DLQ=smarthome/_dlq/ingest \
+  -e OUTPUT_SINK=influx \
   -e INFLUX_URL=http://host.docker.internal:8086 \
   -e INFLUX_ORG=smarthome \
   -e INFLUX_BUCKET=sensors \
@@ -56,7 +56,7 @@ curl -i http://localhost:8085/readyz
 Interpretation:
 
 - `/healthz` validates the HTTP server process.
-- `/readyz` validates MQTT readiness.
+- `/readyz` validates active input-source readiness (`ConnAck` for the current MQTT source).
 
 ## Check Cache State
 
@@ -87,7 +87,7 @@ Useful signals:
 
 | Symptom | Metrics to check |
 |---|---|
-| MQTT is arriving | `mqtt_messages_received_total` |
+| MQTT input is arriving | `mqtt_messages_received_total` |
 | Input workers are overloaded | `ingest_event_queue_full_total` |
 | Payloads are invalid | `ingest_incoming_invalid_json_total`, `ingest_validate_raw_failed_total`, `ingest_validate_business_failed_total` |
 | Transform logic rejects payloads | `ingest_transform_failed_total` |
@@ -95,9 +95,9 @@ Useful signals:
 | InfluxDB writes are failing | `influx_write_errors_total`, `wal_forwarder_retry_total`, `wal_forwarder_retry_outage_active` |
 | Data is dropped as poison | `wal_forwarder_drop_total` |
 
-## Handle InfluxDB Outage
+## Handle Sink Outage (InfluxDB today)
 
-During a retryable InfluxDB outage, the forwarder holds the current batch and does not advance the WAL cursor. New events continue to accumulate in WAL segment files.
+During a retryable sink outage, the forwarder holds the current batch and does not advance the WAL cursor. With the current `InfluxSink`, that includes network errors, timeouts, HTTP 5xx, `408`, and `429`. New events continue to accumulate in WAL segment files.
 
 Steps:
 
