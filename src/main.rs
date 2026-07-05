@@ -41,6 +41,27 @@ fn worker_count() -> usize {
         .unwrap_or(4)
 }
 
+/// Waits for `SIGTERM`, the default signal Docker sends on `stop`/`down`.
+///
+/// # Errors
+///
+/// Returns an error if the OS signal handler cannot be installed.
+#[cfg(unix)]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    sigterm.recv().await;
+    Ok(())
+}
+
+/// Non-Unix platforms have no `SIGTERM`; never resolves so `ctrl_c` remains
+/// the sole shutdown trigger there.
+#[cfg(not(unix))]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    std::future::pending().await
+}
+
 async fn recv_worker_job(
     rx: &mut mpsc::Receiver<IngestJob>,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -186,7 +207,7 @@ async fn main() -> Result<()> {
     let dispatcher = IngestDispatcher::new(job_txs.clone());
     let mut source_task = tokio::spawn(source.run(dispatcher, shutdown_rx.clone()));
 
-    // Wait for ctrl-c, the HTTP task, or the input source, then signal shutdown.
+    // Wait for ctrl-c, SIGTERM, the HTTP task, or the input source, then signal shutdown.
     let mut fatal_source_err: Option<anyhow::Error> = None;
     let mut source_task_handled = false;
 
@@ -195,6 +216,14 @@ async fn main() -> Result<()> {
             match res {
                 Ok(()) => info!("shutdown signal received"),
                 Err(err) => error!(error = %err, "failed to listen for ctrl-c"),
+            }
+            let _ = shutdown_tx.send(true);
+        }
+
+        res = wait_for_sigterm() => {
+            match res {
+                Ok(()) => info!("SIGTERM received"),
+                Err(err) => error!(error = %err, "failed to listen for sigterm"),
             }
             let _ = shutdown_tx.send(true);
         }
