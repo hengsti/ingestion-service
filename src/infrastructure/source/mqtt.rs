@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rumqttc::{AsyncClient, Event, EventLoop, Incoming, MqttOptions, QoS};
+use rumqttc::{
+    AsyncClient, Event, EventLoop, Incoming, MqttOptions, QoS, SubscribeFilter, SubscribeReasonCode,
+};
 use serde_json::json;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
@@ -17,24 +19,25 @@ use crate::config::Config;
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// MQTT-backed [`Source`]. Never exits on connection errors: it keeps polling
-/// so `rumqttc` reconnects, and re-subscribes to `topics` on every `ConnAck`.
+/// so `rumqttc` reconnects, and re-subscribes to `filters` on every `ConnAck`.
+/// Readiness is only reported once the broker acknowledges the subscription.
 pub struct MqttSource {
     eventloop: EventLoop,
     client: AsyncClient,
-    topics: Vec<String>,
+    filters: Vec<SubscribeFilter>,
+    subscribe_pending: bool,
     ready: Arc<AtomicBool>,
 }
 
 impl MqttSource {
-    /// Queues a subscription for every topic. Uses `try_subscribe` because the
-    /// request channel is drained by this same task's `poll()`, so awaiting
-    /// here could deadlock if the channel were full.
-    fn subscribe_all(&self) {
-        for topic in &self.topics {
-            match self.client.try_subscribe(topic, QoS::AtLeastOnce) {
-                Ok(()) => info!(topic = %topic, "subscribed to MQTT topic"),
-                Err(err) => error!(topic = %topic, error = %err, "MQTT subscribe failed"),
-            }
+    /// Queues one batched subscription for all filters. Uses the non-blocking
+    /// `try_` variant because the request channel is drained by this same
+    /// task's `poll()`; if the channel is full, the request stays pending and
+    /// is retried after the next poll.
+    fn try_subscribe(&mut self) {
+        match self.client.try_subscribe_many(self.filters.iter().cloned()) {
+            Ok(()) => self.subscribe_pending = false,
+            Err(err) => warn!(error = %err, "MQTT subscribe not queued; retrying"),
         }
     }
 }
@@ -74,16 +77,31 @@ impl Source for MqttSource {
 
                         match &event {
                             Event::Incoming(Incoming::ConnAck(_)) => {
-                                self.ready.store(true, Ordering::Relaxed);
                                 info!("MQTT connected");
                                 // Always re-subscribe: brokers may report
                                 // `session_present` without restoring subscriptions.
-                                self.subscribe_all();
+                                self.subscribe_pending = true;
+                            }
+                            Event::Incoming(Incoming::SubAck(suback)) => {
+                                let all_ok = suback
+                                    .return_codes
+                                    .iter()
+                                    .all(|c| matches!(c, SubscribeReasonCode::Success(_)));
+                                if all_ok {
+                                    self.ready.store(true, Ordering::Relaxed);
+                                    info!(topics = self.filters.len(), "subscribed to MQTT topics");
+                                } else {
+                                    error!(codes = ?suback.return_codes, "MQTT subscribe rejected by broker");
+                                }
                             }
                             Event::Incoming(Incoming::Disconnect) => {
                                 self.ready.store(false, Ordering::Relaxed);
                             }
                             _ => {}
+                        }
+
+                        if self.subscribe_pending {
+                            self.try_subscribe();
                         }
 
                         if let Event::Incoming(Incoming::Publish(publish)) = event {
@@ -167,17 +185,18 @@ pub async fn build(
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
-    let topics = cfg
+    let filters = cfg
         .topic_routes
         .iter()
         .filter(|(k, _)| !k.ends_with("DLQ"))
-        .map(|(_, topic)| topic.clone())
+        .map(|(_, topic)| SubscribeFilter::new(topic.clone(), QoS::AtLeastOnce))
         .collect();
 
     let source: Box<dyn Source> = Box::new(MqttSource {
         eventloop,
         client: client.clone(),
-        topics,
+        filters,
+        subscribe_pending: false,
         ready,
     });
     let publisher: Arc<dyn DlqPublisher> = Arc::new(MqttDlqPublisher::new(client));
@@ -214,7 +233,11 @@ mod tests {
         let source = Box::new(MqttSource {
             eventloop,
             client,
-            topics: vec!["smarthome/+/sensor".to_owned()],
+            filters: vec![SubscribeFilter::new(
+                "smarthome/+/sensor".to_owned(),
+                QoS::AtLeastOnce,
+            )],
+            subscribe_pending: false,
             ready: ready.clone(),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -236,6 +259,31 @@ mod tests {
         // Assert
         assert!(still_running);
         assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mqtt_source_try_subscribe_full_channel_stays_pending() -> Result<()> {
+        // Arrange: capacity-1 request channel already occupied by a publish.
+        let opts = TestMqttOptions::new("test-mqtt-source-full", "127.0.0.1", 1);
+        let (client, eventloop) = AsyncClient::new(opts, 1);
+        client.try_publish("t", QoS::AtLeastOnce, false, "x")?;
+        let mut source = MqttSource {
+            eventloop,
+            client,
+            filters: vec![SubscribeFilter::new(
+                "smarthome/+/sensor".to_owned(),
+                QoS::AtLeastOnce,
+            )],
+            subscribe_pending: true,
+            ready: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Act
+        source.try_subscribe();
+
+        // Assert
+        assert!(source.subscribe_pending);
         Ok(())
     }
 
