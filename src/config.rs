@@ -55,6 +55,7 @@ pub struct MqttSourceConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub client_id: String,
+    pub clean_session: bool,
 }
 
 impl fmt::Debug for MqttSourceConfig {
@@ -64,6 +65,7 @@ impl fmt::Debug for MqttSourceConfig {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("client_id", &self.client_id)
+            .field("clean_session", &self.clean_session)
             .finish()
     }
 }
@@ -157,9 +159,10 @@ impl Config {
                 let username = env_var("MQTT_USERNAME");
                 let password = env_var("MQTT_PASSWORD");
 
-                let mut client_id = env_var("MQTT_CLIENT_ID")
+                let client_id = env_var("MQTT_CLIENT_ID")
                     .context("MQTT_CLIENT_ID must be set when INPUT_SOURCE=mqtt")?;
-                client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
+                let (clean_session, client_id) =
+                    mqtt_session(env_var("MQTT_CLEAN_SESSION"), client_id)?;
 
                 let topic_routes = strip_prefixed(env::vars(), "MQTT_TOPIC_");
                 if topic_routes.is_empty() {
@@ -173,6 +176,7 @@ impl Config {
                         username,
                         password,
                         client_id,
+                        clean_session,
                     }),
                     topic_routes,
                 )
@@ -281,6 +285,18 @@ fn env_var(k: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
+fn mqtt_session(clean_session: Option<String>, mut client_id: String) -> Result<(bool, String)> {
+    let clean_session = match clean_session {
+        Some(v) => v
+            .parse::<bool>()
+            .context("MQTT_CLEAN_SESSION must be a valid bool")?,
+        None => true,
+    };
+    if clean_session {
+        client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
+    }
+    Ok((clean_session, client_id))
+}
 
 fn strip_prefixed(
     vars: impl Iterator<Item = (String, String)>,
@@ -346,6 +362,35 @@ mod tests {
     #[test]
     fn output_source_kind_parse_rejects_empty_value() {
         assert!(OutputSinkKind::parse("").is_err());
+    }
+
+    #[test]
+    fn mqtt_session_unset_defaults_to_clean_with_suffixed_client_id() -> Result<()> {
+        let (clean_session, client_id) = mqtt_session(None, "ingest".to_string())?;
+
+        assert!(clean_session);
+        let suffix = client_id
+            .strip_prefix("ingest-")
+            .context("client id must be suffixed")?;
+        assert!(suffix.parse::<i64>().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn mqtt_session_false_uses_client_id_verbatim() -> Result<()> {
+        let (clean_session, client_id) =
+            mqtt_session(Some("false".to_string()), "ingest".to_string())?;
+
+        assert!(!clean_session);
+        assert_eq!(client_id, "ingest");
+        Ok(())
+    }
+
+    #[test]
+    fn mqtt_session_invalid_value_returns_error() {
+        let result = mqtt_session(Some("nope".to_string()), "ingest".to_string());
+
+        assert!(result.is_err());
     }
 
     #[test]

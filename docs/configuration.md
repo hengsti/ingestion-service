@@ -18,7 +18,8 @@ The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT
 |---|---:|---|---|
 | `MQTT_HOST` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker host |
 | `MQTT_PORT` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker port as `u16` |
-| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Base client id. The service appends `-<unix_timestamp>` at startup |
+| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Base client id. The service appends `-<unix_timestamp>` at startup only when `MQTT_CLEAN_SESSION=true`; otherwise it is used verbatim |
+| `MQTT_CLEAN_SESSION` | No | `true` | Boolean. `false` requests a persistent session: the client id is used verbatim and the broker queues QoS 1 messages while ingest is offline |
 | `MQTT_USERNAME` | No | None | Optional MQTT username |
 | `MQTT_PASSWORD` | No | None | Optional MQTT password |
 | `MQTT_TOPIC_SENSOR` | Expected | None | Sensor subscription and route, for example `smarthome/+/sensor` |
@@ -27,6 +28,10 @@ The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT
 | `ENFORCE_TOPIC_DEVICE_MATCH` | Yes | None | Boolean. When `true`, payload `device_id` must match the device id extracted from the topic |
 
 At least one `MQTT_TOPIC_<NAME>` variable must be set for config parsing. `MQTT_TOPIC_DLQ` is required later during startup because the DLQ stage needs a publish topic.
+
+With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
+
+A persistent session also keeps its subscriptions on the broker. The service subscribes to the current `MQTT_TOPIC_*` filters on every connect but never unsubscribes. If you remove or change a topic filter, the old subscription stays active, and its messages have no route, so they go to the DLQ. When you change topic filters, also change `MQTT_CLIENT_ID` (for example `smarthome-ingest-v2`) to start a fresh session. The broker discards the old session after its session expiry.
 
 Unknown `MQTT_TOPIC_*` keys are not routed. They are still subscribed if they do not end in `DLQ`, so avoid unknown topic keys in production.
 
