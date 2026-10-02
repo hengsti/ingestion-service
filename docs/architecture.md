@@ -40,7 +40,7 @@ Input ingestion is decoupled behind a `Source` abstraction (`src/infrastructure/
 - **`Source` trait** — owns a transport's connect/subscribe/event-loop and pushes decoded `IngestJob`s into a shared `IngestDispatcher`. `run` takes `self: Box<Self>` and a cloned shutdown `watch::Receiver<bool>`, matching the shutdown pattern already used by workers.
 - **`DlqPublisher` trait** — abstracts "publish a rejected message back out". It is coupled 1:1 with the active `Source`: `build_source()` returns both from one factory call, matched on `Config::input_source`.
 - **`IngestDispatcher`** — round-robins `IngestJob`s across the worker pool's per-worker bounded channels. It is handed to `Source::run` by value so a source never needs to know about worker count or pool internals, and there is no extra channel hop between the source and the workers.
-- **`MqttSource` / `MqttDlqPublisher`** (`src/infrastructure/source/mqtt.rs`) — the only implementation today. `MqttSource` holds just the `rumqttc::EventLoop` and a readiness flag; the `AsyncClient` handle used for subscribing is cloned into `MqttDlqPublisher` and the original handle dropped, since the event loop owns the actual network connection independent of client handle count.
+- **`MqttSource` / `MqttDlqPublisher`** (`src/infrastructure/source/mqtt.rs`) — the only implementation today. `MqttSource` holds the `rumqttc::EventLoop`, an `AsyncClient` handle for subscribing, the topic list, and a readiness flag; another `AsyncClient` clone goes to `MqttDlqPublisher`. On a poll error the source sets readiness to `false`, logs a warning, waits 1 s (still honouring shutdown), and polls again so `rumqttc` reconnects — it never exits on connection errors. It re-subscribes on **every** `ConnAck`, because brokers may report `session_present=true` without restoring subscriptions.
 
 `INPUT_SOURCE` (env var) selects which source `build_source()` constructs. Only `mqtt` is implemented; adding a future transport (e.g. Kafka) means adding an `InputSourceKind` variant plus a matching `Source`/`DlqPublisher` pair — `main.rs`'s wiring does not need to change, including topic/route configuration (see below).
 
@@ -52,7 +52,7 @@ Topic/route definitions are populated by whichever input source is active, the s
 
 `Router`/`Route`/`TopicPattern` only ever see the generic `topic_routes` map — they have no knowledge of environment variable naming or which source populated it. A future source (e.g. Kafka) would add its own conditional arm producing the same `topic_routes` shape from its own env var convention (e.g. `KAFKA_TOPIC_*`), with zero changes needed to `Router`, `build_router`, or any pipeline stage.
 
-The MQTT source subscribes to every configured route except the `DLQ` key. The router only creates routes for `SENSOR` and `STATUS`. Avoid unknown non-DLQ `MQTT_TOPIC_*` keys unless you intentionally want to subscribe to topics that will not match a route.
+The MQTT source subscribes (on every `ConnAck`) to every configured route except the `DLQ` key. The router only creates routes for `SENSOR` and `STATUS`. Avoid unknown non-DLQ `MQTT_TOPIC_*` keys unless you intentionally want to subscribe to topics that will not match a route.
 
 Incoming messages are dispatched round-robin into per-worker bounded channels via `IngestDispatcher`. Worker count is based on available CPU parallelism and clamped to 2 through 8.
 
@@ -152,4 +152,4 @@ On Ctrl+C, HTTP task failure, or a fatal input source error, the service:
 4. Waits up to 5 seconds for the forwarder to drain its final batch.
 5. Aborts the forwarder if it cannot drain in time.
 
-This avoids intentionally dropping queued messages during normal shutdown, but it is still bounded by the 5 second final forwarder drain timeout. A fatal input source error (e.g. broker unreachable) still exits the process non-zero, but only after this drain sequence runs — it flows through the same shutdown path as Ctrl+C rather than exiting immediately.
+This avoids intentionally dropping queued messages during normal shutdown, but it is still bounded by the 5 second final forwarder drain timeout. Broker connection errors are not fatal — the MQTT source reconnects instead (see [Input Source](#input-source)). Any other fatal input source error still exits the process non-zero, but only after this drain sequence runs — it flows through the same shutdown path as Ctrl+C rather than exiting immediately.
