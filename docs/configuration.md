@@ -31,6 +31,8 @@ At least one `MQTT_TOPIC_<NAME>` variable must be set for config parsing. `MQTT_
 
 With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
 
+A persistent session also keeps its subscriptions on the broker. The service subscribes to the current `MQTT_TOPIC_*` filters on every connect but never unsubscribes. If you remove or change a topic filter, the old subscription stays active, and its messages have no route, so they go to the DLQ. When you change topic filters, also change `MQTT_CLIENT_ID` (for example `smarthome-ingest-v2`) to start a fresh session. The broker discards the old session after its session expiry.
+
 Unknown `MQTT_TOPIC_*` keys are not routed. They are still subscribed if they do not end in `DLQ`, so avoid unknown topic keys in production.
 
 ## InfluxDB
