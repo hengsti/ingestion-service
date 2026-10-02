@@ -22,7 +22,7 @@ Returns:
 | `200` | Active input source is ready (`ConnAck` for the current MQTT source) |
 | `503` | Active input source is not ready |
 
-With the current MQTT source, readiness flips to `200` after `ConnAck`. If event-loop polling fails, the main task exits with context `MQTT poll failed`.
+With the current MQTT source, readiness flips to `200` after `ConnAck`. If the connection fails (e.g. broker restart), readiness returns `503` while the source retries every second; the process does not exit.
 
 ### `GET /v1/state`
 
