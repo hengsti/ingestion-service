@@ -160,4 +160,4 @@ curl -i http://localhost:8085/readyz
 curl http://localhost:9090/metrics
 ```
 
-`/healthz` returns `200` when the HTTP server is alive. `/readyz` returns `200` after the current MQTT source has acknowledged the connection and `503` before that.
+`/healthz` returns `200` when the HTTP server is alive. `/readyz` returns `200` after the broker has acknowledged the current MQTT source's topic subscription and `503` before that.

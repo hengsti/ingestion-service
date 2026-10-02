@@ -56,7 +56,7 @@ curl -i http://localhost:8085/readyz
 Interpretation:
 
 - `/healthz` validates the HTTP server process.
-- `/readyz` validates active input-source readiness (`ConnAck` for the current MQTT source).
+- `/readyz` validates active input-source readiness (successful `SubAck` for the current MQTT source).
 
 ## Check Cache State
 
