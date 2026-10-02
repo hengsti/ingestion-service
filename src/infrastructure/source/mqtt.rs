@@ -178,6 +178,7 @@ pub async fn build(
 
     let mut mqttoptions = MqttOptions::new(&mqtt_cfg.client_id, &mqtt_cfg.host, mqtt_cfg.port);
     mqttoptions.set_keep_alive(Duration::from_secs(30));
+    mqttoptions.set_clean_session(mqtt_cfg.clean_session);
 
     if let (Some(username), Some(password)) = (&mqtt_cfg.username, &mqtt_cfg.password) {
         mqttoptions.set_credentials(username, password);
