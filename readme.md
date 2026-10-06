@@ -152,7 +152,7 @@ Generate local Rust API docs:
 cargo doc --all-features --no-deps
 ```
 
-CI runs formatting, clippy, and tests on Rust `1.87.0`.
+CI runs formatting, clippy, and tests on Rust `1.87.0`. The Docker image builds with the same toolchain (`rust:1.87.0-bookworm`) and `--locked`.
 
 ## License
 
