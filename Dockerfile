@@ -1,9 +1,9 @@
-FROM rust:1-bookworm AS build
+FROM rust:1.87.0-bookworm AS build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY schema ./schema
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/* \
