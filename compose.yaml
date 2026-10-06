@@ -1,0 +1,49 @@
+# Env contract: docs/configuration.md (checked against src/config.rs in CI).
+services:
+  ingest:
+    image: ghcr.io/${GHCR_OWNER:-hengsti}/ingestion-service:${INGEST_TAG:?set INGEST_TAG (release tag or sha-<commit>)}
+    container_name: ingest
+    restart: unless-stopped
+    expose:
+      - "8085"
+    volumes:
+      - wal:/data/wal # must match WAL_DIR
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Input: MQTT
+      INPUT_SOURCE: mqtt
+      MQTT_HOST: ${MQTT_HOST:-emqx}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_CLIENT_ID: smarthome-ingest
+      # Broker keeps QoS 1 messages while ingest is down; requires a unique MQTT_CLIENT_ID.
+      MQTT_CLEAN_SESSION: "false"
+      # Optional; passed through from the host environment only when set.
+      MQTT_USERNAME:
+      MQTT_PASSWORD:
+      MQTT_TOPIC_SENSOR: smarthome/+/bme680
+      MQTT_TOPIC_STATUS: smarthome/+/status
+      MQTT_TOPIC_DLQ: smarthome/_dlq/ingest
+      ENFORCE_TOPIC_DEVICE_MATCH: "true"
+      INPUT_QUEUE_CAPACITY: "1000000"
+
+      # Output: InfluxDB
+      OUTPUT_SINK: influx
+      INFLUX_URL: ${INFLUX_URL:-http://influxdb:8086}
+      INFLUX_ORG: ${INFLUX_ORG:-smarthome}
+      INFLUX_BUCKET: ${INFLUX_BUCKET:-sensors}
+      INFLUX_TOKEN: ${INFLUX_TOKEN:?set INFLUX_TOKEN (InfluxDB write token)}
+      BATCH_SIZE: "500"
+      FLUSH_INTERVAL_MS: "10000"
+
+      # Write-ahead log
+      WAL_DIR: /data/wal
+
+      # HTTP: cache API (/healthz, /readyz) and Prometheus metrics
+      CACHE_BIND: 0.0.0.0:8085
+      CACHE_TTL_MS: "30000"
+      CACHE_BUFFER: "10"
+      METRICS_BIND: 0.0.0.0:9090
+
+volumes:
+  wal:
