@@ -2,8 +2,9 @@
 
 ## CI - runs automatically
 
-Every push and pull request to `master` runs formatting, clippy, and tests.
-No action required.
+Every push and pull request to `master` runs formatting, clippy, and tests. It also
+validates `compose.yaml` with `docker compose config` and checks its environment against
+`src/config.rs`. No action required.
 
 ## CD - runs only when you trigger it
 
