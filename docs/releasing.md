@@ -11,12 +11,15 @@ validates `compose.yaml` with `docker compose config` and checks its environment
 ### Release a new version (recommended)
 
 1. Ensure master is in the desired state and CI is green.
-2. Tag the commit with a SemVer version:
+2. Bump `version` in `Cargo.toml` (e.g. `1.2.3`), run `cargo check` to update `Cargo.lock`,
+   and commit both files.
+3. Tag that commit with the same version, prefixed with `v`:
    ```bash
    git tag v1.2.3
    git push origin v1.2.3
    ```
-3. The `cd.yaml` workflow starts automatically:
+4. The `cd.yaml` workflow starts automatically:
+   - Fails if the tag does not match the `Cargo.toml` version
    - Builds and pushes the Docker image tagged `:v1.2.3` and `:latest`
    - Deploys the new image to the self-hosted runner
 
