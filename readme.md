@@ -86,6 +86,8 @@ A complete walkthrough is available in [docs/tutorial.md](docs/tutorial.md).
 
 ## Docker
 
+For Docker Compose (standalone or in the Server stack), use [`compose.yaml`](compose.yaml). See [docs/operations.md](docs/operations.md#run-with-docker-compose).
+
 The Docker image healthcheck probes `http://localhost:8085/healthz`, so set `CACHE_BIND=0.0.0.0:8085` when running the container.
 
 ```bash
