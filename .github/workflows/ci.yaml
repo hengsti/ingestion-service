@@ -42,3 +42,38 @@ jobs:
       - name: Run tests
         run: cargo test --all-features --locked
 
+  compose:
+    name: Validate compose.yaml
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Render compose.yaml
+        env:
+          INGEST_TAG: ci
+          INFLUX_TOKEN: ci
+        run: docker compose -f compose.yaml config --quiet
+
+      - name: Check env contract against src/config.rs
+        env:
+          INGEST_TAG: ci
+          INFLUX_TOKEN: ci
+        shell: bash
+        run: |
+          compose_keys=$(docker compose -f compose.yaml config --format json \
+            | jq -r '.services.ingest.environment | keys[]' | sort -u)
+          code_keys=$(grep -oE 'env_var\("[A-Z_]+"\)' src/config.rs \
+            | sed -E 's/env_var\("([A-Z_]+)"\)/\1/' | sort -u)
+          # RUST_LOG is read by tracing, MQTT_TOPIC_* by prefix scan.
+          unread=$(comm -23 <(echo "$compose_keys") <(echo "$code_keys") \
+            | grep -vE '^(RUST_LOG|MQTT_TOPIC_[A-Z_]+)$' || true)
+          # Optional variables with code defaults may be omitted.
+          missing=$(comm -13 <(echo "$compose_keys") <(echo "$code_keys") \
+            | grep -vxE 'WAL_SEGMENT_BYTES|WAL_QUEUE_CAPACITY' || true)
+          if [[ -n "$unread$missing" ]]; then
+            echo "::error file=compose.yaml::env drift. Unread by src/config.rs: [${unread//$'\n'/ }]. Missing from compose.yaml: [${missing//$'\n'/ }]"
+            exit 1
+          fi
+
