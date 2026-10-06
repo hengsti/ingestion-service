@@ -6,13 +6,18 @@
 
 ### Standalone
 
-The defaults expect the brokers on the same Compose network (`emqx`, `influxdb`). Point them elsewhere with variables, for example in a `.env` next to `compose.yaml` (do not commit it):
+`compose.yaml` has no fallback values. Create a `.env` next to it (git-ignored, never commit it) with every required variable; Compose fails with an error naming any missing one:
 
 ```bash
+GHCR_OWNER=<github-owner>
 INGEST_TAG=v1.2.3
-INFLUX_TOKEN=change-me
-MQTT_HOST=host.docker.internal
-INFLUX_URL=http://host.docker.internal:8086
+RUST_LOG=info
+MQTT_HOST=<broker-host>
+MQTT_PORT=1883
+INFLUX_URL=http://<influx-host>:8086
+INFLUX_ORG=<org>
+INFLUX_BUCKET=<bucket>
+INFLUX_TOKEN=<write-token>
 ```
 
 ```bash
@@ -36,7 +41,7 @@ include:
     env_file: ./.env
 ```
 
-- The stack `.env` provides `GHCR_OWNER`, `INGEST_TAG` (rewritten by CD) and `INFLUX_TOKEN`. The same token is used by `influxdb` and `grafana`. Rotate it if it was ever committed.
+- The stack `.env` provides all required variables listed in [Configuration](configuration.md#docker-compose), including `INGEST_TAG` (rewritten by CD). The same token is used by `influxdb` and `grafana`. Rotate it if it was ever committed.
 - `ingest.override.yaml` in the stack holds the stack-only wiring: `depends_on` (`influxdb` healthy, `emqx` healthy) and the Traefik labels (`ingest.smarthome.local` and `/ingest` with strip-prefix; the HomeKit bridge uses `/ingest/v1/stream`).
 - The stack file must not define an `ingest` service or a `wal` volume itself. The included `wal` key keeps the existing `<project>_wal` volume, so unforwarded WAL data survives the switch.
 - CD runs `docker compose pull ingest` and `docker compose up -d --no-deps ingest` in `DEPLOY_PATH`. This works unchanged through the include.
