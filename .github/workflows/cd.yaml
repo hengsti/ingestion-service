@@ -37,6 +37,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Check tag matches Cargo.toml version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version=$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error file=Cargo.toml::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}. Bump the version, commit, and re-tag."
+            exit 1
+          fi
+
       - name: Compute image tag
         id: vars
         shell: bash
