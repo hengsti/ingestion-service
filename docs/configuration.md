@@ -105,19 +105,19 @@ When the sensor cache is full and a new device arrives, the stalest cached devic
 
 ## Docker Compose
 
-[`compose.yaml`](../compose.yaml) in the repository root defines the `ingest` service with the full environment contract above. The values match the Server stack. Only the variables below are read from the Compose environment (shell or `.env`); change other values with an override file.
+[`compose.yaml`](../compose.yaml) in the repository root defines the `ingest` service with the full environment contract above. Only the variables below are read from the Compose environment (shell or the project root `.env`, which is git-ignored); change other values with an override file. The file has no fallback values: `docker compose` fails with an error naming the variable if a required one is missing.
 
-| Variable | Required | Default | Used for |
-|---|---:|---|---|
-| `INGEST_TAG` | Yes | None | Image tag: a release tag (`v1.2.3`) or `sha-<12hex>`. CD rewrites it in the stack `.env` |
-| `GHCR_OWNER` | No | `hengsti` | Image owner in `ghcr.io/<owner>/ingestion-service` |
-| `INFLUX_TOKEN` | Yes | None | Passed to the container. Never commit it; keep it in `.env` |
-| `MQTT_HOST` | No | `emqx` | Stack broker hostname |
-| `MQTT_PORT` | No | `1883` | |
-| `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Unset | Passed to the container only when set |
-| `INFLUX_URL` | No | `http://influxdb:8086` | Stack InfluxDB hostname |
-| `INFLUX_ORG` / `INFLUX_BUCKET` | No | `smarthome` / `sensors` | |
-| `RUST_LOG` | No | `info` | |
+| Variable | Required | Used for |
+|---|---:|---|
+| `INGEST_TAG` | Yes | Image tag: a release tag (`v1.2.3`) or `sha-<12hex>`. CD rewrites it in the stack `.env` |
+| `GHCR_OWNER` | Yes | Image owner in `ghcr.io/<owner>/ingestion-service` |
+| `INFLUX_TOKEN` | Yes | Passed to the container. Never commit it |
+| `MQTT_HOST` | Yes | Broker hostname |
+| `MQTT_PORT` | Yes | Broker port |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Passed to the container only when set |
+| `INFLUX_URL` | Yes | InfluxDB URL |
+| `INFLUX_ORG` / `INFLUX_BUCKET` | Yes | |
+| `RUST_LOG` | Yes | Log filter, e.g. `info` |
 
 `WAL_DIR` is `/data/wal`, and the `wal` named volume is mounted at that path. Keep the two in sync. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set, so the code defaults apply. The image `HEALTHCHECK` is used as-is.
 
