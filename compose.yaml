@@ -1,7 +1,8 @@
 # Env contract: docs/configuration.md (checked against src/config.rs in CI).
+# All ${VAR} values must be set in the project root .env (never committed).
 services:
   ingest:
-    image: ghcr.io/${GHCR_OWNER:-hengsti}/ingestion-service:${INGEST_TAG:?set INGEST_TAG (release tag or sha-<commit>)}
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER (image owner)}/ingestion-service:${INGEST_TAG:?set INGEST_TAG (release tag or sha-<commit>)}
     container_name: ingest
     restart: unless-stopped
     expose:
@@ -9,12 +10,12 @@ services:
     volumes:
       - wal:/data/wal # must match WAL_DIR
     environment:
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: ${RUST_LOG:?set RUST_LOG (e.g. info)}
 
       # Input: MQTT
       INPUT_SOURCE: mqtt
-      MQTT_HOST: ${MQTT_HOST:-emqx}
-      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_HOST: ${MQTT_HOST:?set MQTT_HOST (broker hostname)}
+      MQTT_PORT: ${MQTT_PORT:?set MQTT_PORT (broker port)}
       MQTT_CLIENT_ID: smarthome-ingest
       # Broker keeps QoS 1 messages while ingest is down; requires a unique MQTT_CLIENT_ID.
       MQTT_CLEAN_SESSION: "false"
@@ -29,9 +30,9 @@ services:
 
       # Output: InfluxDB
       OUTPUT_SINK: influx
-      INFLUX_URL: ${INFLUX_URL:-http://influxdb:8086}
-      INFLUX_ORG: ${INFLUX_ORG:-smarthome}
-      INFLUX_BUCKET: ${INFLUX_BUCKET:-sensors}
+      INFLUX_URL: ${INFLUX_URL:?set INFLUX_URL (http:// or https://)}
+      INFLUX_ORG: ${INFLUX_ORG:?set INFLUX_ORG}
+      INFLUX_BUCKET: ${INFLUX_BUCKET:?set INFLUX_BUCKET}
       INFLUX_TOKEN: ${INFLUX_TOKEN:?set INFLUX_TOKEN (InfluxDB write token)}
       BATCH_SIZE: "500"
       FLUSH_INTERVAL_MS: "10000"
