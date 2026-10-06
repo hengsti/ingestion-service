@@ -103,6 +103,28 @@ The service divides `INPUT_QUEUE_CAPACITY` by worker count to create one bounded
 
 When the sensor cache is full and a new device arrives, the stalest cached device is evicted.
 
+## Docker Compose
+
+[`compose.yaml`](../compose.yaml) in the repository root defines the `ingest` service with the full environment contract above. The values match the Server stack. Only the variables below are read from the Compose environment (shell or `.env`); change other values with an override file.
+
+| Variable | Required | Default | Used for |
+|---|---:|---|---|
+| `INGEST_TAG` | Yes | None | Image tag: a release tag (`v1.2.3`) or `sha-<12hex>`. CD rewrites it in the stack `.env` |
+| `GHCR_OWNER` | No | `hengsti` | Image owner in `ghcr.io/<owner>/ingestion-service` |
+| `INFLUX_TOKEN` | Yes | None | Passed to the container. Never commit it; keep it in `.env` |
+| `MQTT_HOST` | No | `emqx` | Stack broker hostname |
+| `MQTT_PORT` | No | `1883` | |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Unset | Passed to the container only when set |
+| `INFLUX_URL` | No | `http://influxdb:8086` | Stack InfluxDB hostname |
+| `INFLUX_ORG` / `INFLUX_BUCKET` | No | `smarthome` / `sensors` | |
+| `RUST_LOG` | No | `info` | |
+
+`WAL_DIR` is `/data/wal`, and the `wal` named volume is mounted at that path. Keep the two in sync. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set, so the code defaults apply. The image `HEALTHCHECK` is used as-is.
+
+CI renders the file with `docker compose config` and compares its `environment` keys with the variables read in `src/config.rs`. A variable that the code does not read, or a missing required variable, fails the build. Update `compose.yaml`, `src/config.rs`, and this page together.
+
+See [Operations](operations.md#run-with-docker-compose) for standalone use and inclusion in the Server stack.
+
 ## Logging
 
 The Docker image sets:
