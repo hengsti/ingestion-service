@@ -45,21 +45,25 @@ jobs:
   compose:
     name: Validate compose.yaml
     runs-on: ubuntu-latest
+    env:
+      GHCR_OWNER: ci
+      INGEST_TAG: ci
+      RUST_LOG: info
+      MQTT_HOST: ci
+      MQTT_PORT: "1883"
+      INFLUX_URL: http://ci:8086
+      INFLUX_ORG: ci
+      INFLUX_BUCKET: ci
+      INFLUX_TOKEN: ci
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
       - name: Render compose.yaml
-        env:
-          INGEST_TAG: ci
-          INFLUX_TOKEN: ci
         run: docker compose -f compose.yaml config --quiet
 
       - name: Check env contract against src/config.rs
-        env:
-          INGEST_TAG: ci
-          INFLUX_TOKEN: ci
         shell: bash
         run: |
           compose_keys=$(docker compose -f compose.yaml config --format json \
