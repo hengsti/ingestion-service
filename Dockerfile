@@ -7,7 +7,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/* \
-    && adduser --disabled-password --gecos '' appuser
+    && adduser --disabled-password --gecos '' appuser \
+    && mkdir -p /data/wal && chown appuser:appuser /data/wal
 WORKDIR /app
 COPY --from=build /app/target/release/smarthome-ingest /app/smarthome-ingest
 ENV RUST_LOG=info
