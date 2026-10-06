@@ -1,5 +1,48 @@
 # Operations Guide
 
+## Run with Docker Compose
+
+[`compose.yaml`](../compose.yaml) is the service definition used in production. Variables are listed in [Configuration](configuration.md#docker-compose).
+
+### Standalone
+
+The defaults expect the brokers on the same Compose network (`emqx`, `influxdb`). Point them elsewhere with variables, for example in a `.env` next to `compose.yaml` (do not commit it):
+
+```bash
+INGEST_TAG=v1.2.3
+INFLUX_TOKEN=change-me
+MQTT_HOST=host.docker.internal
+INFLUX_URL=http://host.docker.internal:8086
+```
+
+```bash
+docker compose -f compose.yaml config --quiet   # validate
+docker compose -f compose.yaml up -d
+docker compose -f compose.yaml exec ingest wget -qO- http://localhost:8085/readyz
+```
+
+The service only uses `expose`, so nothing is published on the host. To reach the API from the host, add an override file with `ports`.
+
+### Inside the Server stack
+
+The Server stack (`DEPLOY_PATH`) checks out this repository as `./smarthome-ingest` and includes it. Requires Docker Compose 2.24 or later.
+
+```yaml
+# docker-compose.yaml (stack)
+include:
+  - path:
+      - ./smarthome-ingest/compose.yaml
+      - ./ingest.override.yaml
+    env_file: ./.env
+```
+
+- The stack `.env` provides `GHCR_OWNER`, `INGEST_TAG` (rewritten by CD) and `INFLUX_TOKEN`. The same token is used by `influxdb` and `grafana`. Rotate it if it was ever committed.
+- `ingest.override.yaml` in the stack holds the stack-only wiring: `depends_on` (`influxdb` healthy, `emqx` healthy) and the Traefik labels (`ingest.smarthome.local` and `/ingest` with strip-prefix; the HomeKit bridge uses `/ingest/v1/stream`).
+- The stack file must not define an `ingest` service or a `wal` volume itself. The included `wal` key keeps the existing `<project>_wal` volume, so unforwarded WAL data survives the switch.
+- CD runs `docker compose pull ingest` and `docker compose up -d --no-deps ingest` in `DEPLOY_PATH`. This works unchanged through the include.
+
+Check the effective service with `docker compose config ingest` in `DEPLOY_PATH`.
+
 ## Run with Docker
 
 Build:
