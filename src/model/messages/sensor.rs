@@ -9,6 +9,14 @@ pub struct SensorMessage {
     pub time_ms: i64,
     pub time_iso: String,
     pub time_valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmed_up: Option<bool>,
+    #[serde(default)]
+    pub replayed: bool,
     pub data: SensorData,
 }
 
