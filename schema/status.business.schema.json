@@ -37,6 +37,24 @@
         "ssid": {
           "type": "string",
           "description": "Connected WiFi SSID"
+        },
+        "queued": {
+          "type": "integer"
+        },
+        "dropped_total": {
+          "type": "integer"
+        },
+        "samples_failed_total": {
+          "type": "integer"
+        },
+        "mqtt_connects_total": {
+          "type": "integer"
+        },
+        "sensor_read_failures_total": {
+          "type": "integer"
+        },
+        "reset_reason": {
+          "type": "string"
         }
       },
       "required": [
