@@ -139,6 +139,10 @@ mod tests {
             time_ms: last_seen_override_ms.unwrap_or(0) as i64,
             time_iso: "2024-01-01T00:00:00Z".to_string(),
             time_valid: true,
+            boot_id: None,
+            seq: None,
+            warmed_up: None,
+            replayed: false,
             data: SensorData {
                 temp_c: 20.0,
                 rel_hum_perc: 50.0,
