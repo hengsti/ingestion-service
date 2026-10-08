@@ -110,6 +110,12 @@ mod tests {
             uptime: 3600,
             free_mem: 200_000,
             ssid: "HomeNet".to_string(),
+            queued: None,
+            dropped_total: None,
+            samples_failed_total: None,
+            mqtt_connects_total: None,
+            sensor_read_failures_total: None,
+            reset_reason: None,
         })
     }
 
