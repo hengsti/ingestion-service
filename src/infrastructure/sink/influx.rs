@@ -214,6 +214,25 @@ pub fn status_to_point(msg: &StatusMessage) -> Point {
         .field_str("ssid", &msg.ssid)
         .field_i64("rssi", msg.rssi);
 
+    if let Some(queued) = msg.queued {
+        b = b.field_i64("queued", queued);
+    }
+    if let Some(dropped_total) = msg.dropped_total {
+        b = b.field_i64("dropped_total", dropped_total);
+    }
+    if let Some(samples_failed_total) = msg.samples_failed_total {
+        b = b.field_i64("samples_failed_total", samples_failed_total);
+    }
+    if let Some(mqtt_connects_total) = msg.mqtt_connects_total {
+        b = b.field_i64("mqtt_connects_total", mqtt_connects_total);
+    }
+    if let Some(sensor_read_failures_total) = msg.sensor_read_failures_total {
+        b = b.field_i64("sensor_read_failures_total", sensor_read_failures_total);
+    }
+    if let Some(reset_reason) = &msg.reset_reason {
+        b = b.field_str("reset_reason", reset_reason);
+    }
+
     if msg.time_valid && msg.time_ms > 0 {
         b = b.timestamp_ms(msg.time_ms);
     }
