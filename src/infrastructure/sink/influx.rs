@@ -180,6 +180,19 @@ pub fn sensor_to_point(msg: &SensorMessage) -> Point {
         .field_f64("altitude_m", msg.data.altitude_m)
         .field_bool("time_valid", msg.time_valid);
 
+    if let Some(boot_id) = msg.boot_id {
+        b = b.field_u64("boot_id", u64::from(boot_id));
+    }
+    if let Some(seq) = msg.seq {
+        b = b.field_u64("seq", u64::from(seq));
+    }
+    if let Some(warmed_up) = msg.warmed_up {
+        b = b.field_bool("warmed_up", warmed_up);
+    }
+    if msg.replayed {
+        b = b.field_bool("replayed", true);
+    }
+
     // Use the device timestamp only when it is marked valid and non-zero.
     if msg.time_valid && msg.time_ms > 0 {
         b = b.timestamp_ms(msg.time_ms);
