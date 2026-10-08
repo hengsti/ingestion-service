@@ -12,6 +12,22 @@
           "type": "string",
           "description": "Room where the device is located"
         },
+        "boot_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "warmed_up": {
+          "type": "boolean"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
         "data": {
           "type": "object",
           "properties": {
