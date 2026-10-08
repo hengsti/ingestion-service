@@ -118,6 +118,17 @@ The raw schema defines `uptime`, `free_mem`, and `ssid`, but does not require th
 | `free_mem` | `0` |
 | `ssid` | `""` |
 
+Optional device health fields are retained when sent:
+
+| Field | Type | Notes |
+|---|---|---|
+| `queued` | integer | Readings waiting in the device queue |
+| `dropped_total` | integer | Readings dropped by the device |
+| `samples_failed_total` | integer | Publish failures |
+| `mqtt_connects_total` | integer | MQTT connections |
+| `sensor_read_failures_total` | integer | Sensor read failures |
+| `reset_reason` | string | Device reset reason |
+
 Example:
 
 ```json
@@ -204,6 +215,12 @@ Fields:
 - `free_mem`
 - `ssid`
 - `rssi`
+- `queued` (when present)
+- `dropped_total` (when present)
+- `samples_failed_total` (when present)
+- `mqtt_connects_total` (when present)
+- `sensor_read_failures_total` (when present)
+- `reset_reason` (when present)
 
 For both message types, `time_ms` is written as the InfluxDB timestamp only when `time_valid=true` and `time_ms > 0`. Otherwise the timestamp is omitted and InfluxDB uses server time.
 
