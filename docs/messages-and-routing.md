@@ -48,6 +48,15 @@ Required sensor fields:
 | `data.gas_ohm` | number | Gas resistance in Ohms |
 | `data.altitude_m` | number | Approximate altitude in meters |
 
+Optional sensor fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `boot_id` | unsigned 32-bit integer | Identifies the device boot for a reading |
+| `seq` | unsigned 32-bit integer | Reading sequence number within a boot |
+| `warmed_up` | boolean | `false` while gas and derived IAQ readings are unreliable |
+| `replayed` | boolean | `true` when the reading came from the offline buffer; defaults to `false` |
+
 Example:
 
 ```json
@@ -173,6 +182,10 @@ Fields:
 - `heat_index_c`
 - `altitude_m`
 - `time_valid`
+- `boot_id` (when present)
+- `seq` (when present)
+- `warmed_up` (when present)
+- `replayed` (when `true`)
 
 Status messages become measurement `device_status`.
 
