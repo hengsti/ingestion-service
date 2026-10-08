@@ -125,6 +125,74 @@ async fn valid_status_message_processes_end_to_end() {
         "expected a status line protocol, got: {:?}",
         event.payload
     );
+    for field in [
+        "queued=",
+        "dropped_total=",
+        "samples_failed_total=",
+        "mqtt_connects_total=",
+        "sensor_read_failures_total=",
+        "reset_reason=",
+    ] {
+        assert!(
+            !event.payload.contains(field),
+            "legacy status line must not contain {field}: {:?}",
+            event.payload
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_health_metadata_reaches_influx_fields() {
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&common::valid_status_payload("esp32-1")).unwrap();
+    payload["queued"] = serde_json::json!(0);
+    payload["dropped_total"] = serde_json::json!(2);
+    payload["samples_failed_total"] = serde_json::json!(3);
+    payload["mqtt_connects_total"] = serde_json::json!(4);
+    payload["sensor_read_failures_total"] = serde_json::json!(5);
+    payload["reset_reason"] = serde_json::json!("brownout");
+    let mut ctx = PipelineContext::new(
+        "smarthome/esp32-1/status",
+        serde_json::to_vec(&payload).unwrap(),
+    );
+
+    pipeline.run(&mut ctx).await;
+
+    assert!(
+        !ctx.should_publish_dlq(),
+        "expected no DLQ, got: {:?}",
+        ctx.dlq_reason()
+    );
+    let event = common::recv_event(&mut sub, 500)
+        .await
+        .expect("expected a status event in the WAL");
+    let (measurement_and_tags, fields_and_time) = event.payload.split_once(' ').unwrap();
+    assert!(measurement_and_tags.starts_with("device_status,"));
+    for field in [
+        "queued=0i",
+        "dropped_total=2i",
+        "samples_failed_total=3i",
+        "mqtt_connects_total=4i",
+        "sensor_read_failures_total=5i",
+        "reset_reason=\"brownout\"",
+    ] {
+        assert!(
+            fields_and_time.contains(field),
+            "status line missing {field}: {:?}",
+            event.payload
+        );
+    }
+    for tag in [
+        "queued=",
+        "dropped_total=",
+        "samples_failed_total=",
+        "mqtt_connects_total=",
+        "sensor_read_failures_total=",
+        "reset_reason=",
+    ] {
+        assert!(!measurement_and_tags.contains(tag), "{}", event.payload);
+    }
 }
 
 // ── failure paths → DLQ ──────────────────────────────────────────────────────
