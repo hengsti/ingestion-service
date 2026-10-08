@@ -44,11 +44,61 @@ async fn valid_sensor_message_processes_end_to_end() {
         "expected a sensor line protocol, got: {:?}",
         event.payload
     );
+    for field in ["boot_id=", "seq=", "warmed_up=", "replayed="] {
+        assert!(
+            !event.payload.contains(field),
+            "legacy sensor line must not contain {field}: {:?}",
+            event.payload
+        );
+    }
 
     assert!(
         cache.snapshot_sensor("esp32-1").is_some(),
         "sensor must be present in cache after processing"
     );
+}
+
+#[tokio::test]
+async fn sensor_reading_metadata_reaches_influx_fields() {
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&common::valid_sensor_payload("esp32-1")).unwrap();
+    payload["boot_id"] = serde_json::json!(u32::MAX);
+    payload["seq"] = serde_json::json!(42);
+    payload["warmed_up"] = serde_json::json!(false);
+    payload["replayed"] = serde_json::json!(true);
+    let mut ctx = PipelineContext::new(
+        "smarthome/esp32-1/sensor",
+        serde_json::to_vec(&payload).unwrap(),
+    );
+
+    pipeline.run(&mut ctx).await;
+
+    assert!(
+        !ctx.should_publish_dlq(),
+        "expected no DLQ, got: {:?}",
+        ctx.dlq_reason()
+    );
+    let event = common::recv_event(&mut sub, 500)
+        .await
+        .expect("expected a sensor event in the WAL");
+    assert!(event.payload.starts_with("bme680,"), "{}", event.payload);
+    let (measurement_and_tags, fields_and_time) = event.payload.split_once(' ').unwrap();
+    for field in [
+        "boot_id=4294967295u",
+        "seq=42u",
+        "warmed_up=false",
+        "replayed=true",
+    ] {
+        assert!(
+            fields_and_time.contains(field),
+            "sensor line missing {field}: {:?}",
+            event.payload
+        );
+    }
+    for tag in ["boot_id=", "seq=", "warmed_up=", "replayed="] {
+        assert!(!measurement_and_tags.contains(tag), "{}", event.payload);
+    }
 }
 
 #[tokio::test]

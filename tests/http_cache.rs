@@ -121,6 +121,10 @@ async fn list_state_returns_cached_sensor() {
         time_ms: 1_700_000_000_000,
         time_iso: "2023-11-14T22:13:20Z".to_string(),
         time_valid: true,
+        boot_id: None,
+        seq: None,
+        warmed_up: None,
+        replayed: false,
         data: smarthome_ingest::model::messages::sensor::SensorData {
             temp_c: 22.5,
             rel_hum_perc: 45.0,
