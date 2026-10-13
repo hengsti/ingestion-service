@@ -110,12 +110,12 @@ After transform, `schema/sensor.business.schema.json` requires the derived field
 
 | Index | `iaq_score` | `iaq_text` |
 |---|---|---|
-| `< 51` | `> 89.8` | `Air quality is Good` |
-| `51–150` | `69.8–89.8` | `Air quality is Moderate` |
-| `151–175` | `64.8–69.8` | `Air quality is Unhealthy for Sensitive Groups` |
-| `176–200` | `59.8–64.8` | `Air quality is Unhealthy` |
-| `201–300` | `39.8–59.8` | `Air quality is Very Unhealthy` |
-| `>= 301` | `<= 39.8` | `Air quality is Hazardous` |
+| `[0, 51)` | `(89.8, 100]` | `Air quality is Good` |
+| `[51, 151)` | `(69.8, 89.8]` | `Air quality is Moderate` |
+| `[151, 176)` | `(64.8, 69.8]` | `Air quality is Unhealthy for Sensitive Groups` |
+| `[176, 201)` | `(59.8, 64.8]` | `Air quality is Unhealthy` |
+| `[201, 301)` | `(39.8, 59.8]` | `Air quality is Very Unhealthy` |
+| `[301, 500]` | `[0, 39.8]` | `Air quality is Hazardous` |
 
 Gas readings are unreliable until the sensor has warmed up. When a sensor message has `warmed_up=false`, `iaq_score` is not written to InfluxDB.
 
