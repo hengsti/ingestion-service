@@ -86,8 +86,8 @@ The transform stage adds these fields under `data`:
 |---|---|---|
 | `dew_point_c` | number | Calculated from temperature and humidity |
 | `heat_index_c` | number | Calculated from temperature and humidity |
-| `iaq_score` | number | Calculated from gas resistance and humidity |
-| `iaq_text` | string | Human-readable air quality classification |
+| `iaq_score` | number | Calculated from gas resistance and humidity (see [IAQ Scale](#iaq-scale)) |
+| `iaq_text` | string | Human-readable air quality classification (see [IAQ Scale](#iaq-scale)) |
 
 Transform bounds:
 
@@ -98,6 +98,26 @@ Transform bounds:
 | `data.pressure_hpa` | `[300, 1200]` |
 
 After transform, `schema/sensor.business.schema.json` requires the derived fields and disallows additional properties in the canonical object sections.
+
+### IAQ Scale
+
+`iaq_score` ranges from `0` to `100`, and **higher is better**. This is not the BSEC convention (0–500, lower is better).
+
+- Humidity part, max `25`: full score at 38–42 %RH, decreasing linearly below and above that range.
+- Gas part, max `75`: linear between 5 kΩ (`0`) and 50 kΩ (`75`); `gas_ohm` is clamped to that range.
+
+`iaq_text` maps the score to a BSEC-style index `(100 - iaq_score) * 5` (0–500, lower is better):
+
+| Index | `iaq_score` | `iaq_text` |
+|---|---|---|
+| `< 51` | `> 89.8` | `Air quality is Good` |
+| `51–150` | `69.8–89.8` | `Air quality is Moderate` |
+| `151–175` | `64.8–69.8` | `Air quality is Unhealthy for Sensitive Groups` |
+| `176–200` | `59.8–64.8` | `Air quality is Unhealthy` |
+| `201–300` | `39.8–59.8` | `Air quality is Very Unhealthy` |
+| `>= 301` | `<= 39.8` | `Air quality is Hazardous` |
+
+Gas readings are unreliable until the sensor has warmed up. When a sensor message has `warmed_up=false`, `iaq_score` is not written to InfluxDB.
 
 ## Raw Status Message
 
@@ -179,19 +199,15 @@ Tags:
 - `device_id`
 - `room`
 - `device_class`
-- `fw_version`
 
 Fields:
 
+- `firmware_version`
 - `temp_c`
 - `rel_hum_perc`
 - `pressure_hpa`
 - `gas_ohm`
-- `iaq_score`
-- `iaq_text`
-- `dew_point_c`
-- `heat_index_c`
-- `altitude_m`
+- `iaq_score` (omitted when `warmed_up=false`)
 - `time_valid`
 - `boot_id` (when present)
 - `seq` (when present)
@@ -204,12 +220,11 @@ Tags:
 
 - `device_id`
 - `device_class`
-- `fw_version`
-- `ip`
 
 Fields:
 
-- `time_iso`
+- `firmware_version`
+- `ip_address`
 - `time_valid`
 - `uptime`
 - `free_mem`
@@ -223,6 +238,8 @@ Fields:
 - `reset_reason` (when present)
 
 For both message types, `time_ms` is written as the InfluxDB timestamp only when `time_valid=true` and `time_ms > 0`. Otherwise the timestamp is omitted and InfluxDB uses server time.
+
+`dew_point_c`, `heat_index_c`, `altitude_m`, `iaq_text`, and status `time_iso` are not written to InfluxDB; they stay available through the cache HTTP API. Firmware and IP use the field keys `firmware_version` and `ip_address` so they never collide with the historical `fw_version`/`ip` tags.
 
 ## DLQ Message
 
