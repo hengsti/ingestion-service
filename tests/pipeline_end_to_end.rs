@@ -60,6 +60,62 @@ async fn valid_sensor_message_processes_end_to_end() {
 }
 
 #[tokio::test]
+async fn derived_sensor_fields_reach_influx_with_warmup_suppression() {
+    for warmed_up in [None, Some(true), Some(false)] {
+        let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&common::valid_sensor_payload("esp32-1")).unwrap();
+        payload["data"]["temp_c"] = serde_json::json!(20.0);
+        payload["data"]["rel_hum_perc"] = serde_json::json!(50.0);
+        if let Some(warmed_up) = warmed_up {
+            payload["warmed_up"] = serde_json::json!(warmed_up);
+        }
+        let mut ctx = PipelineContext::new(
+            "smarthome/esp32-1/sensor",
+            serde_json::to_vec(&payload).unwrap(),
+        );
+
+        pipeline.run(&mut ctx).await;
+
+        assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
+        let event = common::recv_event(&mut sub, 500)
+            .await
+            .expect("expected a sensor event in the WAL");
+        let (measurement_and_tags, fields_and_time) = event.payload.split_once(' ').unwrap();
+        for (key, expected) in [("dew_point_c", 9.27), ("heat_index_c", 19.36)] {
+            let prefix = format!("{key}=");
+            let value: f64 = fields_and_time
+                .split(',')
+                .find_map(|field| field.strip_prefix(&prefix))
+                .unwrap_or_else(|| panic!("missing {key}: {}", event.payload))
+                .parse()
+                .unwrap();
+            assert!((value - expected).abs() < 0.05, "{key}={value}");
+        }
+        if warmed_up == Some(false) {
+            for key in ["iaq_score=", "iaq_text="] {
+                assert!(!fields_and_time.contains(key), "{}", event.payload);
+            }
+        } else {
+            // At 50 %RH and 50 kΩ: 20.83 humidity points + 75 gas points.
+            assert!(
+                fields_and_time.contains("iaq_score=95.83"),
+                "{}",
+                event.payload
+            );
+            assert!(
+                fields_and_time.contains("iaq_text=\"Air quality is Good\""),
+                "{}",
+                event.payload
+            );
+        }
+        for key in ["dew_point_c=", "heat_index_c=", "iaq_score=", "iaq_text="] {
+            assert!(!measurement_and_tags.contains(key), "{}", event.payload);
+        }
+    }
+}
+
+#[tokio::test]
 async fn sensor_reading_metadata_reaches_influx_fields() {
     let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
     let mut payload: serde_json::Value =
@@ -101,13 +157,7 @@ async fn sensor_reading_metadata_reaches_influx_fields() {
     for tag in ["boot_id=", "seq=", "warmed_up=", "replayed=", "fw_version="] {
         assert!(!measurement_and_tags.contains(tag), "{}", event.payload);
     }
-    for dropped in [
-        "iaq_score=",
-        "iaq_text=",
-        "dew_point_c=",
-        "heat_index_c=",
-        "altitude_m=",
-    ] {
+    for dropped in ["iaq_score=", "iaq_text=", "altitude_m="] {
         assert!(!event.payload.contains(dropped), "{}", event.payload);
     }
 }
