@@ -29,16 +29,17 @@ impl PipelineStage for ObserveStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            counter!("ingest_messages_processed_total").increment(1);
-
-            match ctx.handled_message()? {
+            let kind = match ctx.handled_message()? {
                 HandledMessage::Sensor(_) => {
                     counter!("ingest_sensor_messages_processed_total").increment(1);
+                    "sensor"
                 }
                 HandledMessage::Status(_) => {
                     counter!("ingest_status_messages_processed_total").increment(1);
+                    "status"
                 }
-            }
+            };
+            counter!("ingest_messages_processed_total", "kind" => kind).increment(1);
 
             histogram!("ingest_pipeline_duration_seconds")
                 .record(ctx.started_at().elapsed().as_secs_f64());

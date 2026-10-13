@@ -129,6 +129,10 @@ text/plain; version=0.0.4
 
 The metrics recorder runs upkeep every 10 seconds.
 
+All counters and the `wal_forwarder_retry_outage_active` gauge are registered with `0` at startup
+(labeled counters for every known `kind`/`reason` value), so a missing series means "not scraped",
+never "no failures". Histograms appear after their first observation.
+
 ## Important Metrics
 
 ### Input and Decode
@@ -168,7 +172,7 @@ The metrics recorder runs upkeep every 10 seconds.
 |---|---|---|---|
 | `ingest_cache_updates_total` | counter | `kind` | Cache stage processed message by kind |
 | `ingest_cache_update_duration_seconds` | histogram | `kind` | Cache stage duration |
-| `ingest_messages_enqueued_total` | counter | `kind` | Messages appended to the WAL |
+| `ingest_messages_enqueued_total` | counter | `kind` | Messages (sensor and status) durably appended to the WAL; compare per `kind` with `ingest_messages_processed_total` |
 | `ingest_queue_full_total` | counter | `kind` | WAL writer queue was full |
 | `ingest_queue_closed_total` | counter | `kind` | WAL writer queue was closed |
 | `ingest_durability_ack_failed_total` | counter | `kind` | WAL writer failed a durability acknowledgement |
@@ -181,7 +185,7 @@ The metrics recorder runs upkeep every 10 seconds.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `ingest_messages_processed_total` | counter | none | Full pipeline successes reaching observe |
+| `ingest_messages_processed_total` | counter | `kind` | Full pipeline successes reaching observe; same message set as `ingest_messages_enqueued_total` |
 | `ingest_sensor_messages_processed_total` | counter | none | Successful sensor messages |
 | `ingest_status_messages_processed_total` | counter | none | Successful status messages |
 | `ingest_pipeline_duration_seconds` | histogram | none | Total successful pipeline duration |
