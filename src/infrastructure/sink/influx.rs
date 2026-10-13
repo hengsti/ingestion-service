@@ -168,18 +168,16 @@ pub fn sensor_to_point(msg: &SensorMessage) -> Point {
         .tag("device_id", &msg.device_id)
         .tag("room", &msg.room)
         .tag("device_class", &msg.device_class)
-        .tag("fw_version", &msg.fw_version)
+        .field_str("firmware_version", &msg.fw_version)
         .field_f64("temp_c", msg.data.temp_c)
         .field_f64("rel_hum_perc", msg.data.rel_hum_perc)
         .field_f64("pressure_hpa", msg.data.pressure_hpa)
         .field_f64("gas_ohm", msg.data.gas_ohm)
-        .field_f64("iaq_score", msg.data.iaq_score)
-        .field_str("iaq_text", &msg.data.iaq_text)
-        .field_f64("dew_point_c", msg.data.dew_point_c)
-        .field_f64("heat_index_c", msg.data.heat_index_c)
-        .field_f64("altitude_m", msg.data.altitude_m)
         .field_bool("time_valid", msg.time_valid);
 
+    if msg.warmed_up != Some(false) {
+        b = b.field_f64("iaq_score", msg.data.iaq_score);
+    }
     if let Some(boot_id) = msg.boot_id {
         b = b.field_u64("boot_id", u64::from(boot_id));
     }
@@ -205,9 +203,8 @@ pub fn status_to_point(msg: &StatusMessage) -> Point {
     let mut b = Point::build("device_status")
         .tag("device_id", &msg.device_id)
         .tag("device_class", &msg.device_class)
-        .tag("fw_version", &msg.fw_version)
-        .tag("ip", &msg.ip)
-        .field_str("time_iso", &msg.time_iso)
+        .field_str("firmware_version", &msg.fw_version)
+        .field_str("ip_address", &msg.ip)
         .field_bool("time_valid", msg.time_valid)
         .field_i64("uptime", msg.uptime)
         .field_i64("free_mem", msg.free_mem)
