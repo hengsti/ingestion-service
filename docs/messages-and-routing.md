@@ -117,7 +117,7 @@ After transform, `schema/sensor.business.schema.json` requires the derived field
 | `[201, 301)` | `(39.8, 59.8]` | `Air quality is Very Unhealthy` |
 | `[301, 500]` | `[0, 39.8]` | `Air quality is Hazardous` |
 
-Gas readings are unreliable until the sensor has warmed up. When a sensor message has `warmed_up=false`, `iaq_score` is not written to InfluxDB.
+Gas readings are unreliable until the sensor has warmed up. When a sensor message has `warmed_up=false`, `iaq_score` and `iaq_text` are not written to InfluxDB. Both are written when `warmed_up=true` or the flag is absent (legacy messages). Dew point and heat index are written regardless of warm-up state.
 
 ## Raw Status Message
 
@@ -207,7 +207,10 @@ Fields:
 - `rel_hum_perc`
 - `pressure_hpa`
 - `gas_ohm`
+- `dew_point_c`
+- `heat_index_c`
 - `iaq_score` (omitted when `warmed_up=false`)
+- `iaq_text` (omitted when `warmed_up=false`)
 - `time_valid`
 - `boot_id` (when present)
 - `seq` (when present)
@@ -239,7 +242,7 @@ Fields:
 
 For both message types, `time_ms` is written as the InfluxDB timestamp only when `time_valid=true` and `time_ms > 0`. Otherwise the timestamp is omitted and InfluxDB uses server time.
 
-`dew_point_c`, `heat_index_c`, `altitude_m`, `iaq_text`, and status `time_iso` are not written to InfluxDB; they stay available through the cache HTTP API. Firmware and IP use the field keys `firmware_version` and `ip_address` so they never collide with the historical `fw_version`/`ip` tags.
+`altitude_m` and status `time_iso` are not written to InfluxDB; they stay available through the cache HTTP API. Firmware and IP use the field keys `firmware_version` and `ip_address` so they never collide with the historical `fw_version`/`ip` tags.
 
 ## DLQ Message
 
