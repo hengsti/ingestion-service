@@ -191,7 +191,7 @@ impl TransformStage {
         } else if rel_hum_perc < 38.0 {
             (0.25 / hum_ref) * rel_hum_perc * 100.0
         } else {
-            ((-0.25 / (100.0 - hum_ref) * rel_hum_perc) + 0.416666) * 100.0
+            0.25 / (100.0 - hum_ref) * (100.0 - rel_hum_perc) * 100.0
         };
 
         let gas_lower_limit = 5_000.0;
@@ -444,6 +444,12 @@ mod tests {
         // Gas at or below lower limit is clamped → gas_score = 0.
         let result = TransformStage::calc_iaq_score(5_000.0, 40.0);
         assert!((result - 25.0).abs() < 0.001, "got {result}");
+    }
+
+    #[test]
+    fn calc_iaq_score_is_0_at_max_humidity_and_min_gas() {
+        let result = TransformStage::calc_iaq_score(5_000.0, 100.0);
+        assert_eq!(result, 0.0);
     }
 
     #[test]

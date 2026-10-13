@@ -44,6 +44,7 @@ async fn valid_sensor_message_processes_end_to_end() {
         "expected a sensor line protocol, got: {:?}",
         event.payload
     );
+    assert!(event.payload.contains("iaq_score="), "{}", event.payload);
     for field in ["boot_id=", "seq=", "warmed_up=", "replayed="] {
         assert!(
             !event.payload.contains(field),
@@ -89,6 +90,7 @@ async fn sensor_reading_metadata_reaches_influx_fields() {
         "seq=42u",
         "warmed_up=false",
         "replayed=true",
+        "firmware_version=\"1.0.0\"",
     ] {
         assert!(
             fields_and_time.contains(field),
@@ -96,8 +98,17 @@ async fn sensor_reading_metadata_reaches_influx_fields() {
             event.payload
         );
     }
-    for tag in ["boot_id=", "seq=", "warmed_up=", "replayed="] {
+    for tag in ["boot_id=", "seq=", "warmed_up=", "replayed=", "fw_version="] {
         assert!(!measurement_and_tags.contains(tag), "{}", event.payload);
+    }
+    for dropped in [
+        "iaq_score=",
+        "iaq_text=",
+        "dew_point_c=",
+        "heat_index_c=",
+        "altitude_m=",
+    ] {
+        assert!(!event.payload.contains(dropped), "{}", event.payload);
     }
 }
 
@@ -176,6 +187,8 @@ async fn status_health_metadata_reaches_influx_fields() {
         "mqtt_connects_total=4i",
         "sensor_read_failures_total=5i",
         "reset_reason=\"brownout\"",
+        "firmware_version=",
+        "ip_address=",
     ] {
         assert!(
             fields_and_time.contains(field),
@@ -183,6 +196,7 @@ async fn status_health_metadata_reaches_influx_fields() {
             event.payload
         );
     }
+    assert!(!event.payload.contains("time_iso="), "{}", event.payload);
     for tag in [
         "queued=",
         "dropped_total=",
@@ -190,6 +204,8 @@ async fn status_health_metadata_reaches_influx_fields() {
         "mqtt_connects_total=",
         "sensor_read_failures_total=",
         "reset_reason=",
+        "fw_version=",
+        "ip=",
     ] {
         assert!(!measurement_and_tags.contains(tag), "{}", event.payload);
     }
