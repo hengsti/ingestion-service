@@ -875,6 +875,15 @@ mod tests {
     }
 
     #[test]
+    fn test_route_config_accepts_json_pointer_token_escaping() -> Result<()> {
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["fields"]["temp_c"]["pointer"] = json!("/payload/with~1slash/~0tilde");
+
+        assert!(load_value(&bundle).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn test_route_config_rejects_reserved_mapping_names() {
         let reserved = [
             "device_id",
