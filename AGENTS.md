@@ -68,10 +68,10 @@ dispatch does not guarantee per-device processing order across workers.
   `BufWriter::flush`, not `fsync`/power-loss durability. WAL records contain already
   encoded sink payloads, not raw input JSON; account for queued records when changing
   encoders, sink formats, or on-disk serialization.
-- **Replay and commit are coupled:** retryable sink errors retain the batch without
-  advancing the cursor. Success and permanent failures advance through `offset_after`;
-  permanent failures deliberately discard the batch. Retry cursor commits without
-  repeating an already-completed sink write. A crash before commit can replay writes:
+- **Replay and commit are coupled:** both retryable and permanent sink errors retain
+  the batch without advancing the cursor. Only successful sink writes advance through
+  `offset_after`. Retry cursor commits without repeating an already-completed sink
+  write. A crash before commit can replay writes:
   do not claim exactly-once or lossless end-to-end delivery.
 - **Overflow paths differ:** a full input worker queue drops the message before the
   pipeline, increments `ingest_event_queue_full_total`, and does not publish DLQ.
