@@ -78,8 +78,8 @@ fn build_body(batch: &[WalEvent]) -> String {
     body
 }
 
-fn http_write_error(status: StatusCode, body: &str) -> anyhow::Error {
-    anyhow::anyhow!("Influx write failed: status={} body={}", status, body)
+fn http_write_error(status: StatusCode) -> anyhow::Error {
+    anyhow::anyhow!("Influx write failed: status={}", status)
 }
 
 impl Sink for InfluxSink {
@@ -124,8 +124,7 @@ impl Sink for InfluxSink {
                     }
                     Ok(resp) if !resp.status().is_success() => {
                         let status = resp.status();
-                        let text = resp.text().await.unwrap_or_default();
-                        let err = http_write_error(status, &text);
+                        let err = http_write_error(status);
 
                         // 4xx are permanent (malformed line protocol) and must not
                         // be retried — except 408/429, which are transient.
@@ -291,10 +290,9 @@ mod tests {
     }
 
     #[test]
-    fn http_write_error_includes_status_and_body_context() {
-        let err = http_write_error(StatusCode::SERVICE_UNAVAILABLE, "outage");
+    fn http_write_error_reports_status_only() {
+        let err = http_write_error(StatusCode::SERVICE_UNAVAILABLE);
         let text = err.to_string();
-        assert!(text.contains("status=503 Service Unavailable"), "{text}");
-        assert!(text.contains("body=outage"), "{text}");
+        assert_eq!(text, "Influx write failed: status=503 Service Unavailable");
     }
 }

@@ -79,7 +79,6 @@ const COUNTERS: &[&str] = &[
     "influx_write_success_total",
     "influx_write_errors_total",
     "wal_forwarder_committed_total",
-    "wal_forwarder_drop_total",
     "wal_forwarder_retry_total",
     "wal_forwarder_commit_retry_total",
     "wal_subscription_corrupt_skipped_total",

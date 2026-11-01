@@ -284,12 +284,14 @@ async fn forwarder_drains_final_batch_and_terminates_when_wal_closes() {
 
 #[tokio::test]
 async fn forwarder_outage_retries_and_commits_only_after_recovery() {
-    // Simulate one transient outage window for a single sink.write call:
-    // 503, 503, then 204. InfluxSink retries these internally, so the forwarder
-    // must hold the WAL batch and only commit after recovery.
+    // Exhaust InfluxSink's internal retries for 429 and 500 before recovering.
     let (url, received) = spawn_scripted_mock_influx(vec![
-        StatusCode::SERVICE_UNAVAILABLE,
-        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::NO_CONTENT,
     ])
     .await;
@@ -335,7 +337,102 @@ async fn forwarder_outage_retries_and_commits_only_after_recovery() {
 
     assert_eq!(
         post_count(&received),
-        3,
-        "expected two 503 retries followed by one successful recovery write"
+        7,
+        "expected exhausted 429 and 500 retries followed by a successful write"
+    );
+    assert!(received
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|body| body == "device_status,device_id=dev-outage,device_class=esp32p4-bme680 rssi=-65i 1700000000000"));
+}
+
+#[tokio::test]
+async fn forwarder_retries_auth_and_destination_failures_with_unchanged_payload() {
+    let (url, received) = spawn_scripted_mock_influx(vec![
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::NO_CONTENT,
+    ])
+    .await;
+    let sink = make_sink(&url);
+    let (wal, sub, tmp) = common::open_temp_wal().await;
+    let handle = tokio::spawn(run_forwarder(sub, sink, 1, 1));
+
+    let event = status_event("dev-auth");
+    let expected_payload = event.payload.clone();
+    wal.try_append(event).unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while post_count(&received) < 4 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(wal);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("forwarder shutdown timed out")
+        .expect("forwarder task panicked")
+        .expect("forwarder returned an error");
+
+    let posts = received.lock().unwrap();
+    assert_eq!(
+        posts.len(),
+        4,
+        "auth and destination failures must be retried"
+    );
+    assert!(posts.iter().all(|body| body == &expected_payload));
+    assert!(
+        read_cursor(tmp.path()).unwrap().is_some(),
+        "cursor commits after the repaired write succeeds"
+    );
+}
+
+#[tokio::test]
+async fn forwarder_replays_mixed_type_conflict_batch_after_http_400() {
+    // The 400 models a type conflict after partial acceptance; retry the full body.
+    let (url, received) =
+        spawn_scripted_mock_influx(vec![StatusCode::BAD_REQUEST, StatusCode::NO_CONTENT]).await;
+    let sink = make_sink(&url);
+    let (wal, sub, tmp) = common::open_temp_wal().await;
+    let handle = tokio::spawn(run_forwarder(sub, sink, 2, 1));
+
+    let valid = status_event("dev-conflict");
+    let conflicting = WalEvent {
+        payload: "device_status,device_id=dev-conflict rssi=\"wrong-type\" 1700000000000"
+            .to_string(),
+        ..status_event("dev-conflict")
+    };
+    let expected_body = format!("{}\n{}", valid.payload, conflicting.payload);
+    wal.try_append(valid).unwrap();
+    wal.try_append(conflicting).unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while post_count(&received) < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(wal);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("forwarder shutdown timed out")
+        .expect("forwarder task panicked")
+        .expect("forwarder returned an error");
+
+    let posts = received.lock().unwrap();
+    assert_eq!(
+        posts.len(),
+        2,
+        "HTTP 400 must leave the batch pending for repair"
+    );
+    assert_eq!(posts[0], expected_body);
+    assert_eq!(
+        posts[1], expected_body,
+        "retry must include the complete batch, including points already accepted"
+    );
+    assert!(
+        read_cursor(tmp.path()).unwrap().is_some(),
+        "cursor commits only after the complete replay succeeds"
     );
 }
