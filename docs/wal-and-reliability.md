@@ -115,25 +115,25 @@ Sink outcomes:
 | Sink result | Forwarder action | Cursor action |
 |---|---|---|
 | Success | Clear batch | Commit through highest `offset_after` |
-| Permanent failure | Drop poison batch | Commit through highest `offset_after` |
-| Retryable failure | Hold batch and retry with backoff | Do not commit |
+| Permanent failure | Retain batch and retry with backoff until repaired | Do not commit |
+| Retryable failure | Retain batch and retry with backoff | Do not commit |
 
 Retry backoff:
 
-- Initial retry delay is `min(FLUSH_INTERVAL_MS, 1000)`.
+- Initial retry delay is `min(max(FLUSH_INTERVAL_MS, 1), 1000)` ms.
 - Delay doubles up to 5000 ms.
 
-Cursor commit failures after a successful or permanent sink result are retried in-loop. The sink write is not repeated while the cursor commit is being retried.
+Cursor commit failures after a successful sink write are retried in-loop. The sink write is not repeated while the cursor commit is being retried.
 
 ## Delivery Semantics
 
-The service aims for at-least-once delivery from the WAL to the active sink for retryable failures.
+The service retains WAL batches and retries delivery after both retryable and permanent sink failures.
 
 With the current `InfluxSink`, cases to understand are:
 
 - If InfluxDB is temporarily unavailable, the forwarder holds the batch and does not advance the cursor.
 - If the process crashes before committing a successfully written batch, the batch can be replayed after restart.
-- If InfluxDB returns a permanent 4xx error, except `408` or `429`, the batch is dropped and the cursor advances.
+- If InfluxDB returns a permanent 4xx error, except `408` or `429`, the batch remains pending and blocks later writes until the destination or pending output is repaired.
 - If payload timestamps are valid, replayed writes use the same line protocol timestamp. If timestamps are invalid and omitted, replayed writes can create separate points with InfluxDB server time.
 
 The WAL is not a general event archive. Committed older segments are deleted.
@@ -143,5 +143,5 @@ The WAL is not a general event archive. Committed older segments are deleted.
 - Put `WAL_DIR` on persistent storage with enough capacity for the expected sink outage duration.
 - Alert on `wal_forwarder_retry_outage_active == 1`.
 - Alert on sustained growth of WAL segment files.
-- Investigate `wal_forwarder_drop_total` immediately; it means data was discarded as permanently unwritable.
+- Investigate permanent sink-error logs and repair the cause; the forwarder retains the failed batch and does not advance the cursor.
 - Investigate `wal_writer_fatal_total`; it means the WAL writer exited and subsequent appends will fail.

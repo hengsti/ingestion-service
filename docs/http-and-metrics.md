@@ -199,11 +199,10 @@ never "no failures". Histograms appear after their first observation.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `wal_forwarder_committed_total` | counter | none | WAL events committed after sink success |
-| `wal_forwarder_drop_total` | counter | none | WAL events dropped after permanent sink failure |
-| `wal_forwarder_retry_total` | counter | none | Forwarder retry loops after retryable sink failure |
-| `wal_forwarder_commit_retry_total` | counter | none | Cursor commit retries after sink terminal outcome |
-| `wal_forwarder_retry_outage_seconds` | histogram | none | Duration of retryable sink outage windows |
-| `wal_forwarder_retry_outage_active` | gauge | none | `1` while holding a retryable failed batch, else `0` |
+| `wal_forwarder_retry_total` | counter | none | Forwarder retry loops after any sink failure |
+| `wal_forwarder_commit_retry_total` | counter | none | Cursor commit retries after a successful sink write |
+| `wal_forwarder_retry_outage_seconds` | histogram | none | Duration of sink-failure windows, including blocked permanent failures |
+| `wal_forwarder_retry_outage_active` | gauge | none | `1` while retaining a failed batch, else `0` |
 | `wal_subscription_corrupt_skipped_total` | counter | none | Durable corrupt WAL records skipped by subscription |
 | `wal_writer_fatal_total` | counter | `reason` | Fatal WAL writer exits |
 | `wal_segment_rotations_total` | counter | none | WAL segment rotations |

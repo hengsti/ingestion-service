@@ -141,16 +141,16 @@ Useful signals:
 | Transform logic rejects payloads | `ingest_transform_failed_total` |
 | WAL is saturated or failing | `ingest_queue_full_total`, `ingest_queue_closed_total`, `ingest_durability_ack_failed_total`, `wal_writer_fatal_total` |
 | InfluxDB writes are failing | `influx_write_errors_total`, `wal_forwarder_retry_total`, `wal_forwarder_retry_outage_active` |
-| Data is dropped as poison | `wal_forwarder_drop_total` |
+| Forwarder is blocked by a permanent sink error | `wal_forwarder_retry_outage_active`; inspect the logged HTTP status and repair the destination or pending output |
 
 ## Handle Sink Outage (InfluxDB today)
 
-During a retryable sink outage, the forwarder holds the current batch and does not advance the WAL cursor. With the current `InfluxSink`, that includes network errors, timeouts, HTTP 5xx, `408`, and `429`. New events continue to accumulate in WAL segment files.
+For any sink failure, the forwarder holds the current batch and does not advance the WAL cursor. `InfluxSink` classifies network errors, timeouts, HTTP 5xx, `408`, and `429` as retryable; other 4xx failures remain pending and block later writes until the cause is repaired. New events continue to accumulate in WAL segment files.
 
 Steps:
 
 1. Confirm `wal_forwarder_retry_outage_active` is `1`.
-2. Check InfluxDB availability and credentials.
+2. Check InfluxDB availability, credentials, organization, bucket, and the pending line-protocol output.
 3. Watch available disk space for `WAL_DIR`.
 4. After recovery, confirm `wal_forwarder_retry_outage_active` returns to `0`.
 5. Confirm `wal_forwarder_committed_total` increases.
