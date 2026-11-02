@@ -66,9 +66,8 @@ docker run --rm \
   -e MQTT_HOST=host.docker.internal \
   -e MQTT_PORT=1883 \
   -e MQTT_CLIENT_ID=smarthome-ingest \
-  -e MQTT_TOPIC_SENSOR=smarthome/+/sensor \
-  -e MQTT_TOPIC_STATUS=smarthome/+/status \
   -e MQTT_TOPIC_DLQ=smarthome/_dlq/ingest \
+  -e INGEST_ROUTES_FILE=/app/config/routes.json \
   -e OUTPUT_SINK=influx \
   -e INFLUX_URL=http://host.docker.internal:8086 \
   -e INFLUX_ORG=smarthome \
@@ -77,7 +76,6 @@ docker run --rm \
   -e BATCH_SIZE=500 \
   -e FLUSH_INTERVAL_MS=1000 \
   -e WAL_DIR=/app/wal \
-  -e ENFORCE_TOPIC_DEVICE_MATCH=true \
   -e METRICS_BIND=0.0.0.0:9090 \
   -e CACHE_BIND=0.0.0.0:8085 \
   -e CACHE_TTL_MS=60000 \
@@ -113,7 +111,8 @@ curl http://localhost:8085/v1/state
 curl http://localhost:8085/v1/state/esp32-1
 ```
 
-Use `stale=true` as an indicator that the service has not received a recent sensor message for that device within `CACHE_TTL_MS`.
+Use `stale=true` as an indicator that the service has not received a recent cache-enabled
+record for that device within `CACHE_TTL_MS`.
 
 ## Watch Live Sensor Updates
 
@@ -137,8 +136,7 @@ Useful signals:
 |---|---|
 | MQTT input is arriving | `mqtt_messages_received_total` |
 | Input workers are overloaded | `ingest_event_queue_full_total` |
-| Payloads are invalid | `ingest_incoming_invalid_json_total`, `ingest_validate_raw_failed_total`, `ingest_validate_business_failed_total` |
-| Transform logic rejects payloads | `ingest_transform_failed_total` |
+| Payloads are invalid | `ingest_incoming_invalid_json_total`, `ingest_validate_raw_failed_total`, configured output-schema validation failures |
 | WAL is saturated or failing | `ingest_queue_full_total`, `ingest_queue_closed_total`, `ingest_durability_ack_failed_total`, `wal_writer_fatal_total` |
 | InfluxDB writes are failing | `influx_write_errors_total`, `wal_forwarder_retry_total`, `wal_forwarder_retry_outage_active` |
 | Forwarder is blocked by a permanent sink error | `wal_forwarder_retry_outage_active`; inspect the logged HTTP status and repair the destination or pending output |
@@ -173,10 +171,9 @@ Common causes:
 | `payload too large` | Keep MQTT payloads at or below 64 KiB |
 | `payload not utf8` | Publish UTF-8 JSON |
 | `payload not valid JSON` | Fix publisher serialization |
-| `raw validation failed` | Compare payload with `schema/*.schema.json` |
-| `device_id mismatch` | Align topic device id and payload `device_id`, or set `ENFORCE_TOPIC_DEVICE_MATCH=false` |
-| `transform failed` | Check humidity, gas, and pressure bounds |
-| `business validation failed` | Compare post-transform canonical shape with `schema/*.business.schema.json` |
+| `raw validation failed` | Compare payload with the raw schema configured for its route in `config/routes.json` |
+| `transform failed` | Check the route's mappings, defaults, and configured calculations |
+| `output validation failed` | Compare the mapped record with its configured output schema and output constraints |
 | `wal queue full` | Increase `WAL_QUEUE_CAPACITY`, lower ingest rate, or fix disk/WAL writer pressure |
 
 ## Tune Throughput

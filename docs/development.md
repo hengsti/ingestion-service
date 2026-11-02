@@ -14,6 +14,10 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 ```
 
+`tests/influx_timestamp_semantics.rs` is skipped unless all four `INFLUX_TEST_URL`,
+`INFLUX_TEST_ORG`, `INFLUX_TEST_BUCKET`, and `INFLUX_TEST_TOKEN` variables are explicitly
+set. It writes to a unique measurement in that test bucket.
+
 Build release binary:
 
 ```bash
@@ -32,12 +36,12 @@ cargo doc --all-features --no-deps
 |---|---|---|
 | Runtime wiring | `src/main.rs` | Owns task startup, source/sink wiring, worker dispatch, shutdown |
 | Config | `src/config.rs` | Environment parsing and defaults |
-| Messages | `src/model/messages/` | Canonical Rust structs |
-| Topic matching | `src/model/topic.rs` | MQTT wildcard matching and device id extraction |
+| Telemetry | `src/model/messages/` | Typed records and scalar values |
+| Topic matching | `src/model/topic.rs` | Strict MQTT filter matching and configured identity segments |
 | Pipeline | `src/pipeline/` | Stage trait, runner, context, and stage implementations |
 | Routing/schema | `src/infrastructure/router.rs`, `src/infrastructure/schema.rs` | Topic route and JSON Schema validation |
 | Input source | `src/infrastructure/source/` | `Source`/`DlqPublisher`, MQTT implementation, and ingest dispatch |
-| Cache API | `src/infrastructure/cache/` | Latest sensor state and HTTP/SSE API |
+| Cache API | `src/infrastructure/cache/` | Configured latest-state cache and HTTP/SSE API |
 | Output sink | `src/infrastructure/sink/` | `Sink`/`Encoder`, Influx sink, and line-protocol point builder |
 | WAL | `src/infrastructure/wal/` | Segment writer, subscription, cursor, recovery, forwarder |
 
@@ -59,35 +63,27 @@ Many modules also contain unit tests next to implementation code.
 3. Use `PipelineContext` for shared state. Prefer adding explicit getters/setters over reaching around stage ordering.
 4. Return `StageFlow::Continue` for success and `StageFlow::Stop` when the pipeline should stop.
 5. To route a rejected message to the DLQ, call `ctx.mark_dlq(...)`.
-6. To stop without DLQ, call `ctx.mark_ignored(...)`.
+6. To stop intentionally without DLQ, return `StageFlow::Stop` without marking the context.
 7. Register the stage in `main.rs` and in integration test pipeline builders.
 8. Add unit tests for stage behavior and an integration test if it changes end-to-end behavior.
 
-## Add a Message Type
+## Add a telemetry route
 
-1. Add a raw schema in `schema/<name>.schema.json`.
-2. Add a business schema in `schema/<name>.business.schema.json`.
-3. Add Rust message structs under `src/model/messages/`.
-4. Add a variant to `MessageType` and `HandledMessage`.
-5. Update `build_router` in `main.rs` to map `MQTT_TOPIC_<NAME>` to the new type and schema.
-6. Update `Route::deserialize`.
-7. Update `TransformStage` if normalization or derived fields are needed.
-8. Update `ValidateBusinessStage` to load and apply the business schema.
-9. Update `CacheUpdateStage` if the new type should appear in the cache API.
-10. Update the active encoder implementation, currently `src/infrastructure/sink/influx.rs`, to render the new message type.
-11. Add tests for routing, transform, business validation, persistence, and end-to-end behavior.
-12. Update docs in `docs/messages-and-routing.md`, `docs/http-and-metrics.md`, and `docs/configuration.md`.
+1. Add or update raw/output schemas under `config/schemas/`.
+2. Add a route to `config/routes.json` with its topic filter, identity source,
+   measurement, mappings, timestamp, and optional calculations/cache setting.
+3. Use schema paths relative to the route bundle. The bundle is compiled at startup;
+   invalid schemas, overlapping filters, and incompatible field types fail startup.
+4. Add a focused route test and a pipeline integration case for the new payload.
+5. Update the cache/API or line-protocol goldens if the configured route changes them.
+6. Document the route contract in `docs/messages-and-routing.md`.
 
 ## Change Schemas
 
-The schemas are embedded with `include_str!`, so schema files are compiled into the binary.
-
-When changing schemas:
-
-- Update raw schemas for publisher input contracts.
-- Update business schemas for canonical post-transform contracts.
-- Keep transform output compatible with business schemas.
-- Run full tests because schema failures often surface in end-to-end tests.
+Route schemas are loaded from `INGEST_ROUTES_FILE` at startup. Raw schemas validate publisher
+input; optional output schemas validate the normalized typed record before persistence.
+Relative schema/resource paths are resolved from the route bundle. Run the full suite after
+changing schemas because failures often surface in end-to-end tests.
 
 ## Change WAL Behavior
 
@@ -116,7 +112,8 @@ Rules:
 - String fields are quoted and escaped.
 - Integers are suffixed with `i`.
 - Unsigned integers are suffixed with `u`.
-- Timestamp is in milliseconds because the sink uses `precision=ms`.
+- Every validated record timestamp is written in milliseconds because the sink uses
+  `precision=ms`; records never fall back to InfluxDB server time.
 
 If you add or remove tags or fields, update:
 

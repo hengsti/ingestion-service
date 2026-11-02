@@ -1,6 +1,8 @@
 # Configuration Reference
 
-All runtime configuration is supplied through environment variables. Empty strings are treated as unset because `Config::from_env` trims values and filters empty results.
+Runtime settings are supplied through environment variables. Empty strings are treated as unset.
+The required `INGEST_ROUTES_FILE` points to the versioned route bundle; route and schema paths
+inside the bundle are resolved relative to the bundle file.
 
 ## Input source
 
@@ -10,9 +12,25 @@ All runtime configuration is supplied through environment variables. Empty strin
 
 The service ingests messages through a swappable `Source` abstraction (see `docs/architecture.md`). `INPUT_SOURCE` selects which implementation `build_source()` constructs at startup. Adding a new transport (e.g. Kafka) means adding a new `InputSourceKind` variant and a matching `Source`/`DlqPublisher` pair — no changes to `main.rs`'s wiring are required beyond that.
 
+## Route bundle
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `INGEST_ROUTES_FILE` | Yes | None | Path to the v1 JSON route bundle. Subscriptions, schemas, mapping, calculations, output validation, measurements, and cache opt-in are loaded from this file. |
+
+The shipped bundle is [`config/routes.json`](../config/routes.json). It is compiled once at startup;
+an empty route list or invalid route/schema fails startup. Schema-resource paths are relative to the
+bundle's directory. Keep the bundle and its `schemas/` directory together when deploying.
+
+The former `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other non-DLQ `MQTT_TOPIC_*` variables, and
+`ENFORCE_TOPIC_DEVICE_MATCH` are rejected at startup with a migration hint to use the route bundle.
+Do not set them alongside `INGEST_ROUTES_FILE`.
+
 ## MQTT
 
-The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT_ID` / `MQTT_TOPIC_*` variables below are **only required when `INPUT_SOURCE=mqtt`** — `Config::from_env` parses all of them, including topic/route definitions, inside the `InputSourceKind::Mqtt` arm. `MQTT_TOPIC_*` values are stored generically as `Config::topic_routes` (keyed by suffix, e.g. `SENSOR`/`STATUS`/`DLQ`), which the transport-agnostic `Router` consumes without any knowledge of MQTT or environment variable naming — a future Kafka source would populate the same `topic_routes` map from its own `KAFKA_TOPIC_*` convention.
+The broker variables below are required only when `INPUT_SOURCE=mqtt`. MQTT subscriptions come
+exclusively from the compiled route bundle. `MQTT_TOPIC_DLQ` remains required and is only used as
+the publish destination for rejected messages; it is not a subscription.
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
@@ -22,18 +40,11 @@ The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT
 | `MQTT_CLEAN_SESSION` | No | `true` | Boolean. `false` requests a persistent session: the client id is used verbatim and the broker queues QoS 1 messages while ingest is offline |
 | `MQTT_USERNAME` | No | None | Optional MQTT username |
 | `MQTT_PASSWORD` | No | None | Optional MQTT password |
-| `MQTT_TOPIC_SENSOR` | Expected | None | Sensor subscription and route, for example `smarthome/+/sensor` |
-| `MQTT_TOPIC_STATUS` | Optional | None | Status subscription and route, for example `smarthome/+/status` |
 | `MQTT_TOPIC_DLQ` | Yes at runtime | None | DLQ publish topic |
-| `ENFORCE_TOPIC_DEVICE_MATCH` | Yes | None | Boolean. When `true`, payload `device_id` must match the device id extracted from the topic |
-
-At least one `MQTT_TOPIC_<NAME>` variable must be set for config parsing. `MQTT_TOPIC_DLQ` is required later during startup because the DLQ stage needs a publish topic.
 
 With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
 
-A persistent session also keeps its subscriptions on the broker. The service subscribes to the current `MQTT_TOPIC_*` filters on every connect but never unsubscribes. If you remove or change a topic filter, the old subscription stays active, and its messages have no route, so they go to the DLQ. When you change topic filters, also change `MQTT_CLIENT_ID` (for example `smarthome-ingest-v2`) to start a fresh session. The broker discards the old session after its session expiry.
-
-Unknown `MQTT_TOPIC_*` keys are not routed. They are still subscribed if they do not end in `DLQ`, so avoid unknown topic keys in production.
+The source subscribes to the route bundle's filters on each connection.
 
 ## InfluxDB
 
@@ -92,16 +103,17 @@ The service divides `INPUT_QUEUE_CAPACITY` by worker count to create one bounded
 | Variable | Required | Default | Description |
 |---|---:|---|---|
 | `CACHE_BIND` | Yes | None | Cache API bind address, for example `0.0.0.0:8085` |
-| `CACHE_TTL_MS` | Yes | None | Age threshold used to mark cached sensor states as stale |
-| `CACHE_BUFFER` | Yes | None | Maximum cached sensor devices and SSE broadcast buffer size |
+| `CACHE_TTL_MS` | Yes | None | Age threshold used to mark cached device states as stale |
+| `CACHE_BUFFER` | Yes | None | Maximum cached devices and SSE broadcast buffer size |
 | `METRICS_BIND` | Yes | None | Prometheus endpoint bind address, for example `0.0.0.0:9090` |
 
 `CACHE_BUFFER` is used for two limits:
 
-- Maximum number of sensor devices retained in the cache.
+- Maximum number of devices retained in the latest-state cache.
 - Number of events retained in the SSE broadcast channel.
 
-When the sensor cache is full and a new device arrives, the stalest cached device is evicted.
+Only routes with `cache: true` update the cache. When it is full and a new device arrives, the
+stalest cached device is evicted.
 
 ## Docker Compose
 
@@ -120,6 +132,9 @@ When the sensor cache is full and a new device arrives, the stalest cached devic
 | `RUST_LOG` | Yes | Log filter, e.g. `info` |
 
 `WAL_DIR` is `/data/wal`, and the `wal` named volume is mounted at that path. Keep the two in sync. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set, so the code defaults apply. The image `HEALTHCHECK` is used as-is.
+
+Compose mounts the repository's `config/` directory read-only at `/app/config` and sets
+`INGEST_ROUTES_FILE=/app/config/routes.json`; no route-file path is needed in the host `.env`.
 
 CI renders the file with `docker compose config` and compares its `environment` keys with the variables read in `src/config.rs`. A variable that the code does not read, or a missing required variable, fails the build. Update `compose.yaml`, `src/config.rs`, and this page together.
 
@@ -149,9 +164,8 @@ INPUT_SOURCE=mqtt
 MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_CLIENT_ID=smarthome-ingest
-MQTT_TOPIC_SENSOR=smarthome/+/sensor
-MQTT_TOPIC_STATUS=smarthome/+/status
 MQTT_TOPIC_DLQ=smarthome/_dlq/ingest
+INGEST_ROUTES_FILE=./config/routes.json
 OUTPUT_SINK=influx
 INFLUX_URL=http://localhost:8086
 INFLUX_ORG=smarthome
@@ -160,7 +174,6 @@ INFLUX_TOKEN=change-me
 BATCH_SIZE=500
 FLUSH_INTERVAL_MS=1000
 WAL_DIR=./data/wal
-ENFORCE_TOPIC_DEVICE_MATCH=true
 METRICS_BIND=0.0.0.0:9090
 CACHE_BIND=0.0.0.0:8085
 CACHE_TTL_MS=60000
