@@ -118,6 +118,11 @@ fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> any
     });
 
     schema.validate(&record)?;
+    record["fields"]["battery"] = json!(90);
+    schema.validate(&record)?;
+    record["fields"]["battery"] = json!(90.5);
+    schema.validate(&record)?;
+    record["fields"].as_object_mut().unwrap().remove("battery");
     record["fields"]["warmed_up"] = json!(false);
     record["fields"]
         .as_object_mut()
@@ -148,7 +153,7 @@ fn test_firmware_routes_status_output_schema_requires_nonempty_ip_and_valid_time
     let schema = status
         .output_schema()
         .context("status route must have an output schema")?;
-    let record = json!({
+    let mut record = json!({
         "route_id": "firmware-status",
         "device_id": "test-sensor",
         "measurement": "device_status",
@@ -170,6 +175,8 @@ fn test_firmware_routes_status_output_schema_requires_nonempty_ip_and_valid_time
         "source_topic": "smarthome/test-sensor/status",
         "retained": false
     });
+    schema.validate(&record)?;
+    record["fields"]["battery"] = json!(90);
     schema.validate(&record)?;
 
     let mut invalid = record.clone();

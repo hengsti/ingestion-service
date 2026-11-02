@@ -70,6 +70,11 @@ async fn assert_legacy_cases(path: &str) -> Result<()> {
                     case.id
                 );
                 if case.topic.ends_with("/sensor") {
+                    assert!(
+                        line.contains("temp_c=22.5"),
+                        "sensor golden is missing mapped temperature for {}",
+                        case.id
+                    );
                     assert!(line.contains("altitude_m="), "{}", case.id);
                     match case.payload.get("replayed").and_then(Value::as_bool) {
                         Some(replayed) => {
