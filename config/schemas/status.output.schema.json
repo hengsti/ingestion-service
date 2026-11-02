@@ -122,7 +122,7 @@
   ],
   "definitions": {
     "scalar": {
-      "oneOf": [
+      "anyOf": [
         {
           "type": "string"
         },
