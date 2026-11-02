@@ -9,6 +9,7 @@ use crate::{
     infrastructure::router::Router,
     model::messages::message::MessageType,
     pipeline::{
+        calculations::{dew_point_c, heat_index_c, iaq_score, iaq_text},
         context::PipelineContext,
         stage::{PipelineStage, StageFlow, StageResult},
     },
@@ -60,10 +61,10 @@ impl TransformStage {
             );
         }
 
-        let dew_point_c = Self::calc_dew_point_c(temp_c, rel_hum_perc);
-        let heat_index_c = Self::calc_heat_index_c(temp_c, rel_hum_perc);
-        let iaq_score = Self::calc_iaq_score(gas_ohm, rel_hum_perc);
-        let iaq_text = Self::calc_iaq_text(iaq_score);
+        let dew_point_c = dew_point_c(temp_c, rel_hum_perc);
+        let heat_index_c = heat_index_c(temp_c, rel_hum_perc);
+        let iaq_score = iaq_score(gas_ohm, rel_hum_perc);
+        let iaq_text = iaq_text(iaq_score);
 
         Self::set_f64_in_object(data, "dew_point_c", dew_point_c)?;
         Self::set_f64_in_object(data, "heat_index_c", heat_index_c)?;
@@ -137,92 +138,6 @@ impl TransformStage {
             .ok_or_else(|| anyhow!("cannot store non-finite float in field {}", key))?;
         obj.insert(key.to_string(), Value::Number(number));
         Ok(())
-    }
-
-    fn calc_dew_point_c(temp_c: f64, rel_hum_perc: f64) -> f64 {
-        let alpha = (rel_hum_perc / 100.0).ln() + ((17.27 * temp_c) / (237.7 + temp_c));
-        (237.7 * alpha) / (17.27 - alpha)
-    }
-
-    fn temp_c_to_f(temp_c: f64) -> f64 {
-        temp_c * 9.0 / 5.0 + 32.0
-    }
-
-    fn temp_f_to_c(temp_f: f64) -> f64 {
-        (temp_f - 32.0) * 5.0 / 9.0
-    }
-
-    fn calc_heat_index_c(temp_c: f64, rel_hum_perc: f64) -> f64 {
-        let temp_f = Self::temp_c_to_f(temp_c);
-
-        let hi_rothfusz = -42.379 + 2.04901523 * temp_f + 10.14333127 * rel_hum_perc
-            - 0.22475541 * temp_f * rel_hum_perc
-            - 0.00683783 * temp_f * temp_f
-            - 0.05481717 * rel_hum_perc * rel_hum_perc
-            + 0.00122874 * temp_f * temp_f * rel_hum_perc
-            + 0.00085282 * temp_f * rel_hum_perc * rel_hum_perc
-            - 0.00000199 * temp_f * temp_f * rel_hum_perc * rel_hum_perc;
-
-        if rel_hum_perc < 13.0 && (80.0..=112.0).contains(&temp_f) {
-            let adjusted_hi =
-                ((13.0 - rel_hum_perc) / 4.0) * (17.0 - (temp_f - 95.0).abs() / 17.0).sqrt();
-            return Self::temp_f_to_c(hi_rothfusz - adjusted_hi);
-        }
-
-        if rel_hum_perc > 85.0 && (80.0..=87.0).contains(&temp_f) {
-            let adjusted_hi = ((rel_hum_perc - 85.0) * (87.0 - temp_f)) / 5.0;
-            return Self::temp_f_to_c(hi_rothfusz + adjusted_hi);
-        }
-
-        if temp_f < 80.0 {
-            let hi_steadman =
-                0.5 * (temp_f + 61.0 + ((temp_f - 68.0) * 1.2) + (rel_hum_perc * 0.094));
-            return Self::temp_f_to_c(hi_steadman);
-        }
-
-        Self::temp_f_to_c(hi_rothfusz)
-    }
-
-    fn calc_iaq_score(gas_ohm: f64, rel_hum_perc: f64) -> f64 {
-        let hum_ref = 40.0;
-
-        let hum_score = if (38.0..=42.0).contains(&rel_hum_perc) {
-            0.25 * 100.0
-        } else if rel_hum_perc < 38.0 {
-            (0.25 / hum_ref) * rel_hum_perc * 100.0
-        } else {
-            0.25 / (100.0 - hum_ref) * (100.0 - rel_hum_perc) * 100.0
-        };
-
-        let gas_lower_limit = 5_000.0;
-        let gas_upper_limit = 50_000.0;
-        let gas_reading = gas_ohm.clamp(gas_lower_limit, gas_upper_limit);
-
-        let gas_score = ((0.75 / (gas_upper_limit - gas_lower_limit) * gas_reading)
-            - (gas_lower_limit * (0.75 / (gas_upper_limit - gas_lower_limit))))
-            * 100.0;
-
-        hum_score + gas_score
-    }
-
-    fn calc_iaq_text(indoor_air_quality_score: f64) -> String {
-        let score = (100.0 - indoor_air_quality_score) * 5.0;
-
-        let suffix = if score >= 301.0 {
-            "Hazardous"
-        } else if score >= 201.0 {
-            "Very Unhealthy"
-        } else if score >= 176.0 {
-            "Unhealthy"
-        } else if score >= 151.0 {
-            "Unhealthy for Sensitive Groups"
-        } else if score >= 51.0 {
-            "Moderate"
-        } else {
-            "Good"
-        };
-
-        format!("Air quality is {}", suffix)
     }
 }
 
@@ -386,7 +301,7 @@ mod tests {
     #[test]
     fn calc_dew_point_c_returns_expected_value_for_typical_conditions() {
         // At 20 °C and 50 % RH the dew point is approximately 9.27 °C.
-        let result = TransformStage::calc_dew_point_c(20.0, 50.0);
+        let result = dew_point_c(20.0, 50.0);
         assert!((result - 9.27).abs() < 0.05, "got {result}");
     }
 
@@ -394,7 +309,7 @@ mod tests {
     fn calc_dew_point_c_equals_temp_at_100_percent_humidity() {
         // At 100 % RH the dew point must equal the air temperature.
         let temp = 25.0;
-        let result = TransformStage::calc_dew_point_c(temp, 100.0);
+        let result = dew_point_c(temp, 100.0);
         assert!((result - temp).abs() < 0.001, "got {result}");
     }
 
@@ -402,14 +317,14 @@ mod tests {
     fn calc_heat_index_c_uses_steadman_formula_below_80f() {
         // 20 °C = 68 °F < 80 °F → Steadman path.
         // Steadman: 0.5 * (68 + 61 + 0 + 50*0.094) = 66.85 °F ≈ 19.36 °C.
-        let result = TransformStage::calc_heat_index_c(20.0, 50.0);
+        let result = heat_index_c(20.0, 50.0);
         assert!((result - 19.36).abs() < 0.05, "got {result}");
     }
 
     #[test]
     fn calc_heat_index_c_uses_rothfusz_formula_above_80f() {
         // 35 °C = 95 °F, 50 % RH → main Rothfusz path (humidity not in low/high correction bands).
-        let result = TransformStage::calc_heat_index_c(35.0, 50.0);
+        let result = heat_index_c(35.0, 50.0);
         // Rothfusz at 95 °F / 50 % RH → ~105.2 °F → ~40.68 °C.
         assert!((result - 40.68).abs() < 0.05, "got {result}");
     }
@@ -417,8 +332,8 @@ mod tests {
     #[test]
     fn calc_heat_index_c_applies_low_humidity_adjustment_above_80f() {
         // 33 °C ≈ 91.4 °F (in [80,112]), RH = 10 % (< 13) → Rothfusz minus adjustment.
-        let result = TransformStage::calc_heat_index_c(33.0, 10.0);
-        let without_adjustment = TransformStage::calc_heat_index_c(33.0, 15.0);
+        let result = heat_index_c(33.0, 10.0);
+        let without_adjustment = heat_index_c(33.0, 15.0);
         // Low humidity makes the apparent temp feel lower than the base Rothfusz.
         assert!(result < without_adjustment, "got {result}");
     }
@@ -426,8 +341,8 @@ mod tests {
     #[test]
     fn calc_heat_index_c_applies_high_humidity_adjustment_80_to_87f() {
         // 29 °C ≈ 84.2 °F (in [80,87]), RH = 90 % (> 85) → Rothfusz plus adjustment.
-        let result = TransformStage::calc_heat_index_c(29.0, 90.0);
-        let without_adjustment = TransformStage::calc_heat_index_c(29.0, 84.0);
+        let result = heat_index_c(29.0, 90.0);
+        let without_adjustment = heat_index_c(29.0, 84.0);
         // High humidity in that band raises the apparent temperature.
         assert!(result > without_adjustment, "got {result}");
     }
@@ -435,27 +350,27 @@ mod tests {
     #[test]
     fn calc_iaq_score_is_100_at_optimal_humidity_and_max_gas() {
         // Humidity in [38,42] → hum_score = 25; gas at upper limit → gas_score = 75.
-        let result = TransformStage::calc_iaq_score(50_000.0, 40.0);
+        let result = iaq_score(50_000.0, 40.0);
         assert!((result - 100.0).abs() < 0.001, "got {result}");
     }
 
     #[test]
     fn calc_iaq_score_is_25_at_optimal_humidity_and_min_gas() {
         // Gas at or below lower limit is clamped → gas_score = 0.
-        let result = TransformStage::calc_iaq_score(5_000.0, 40.0);
+        let result = iaq_score(5_000.0, 40.0);
         assert!((result - 25.0).abs() < 0.001, "got {result}");
     }
 
     #[test]
     fn calc_iaq_score_is_0_at_max_humidity_and_min_gas() {
-        let result = TransformStage::calc_iaq_score(5_000.0, 100.0);
+        let result = iaq_score(5_000.0, 100.0);
         assert_eq!(result, 0.0);
     }
 
     #[test]
     fn calc_iaq_score_hum_score_increases_linearly_below_38_percent() {
-        let low = TransformStage::calc_iaq_score(50_000.0, 20.0);
-        let mid = TransformStage::calc_iaq_score(50_000.0, 30.0);
+        let low = iaq_score(50_000.0, 20.0);
+        let mid = iaq_score(50_000.0, 30.0);
         assert!(
             low < mid,
             "hum score should increase as humidity rises toward 38 %"
@@ -464,8 +379,8 @@ mod tests {
 
     #[test]
     fn calc_iaq_score_hum_score_decreases_above_42_percent() {
-        let at_42 = TransformStage::calc_iaq_score(50_000.0, 42.0);
-        let at_80 = TransformStage::calc_iaq_score(50_000.0, 80.0);
+        let at_42 = iaq_score(50_000.0, 42.0);
+        let at_80 = iaq_score(50_000.0, 80.0);
         assert!(
             at_42 > at_80,
             "hum score should decrease as humidity rises above 42 %"
@@ -475,23 +390,20 @@ mod tests {
     #[test]
     fn calc_iaq_text_good_when_score_above_89_8() {
         // score = (100 - 90) * 5 = 50 → "Good"
-        assert_eq!(TransformStage::calc_iaq_text(90.0), "Air quality is Good");
+        assert_eq!(iaq_text(90.0), "Air quality is Good");
     }
 
     #[test]
     fn calc_iaq_text_moderate_at_score_threshold_51() {
         // (100 - x) * 5 = 51  → x = 89.8; use 89.7 to land just above 51.
-        assert_eq!(
-            TransformStage::calc_iaq_text(89.7),
-            "Air quality is Moderate"
-        );
+        assert_eq!(iaq_text(89.7), "Air quality is Moderate");
     }
 
     #[test]
     fn calc_iaq_text_unhealthy_for_sensitive_groups_at_threshold_151() {
         // (100 - x) * 5 = 151 → x = 69.8; use 69.7 to land just above 151.
         assert_eq!(
-            TransformStage::calc_iaq_text(69.7),
+            iaq_text(69.7),
             "Air quality is Unhealthy for Sensitive Groups"
         );
     }
@@ -499,28 +411,19 @@ mod tests {
     #[test]
     fn calc_iaq_text_unhealthy_at_threshold_176() {
         // (100 - x) * 5 = 176 → x = 64.8; use 64.7.
-        assert_eq!(
-            TransformStage::calc_iaq_text(64.7),
-            "Air quality is Unhealthy"
-        );
+        assert_eq!(iaq_text(64.7), "Air quality is Unhealthy");
     }
 
     #[test]
     fn calc_iaq_text_very_unhealthy_at_threshold_201() {
         // (100 - x) * 5 = 201 → x = 59.8; use 59.7.
-        assert_eq!(
-            TransformStage::calc_iaq_text(59.7),
-            "Air quality is Very Unhealthy"
-        );
+        assert_eq!(iaq_text(59.7), "Air quality is Very Unhealthy");
     }
 
     #[test]
     fn calc_iaq_text_hazardous_at_threshold_301() {
         // (100 - x) * 5 = 301 → x = 39.8; use 39.7.
-        assert_eq!(
-            TransformStage::calc_iaq_text(39.7),
-            "Air quality is Hazardous"
-        );
+        assert_eq!(iaq_text(39.7), "Air quality is Hazardous");
     }
 
     #[test]
