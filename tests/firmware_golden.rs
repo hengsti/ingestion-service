@@ -1,21 +1,19 @@
 mod common;
 
-use std::{sync::atomic::AtomicBool, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use axum::{body::Body, http::Request};
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::Value;
 use smarthome_ingest::{
-    infrastructure::{
-        cache::{http as cache_http, state::CacheState},
-        sink::influx::{sensor_to_point, status_to_point},
-    },
-    model::messages::{
-        message::HandledMessage,
-        sensor::{SensorData, SensorMessage},
-    },
+    infrastructure::cache::{http as cache_http, state::CacheState},
+    model::messages::telemetry::{TelemetryRecord, TelemetryValue},
     pipeline::context::PipelineContext,
 };
 use tower::ServiceExt;
@@ -27,144 +25,103 @@ struct GoldenCase {
     retained: bool,
     received_at_ms: u64,
     payload: Value,
-    legacy_line_protocol: String,
     unified_line_protocol: Option<String>,
     unified_rejection: Option<String>,
 }
 
-fn point_line(point: smarthome_ingest::infrastructure::sink::point::Point) -> String {
-    let mut line = String::new();
-    point.write_line_protocol(&mut line);
-    line
-}
-
-async fn assert_legacy_cases(path: &str) -> Result<()> {
+async fn assert_configured_cases(path: &str) -> Result<()> {
     let cases: Vec<GoldenCase> = serde_json::from_str(path)?;
-    let (pipeline, _subscription, _cache, _wal_dir) = common::build_pipeline().await;
-    let mut actual_lines = Vec::with_capacity(cases.len());
+    let (pipeline, mut subscription, _cache, _wal_dir) = common::build_pipeline().await;
 
-    for case in &cases {
-        assert!(case.received_at_ms > 0);
-        let valid_time = case.payload["time_valid"]
-            .as_bool()
-            .with_context(|| format!("{} missing time_valid", case.id))?;
-        let payload_time_ms = case.payload["time_ms"]
-            .as_i64()
-            .with_context(|| format!("{} missing time_ms", case.id))?;
-        match case.unified_line_protocol.as_deref() {
-            Some(line) => {
-                assert!(!line.is_empty(), "unified golden missing for {}", case.id);
+    for case in cases {
+        let payload = serde_json::to_vec(&case.payload)?;
+        let mut context = PipelineContext::new_with_metadata(
+            &case.topic,
+            payload,
+            i64::try_from(case.received_at_ms)?,
+            case.retained,
+        );
+        pipeline.run(&mut context).await;
+
+        match case.unified_line_protocol {
+            Some(expected) => {
                 assert!(
-                    line.contains(&format!("mqtt_retained={}", case.retained)),
-                    "unified golden has wrong retained flag for {}",
+                    !context.should_publish_dlq(),
+                    "{} unexpectedly rejected: {:?}",
+                    case.id,
+                    context.dlq_reason()
+                );
+                let event = common::recv_event(&mut subscription, 500)
+                    .await
+                    .with_context(|| format!("{} should persist to WAL", case.id))?;
+                assert_eq!(
+                    event.payload, expected,
+                    "configured firmware golden mismatch for {}",
                     case.id
                 );
-                let expected_time_ms = if valid_time {
-                    payload_time_ms
-                } else {
-                    case.received_at_ms as i64
-                };
-                assert!(
-                    line.ends_with(&format!(" {expected_time_ms}")),
-                    "unified golden has wrong frozen timestamp for {}",
-                    case.id
-                );
-                if case.topic.ends_with("/sensor") {
-                    assert!(
-                        line.contains("temp_c=22.5"),
-                        "sensor golden is missing mapped temperature for {}",
-                        case.id
-                    );
-                    assert!(line.contains("altitude_m="), "{}", case.id);
-                    match case.payload.get("replayed").and_then(Value::as_bool) {
-                        Some(replayed) => {
-                            assert!(
-                                line.contains(&format!("replayed={replayed}")),
-                                "{}",
-                                case.id
-                            );
-                        }
-                        None => assert!(!line.contains("replayed="), "{}", case.id),
-                    }
-                    if case.payload.get("warmed_up") == Some(&Value::Bool(false)) {
-                        assert!(!line.contains("iaq_score="), "{}", case.id);
-                        assert!(!line.contains("iaq_text="), "{}", case.id);
-                    }
-                }
             }
             None => {
-                assert!(valid_time && payload_time_ms == 0, "{}", case.id);
-                assert_eq!(
-                    case.unified_rejection.as_deref(),
-                    Some("timestamp_ms must be at least 1"),
-                    "rejected unified golden must explain {}",
+                assert!(
+                    context.should_publish_dlq(),
+                    "{} should be rejected: {:?}",
+                    case.id,
+                    case.unified_rejection
+                );
+                assert!(
+                    common::recv_event(&mut subscription, 100).await.is_none(),
+                    "{} must not reach WAL",
                     case.id
                 );
             }
         }
-        let payload = serde_json::to_vec(&case.payload)?;
-        let mut context = PipelineContext::new(&case.topic, payload);
-        pipeline.run(&mut context).await;
-        if context.should_publish_dlq() {
-            bail!(
-                "legacy pipeline rejected {}: {:?}",
-                case.id,
-                context.dlq_reason()
-            );
-        }
-
-        let line = match context.handled_message()? {
-            HandledMessage::Sensor(message) => point_line(sensor_to_point(message)),
-            HandledMessage::Status(message) => point_line(status_to_point(message)),
-        };
-        actual_lines.push((case.id.as_str(), line));
     }
 
-    for (case, (id, actual)) in cases.iter().zip(actual_lines) {
-        assert_eq!(case.id, id);
-        assert_eq!(
-            case.legacy_line_protocol, actual,
-            "legacy golden mismatch for {} (retained={})",
-            case.id, case.retained
-        );
-    }
     Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_firmware_sensor_lines_match_legacy_encoder() -> Result<()> {
-    assert_legacy_cases(include_str!("fixtures/golden/firmware-sensor.json")).await
+async fn test_golden_firmware_sensor_lines_match_configured_encoder() -> Result<()> {
+    assert_configured_cases(include_str!("fixtures/golden/firmware-sensor.json")).await
 }
 
 #[tokio::test]
-async fn test_golden_firmware_status_lines_match_legacy_encoder() -> Result<()> {
-    assert_legacy_cases(include_str!("fixtures/golden/firmware-status.json")).await
+async fn test_golden_firmware_status_lines_match_configured_encoder() -> Result<()> {
+    assert_configured_cases(include_str!("fixtures/golden/firmware-status.json")).await
 }
 
-fn cache_sensor() -> SensorMessage {
-    SensorMessage {
-        device_id: "esp32-1".to_string(),
-        room: "living_room".to_string(),
-        device_class: "esp32p4-bme680".to_string(),
-        fw_version: "1.0.0".to_string(),
-        time_ms: 1_700_000_000_000,
-        time_iso: "2023-11-14T22:13:20Z".to_string(),
-        time_valid: true,
-        boot_id: None,
-        seq: None,
-        warmed_up: None,
-        replayed: false,
-        data: SensorData {
-            temp_c: 22.5,
-            rel_hum_perc: 45.0,
-            pressure_hpa: 1013.25,
-            gas_ohm: 50_000.0,
-            iaq_score: 97.91666666666666,
-            iaq_text: "Air quality is Good".to_string(),
-            dew_point_c: 9.964857762639978,
-            heat_index_c: 21.980555555555554,
-            altitude_m: 500.0,
-        },
+fn cache_record() -> TelemetryRecord {
+    TelemetryRecord {
+        route_id: "firmware-sensor".to_owned(),
+        device_id: "esp32-1".to_owned(),
+        measurement: "bme680".to_owned(),
+        timestamp_ms: 1_700_000_000_000,
+        tags: BTreeMap::new(),
+        fields: BTreeMap::from([
+            ("temp_c".to_owned(), TelemetryValue::Float(22.5)),
+            ("rel_hum_perc".to_owned(), TelemetryValue::Float(45.0)),
+            ("pressure_hpa".to_owned(), TelemetryValue::Float(1013.25)),
+            ("gas_ohm".to_owned(), TelemetryValue::Float(50_000.0)),
+            (
+                "dew_point_c".to_owned(),
+                TelemetryValue::Float(9.964857762639978),
+            ),
+            (
+                "heat_index_c".to_owned(),
+                TelemetryValue::Float(21.980555555555554),
+            ),
+            (
+                "iaq_score".to_owned(),
+                TelemetryValue::Float(97.91666666666666),
+            ),
+            (
+                "iaq_text".to_owned(),
+                TelemetryValue::String("Air quality is Good".to_owned()),
+            ),
+            ("altitude_m".to_owned(), TelemetryValue::Float(500.0)),
+            ("mqtt_retained".to_owned(), TelemetryValue::Boolean(false)),
+        ]),
+        source_topic: "smarthome/esp32-1/sensor".to_owned(),
+        retained: false,
     }
 }
 
@@ -223,8 +180,7 @@ async fn test_golden_cache_state_device_and_sse_envelopes() -> Result<()> {
     );
 
     let cache = CacheState::new(60_000, 64);
-    let sensor = cache_sensor();
-    cache.update_sensor(&sensor);
+    cache.update_record(&cache_record(), received_at_ms, 1);
     let ready = Arc::new(AtomicBool::new(false));
     let app = cache_http::router(cache.clone(), ready);
 
@@ -240,7 +196,7 @@ async fn test_golden_cache_state_device_and_sse_envelopes() -> Result<()> {
         .oneshot(Request::builder().uri("/v1/stream").body(Body::empty())?)
         .await?;
     assert!(response.status().is_success());
-    cache.update_sensor(&sensor);
+    cache.update_record(&cache_record(), received_at_ms, 2);
     let frame = tokio::time::timeout(Duration::from_secs(1), response.into_body().frame())
         .await?
         .context("cache SSE stream produced no event")??;
