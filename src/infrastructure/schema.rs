@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use jsonschema::{Draft, Resource, Retrieve, Uri, Validator as JsonSchemaValidator};
 use serde_json::Value;
 
-const BASE_SCHEMA: &str = include_str!("../../schema/base.schema.json");
+const BASE_SCHEMA: &str = include_str!("../../config/schemas/base.schema.json");
 
 /// Compiled JSON Schema validator with the shared base schema preloaded.
 pub struct JsonSchema {

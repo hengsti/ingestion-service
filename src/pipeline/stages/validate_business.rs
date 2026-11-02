@@ -21,13 +21,15 @@ pub struct ValidateBusinessStage {
 
 impl ValidateBusinessStage {
     pub fn new() -> Result<Self> {
-        let sensor_schema =
-            JsonSchema::new(include_str!("../../../schema/sensor.business.schema.json"))
-                .context("failed to load sensor business schema")?;
+        let sensor_schema = JsonSchema::new(include_str!(
+            "../../../config/schemas/sensor.business.schema.json"
+        ))
+        .context("failed to load sensor business schema")?;
 
-        let status_schema =
-            JsonSchema::new(include_str!("../../../schema/status.business.schema.json"))
-                .context("failed to load status business schema")?;
+        let status_schema = JsonSchema::new(include_str!(
+            "../../../config/schemas/status.business.schema.json"
+        ))
+        .context("failed to load status business schema")?;
 
         Ok(Self {
             sensor_schema,

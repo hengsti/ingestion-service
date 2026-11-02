@@ -328,8 +328,8 @@ mod tests {
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    const SENSOR_SCHEMA: &str = include_str!("../../../schema/sensor.schema.json");
-    const STATUS_SCHEMA: &str = include_str!("../../../schema/status.schema.json");
+    const SENSOR_SCHEMA: &str = include_str!("../../../config/schemas/sensor.schema.json");
+    const STATUS_SCHEMA: &str = include_str!("../../../config/schemas/status.schema.json");
 
     fn sensor_router() -> Arc<Router> {
         let route = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();

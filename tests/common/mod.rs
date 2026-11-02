@@ -29,8 +29,8 @@ use smarthome_ingest::{
     },
 };
 
-const SENSOR_SCHEMA: &str = include_str!("../../schema/sensor.schema.json");
-const STATUS_SCHEMA: &str = include_str!("../../schema/status.schema.json");
+const SENSOR_SCHEMA: &str = include_str!("../../config/schemas/sensor.schema.json");
+const STATUS_SCHEMA: &str = include_str!("../../config/schemas/status.schema.json");
 
 pub fn build_router() -> Arc<Router> {
     let sensor = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
