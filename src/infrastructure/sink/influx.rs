@@ -12,21 +12,33 @@ use crate::infrastructure::{
     sink::{point::Point, Encoder, Sink, SinkError},
     wal::types::WalEvent,
 };
-use crate::model::messages::{
-    message::HandledMessage, sensor::SensorMessage, status::StatusMessage,
-};
+use crate::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
 
 /// Renders canonical messages as InfluxDB line protocol, pairing 1:1 with
 /// [`InfluxSink`] (both are constructed together for a given output sink).
 pub struct InfluxEncoder;
 
 impl Encoder for InfluxEncoder {
-    fn encode(&self, message: &HandledMessage, out: &mut String) {
-        match message {
-            HandledMessage::Sensor(s) => sensor_to_point(s).write_line_protocol(out),
-            HandledMessage::Status(s) => status_to_point(s).write_line_protocol(out),
-        }
+    fn encode(&self, record: &TelemetryRecord, out: &mut String) {
+        telemetry_to_point(record).write_line_protocol(out);
     }
+}
+
+fn telemetry_to_point(record: &TelemetryRecord) -> Point {
+    let mut point = Point::build(&record.measurement);
+    for (key, value) in &record.tags {
+        point = point.tag(key, value);
+    }
+    for (key, value) in &record.fields {
+        point = match value {
+            TelemetryValue::Float(value) => point.field_f64(key, *value),
+            TelemetryValue::Integer(value) => point.field_i64(key, *value),
+            TelemetryValue::Unsigned(value) => point.field_u64(key, *value),
+            TelemetryValue::Boolean(value) => point.field_bool(key, *value),
+            TelemetryValue::String(value) => point.field_str(key, value),
+        };
+    }
+    point.timestamp_ms(record.timestamp_ms).build()
 }
 
 /// Writes WAL payload batches to the InfluxDB v2 write API with bounded retries.
@@ -162,87 +174,12 @@ fn is_permanent_status(status: StatusCode) -> bool {
         && status != StatusCode::TOO_MANY_REQUESTS
 }
 
-pub fn sensor_to_point(msg: &SensorMessage) -> Point {
-    let mut b = Point::build("bme680")
-        .tag("device_id", &msg.device_id)
-        .tag("room", &msg.room)
-        .tag("device_class", &msg.device_class)
-        .field_str("firmware_version", &msg.fw_version)
-        .field_f64("temp_c", msg.data.temp_c)
-        .field_f64("rel_hum_perc", msg.data.rel_hum_perc)
-        .field_f64("pressure_hpa", msg.data.pressure_hpa)
-        .field_f64("gas_ohm", msg.data.gas_ohm)
-        .field_f64("dew_point_c", msg.data.dew_point_c)
-        .field_f64("heat_index_c", msg.data.heat_index_c)
-        .field_bool("time_valid", msg.time_valid);
-
-    if msg.warmed_up != Some(false) {
-        b = b
-            .field_f64("iaq_score", msg.data.iaq_score)
-            .field_str("iaq_text", &msg.data.iaq_text);
-    }
-    if let Some(boot_id) = msg.boot_id {
-        b = b.field_u64("boot_id", u64::from(boot_id));
-    }
-    if let Some(seq) = msg.seq {
-        b = b.field_u64("seq", u64::from(seq));
-    }
-    if let Some(warmed_up) = msg.warmed_up {
-        b = b.field_bool("warmed_up", warmed_up);
-    }
-    if msg.replayed {
-        b = b.field_bool("replayed", true);
-    }
-
-    // Use the device timestamp only when it is marked valid and non-zero.
-    if msg.time_valid && msg.time_ms > 0 {
-        b = b.timestamp_ms(msg.time_ms);
-    }
-
-    b.build()
-}
-
-pub fn status_to_point(msg: &StatusMessage) -> Point {
-    let mut b = Point::build("device_status")
-        .tag("device_id", &msg.device_id)
-        .tag("device_class", &msg.device_class)
-        .field_str("firmware_version", &msg.fw_version)
-        .field_str("ip_address", &msg.ip)
-        .field_bool("time_valid", msg.time_valid)
-        .field_i64("uptime", msg.uptime)
-        .field_i64("free_mem", msg.free_mem)
-        .field_str("ssid", &msg.ssid)
-        .field_i64("rssi", msg.rssi);
-
-    if let Some(queued) = msg.queued {
-        b = b.field_i64("queued", queued);
-    }
-    if let Some(dropped_total) = msg.dropped_total {
-        b = b.field_i64("dropped_total", dropped_total);
-    }
-    if let Some(samples_failed_total) = msg.samples_failed_total {
-        b = b.field_i64("samples_failed_total", samples_failed_total);
-    }
-    if let Some(mqtt_connects_total) = msg.mqtt_connects_total {
-        b = b.field_i64("mqtt_connects_total", mqtt_connects_total);
-    }
-    if let Some(sensor_read_failures_total) = msg.sensor_read_failures_total {
-        b = b.field_i64("sensor_read_failures_total", sensor_read_failures_total);
-    }
-    if let Some(reset_reason) = &msg.reset_reason {
-        b = b.field_str("reset_reason", reset_reason);
-    }
-
-    if msg.time_valid && msg.time_ms > 0 {
-        b = b.timestamp_ms(msg.time_ms);
-    }
-
-    b.build()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
 
     fn sample_sensor() -> WalEvent {
         WalEvent {
@@ -294,5 +231,40 @@ mod tests {
         let err = http_write_error(StatusCode::SERVICE_UNAVAILABLE);
         let text = err.to_string();
         assert_eq!(text, "Influx write failed: status=503 Service Unavailable");
+    }
+
+    #[test]
+    fn test_telemetry_encoding_renders_typed_fields_sorted_and_escaped_at_ms_precision() {
+        let record = TelemetryRecord {
+            route_id: "typed-test".to_owned(),
+            device_id: "dev-1".to_owned(),
+            measurement: "weather, station".to_owned(),
+            timestamp_ms: 1_700_000_000_000,
+            tags: BTreeMap::from([
+                ("device_id".to_owned(), "dev-1".to_owned()),
+                ("room key".to_owned(), "lab,west".to_owned()),
+            ]),
+            fields: BTreeMap::from([
+                ("bool".to_owned(), TelemetryValue::Boolean(false)),
+                ("float".to_owned(), TelemetryValue::Float(1.5)),
+                ("int".to_owned(), TelemetryValue::Integer(-2)),
+                (
+                    "string".to_owned(),
+                    TelemetryValue::String("a\\b\"c".to_owned()),
+                ),
+                ("uint".to_owned(), TelemetryValue::Unsigned(3)),
+            ]),
+            source_topic: "home/dev-1/weather".to_owned(),
+            retained: false,
+        };
+        let mut line = String::new();
+
+        InfluxEncoder.encode(&record, &mut line);
+
+        assert_eq!(
+            line,
+            r#"weather\,\ station,device_id=dev-1,room\ key=lab\,west bool=false,float=1.5,int=-2i,string="a\\b\"c",uint=3u 1700000000000"#
+        );
+        assert_eq!(line.lines().count(), 1);
     }
 }
