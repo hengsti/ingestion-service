@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use super::{DlqPublisher, IngestDispatcher, IngestJob, Source};
 use crate::config::Config;
+use crate::infrastructure::router::RouteSet;
 
 /// Delay between reconnect attempts after an event-loop poll error.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -108,6 +109,9 @@ impl Source for MqttSource {
                             dispatcher.dispatch(IngestJob {
                                 topic: publish.topic,
                                 payload: publish.payload,
+                                received_at_ms: chrono::Utc::now().timestamp_millis(),
+                                receive_sequence: 0,
+                                retained: publish.retain,
                             });
                         }
                     }
@@ -161,8 +165,7 @@ impl DlqPublisher for MqttDlqPublisher {
 
 /// Builds an [`MqttSource`] + [`MqttDlqPublisher`] pair and returns both handles.
 /// The network connection is established once the source starts polling the
-/// returned event loop; the source subscribes to every configured non-DLQ
-/// `MQTT_TOPIC_*` route on each `ConnAck`.
+/// returned event loop; the source subscribes to the compiled route filters on each `ConnAck`.
 ///
 /// # Errors
 /// Returns an error if `cfg.mqtt` is `None` (should not happen — `Config::from_env`
@@ -170,6 +173,7 @@ impl DlqPublisher for MqttDlqPublisher {
 pub async fn build(
     cfg: &Config,
     ready: Arc<AtomicBool>,
+    routes: &RouteSet,
 ) -> Result<(Box<dyn Source>, Arc<dyn DlqPublisher>)> {
     let mqtt_cfg = cfg
         .mqtt
@@ -186,11 +190,10 @@ pub async fn build(
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
-    let filters = cfg
-        .topic_routes
-        .iter()
-        .filter(|(k, _)| !k.ends_with("DLQ"))
-        .map(|(_, topic)| SubscribeFilter::new(topic.clone(), QoS::AtLeastOnce))
+    let filters = routes
+        .subscriptions()
+        .into_iter()
+        .map(|topic| SubscribeFilter::new(topic.to_owned(), QoS::AtLeastOnce))
         .collect();
 
     let source: Box<dyn Source> = Box::new(MqttSource {

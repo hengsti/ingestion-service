@@ -2,7 +2,7 @@ pub mod mqtt;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,8 +15,16 @@ use crate::config::{Config, InputSourceKind};
 /// A single unit of work dispatched from a [`Source`] into the worker pool.
 #[derive(Debug)]
 pub struct IngestJob {
+    /// Concrete topic that delivered the message.
     pub topic: String,
+    /// Raw MQTT payload bytes.
     pub payload: Bytes,
+    /// Receive time captured once at MQTT intake, in epoch milliseconds.
+    pub received_at_ms: i64,
+    /// Monotonic intake order used to distinguish messages received in one millisecond.
+    pub receive_sequence: u64,
+    /// Whether the broker marked the message as retained.
+    pub retained: bool,
 }
 
 /// Round-robins [`IngestJob`]s across a fixed set of per-worker bounded channels.
@@ -27,6 +35,7 @@ pub struct IngestJob {
 pub struct IngestDispatcher {
     senders: Arc<[mpsc::Sender<IngestJob>]>,
     next: Arc<AtomicUsize>,
+    receive_sequence: Arc<AtomicU64>,
 }
 
 impl IngestDispatcher {
@@ -43,6 +52,7 @@ impl IngestDispatcher {
         Self {
             senders: senders.into(),
             next: Arc::new(AtomicUsize::new(0)),
+            receive_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -51,7 +61,8 @@ impl IngestDispatcher {
     /// If that worker's queue is full, the job is dropped, a warning is logged,
     /// and `ingest_event_queue_full_total` is incremented. The DLQ is not used
     /// for this pre-pipeline drop.
-    pub fn dispatch(&self, job: IngestJob) {
+    pub fn dispatch(&self, mut job: IngestJob) {
+        job.receive_sequence = self.receive_sequence.fetch_add(1, Ordering::Relaxed);
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         if let Err(err) = self.senders[idx].try_send(job) {
             metrics::counter!("ingest_event_queue_full_total").increment(1);
@@ -94,14 +105,14 @@ pub trait DlqPublisher: Send + Sync {
 /// Builds the configured input source and its matching DLQ publisher.
 ///
 /// # Errors
-/// Returns an error if `Config::input_source` names an unsupported source, or
-/// if the underlying transport fails to connect/subscribe during construction.
+/// Returns an error if the configured source is unsupported or lacks the MQTT configuration.
 pub async fn build_source(
     cfg: &Config,
     ready: Arc<AtomicBool>,
+    routes: &crate::infrastructure::router::RouteSet,
 ) -> Result<(Box<dyn Source>, Arc<dyn DlqPublisher>)> {
     match cfg.input_source {
-        InputSourceKind::Mqtt => mqtt::build(cfg, ready).await,
+        InputSourceKind::Mqtt => mqtt::build(cfg, ready, routes).await,
     }
 }
 
@@ -121,20 +132,45 @@ mod tests {
             dispatcher.dispatch(IngestJob {
                 topic: format!("topic/{i}"),
                 payload: Bytes::from_static(b"{}"),
+                received_at_ms: i,
+                receive_sequence: 0,
+                retained: i % 2 == 0,
             });
         }
 
         let mut received_a = Vec::new();
         while let Ok(job) = rx_a.try_recv() {
-            received_a.push(job.topic);
+            received_a.push((
+                job.topic,
+                job.received_at_ms,
+                job.receive_sequence,
+                job.retained,
+            ));
         }
         let mut received_b = Vec::new();
         while let Ok(job) = rx_b.try_recv() {
-            received_b.push(job.topic);
+            received_b.push((
+                job.topic,
+                job.received_at_ms,
+                job.receive_sequence,
+                job.retained,
+            ));
         }
 
-        assert_eq!(received_a, vec!["topic/0", "topic/2"]);
-        assert_eq!(received_b, vec!["topic/1", "topic/3"]);
+        assert_eq!(
+            received_a,
+            vec![
+                ("topic/0".to_string(), 0, 0, true),
+                ("topic/2".to_string(), 2, 2, true)
+            ]
+        );
+        assert_eq!(
+            received_b,
+            vec![
+                ("topic/1".to_string(), 1, 1, false),
+                ("topic/3".to_string(), 3, 3, false)
+            ]
+        );
     }
 
     #[tokio::test]
@@ -145,10 +181,16 @@ mod tests {
         dispatcher.dispatch(IngestJob {
             topic: "topic/first".to_string(),
             payload: Bytes::from_static(b"{}"),
+            received_at_ms: 10,
+            receive_sequence: 0,
+            retained: false,
         });
         dispatcher.dispatch(IngestJob {
             topic: "topic/second".to_string(),
             payload: Bytes::from_static(b"{}"),
+            received_at_ms: 11,
+            receive_sequence: 0,
+            retained: true,
         });
 
         let first = tokio::time::timeout(Duration::from_millis(50), rx.recv())
