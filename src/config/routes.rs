@@ -913,7 +913,11 @@ mod tests {
         assert!(load_value(&bundle).is_ok());
 
         bundle["schema_resources"]["https://schemas.example.test/resource"] =
-            json!("C:\\schemas\\resource.json");
+            json!(std::env::temp_dir()
+                .join("schemas")
+                .join("resource.json")
+                .to_string_lossy()
+                .into_owned());
         assert!(load_value(&bundle).is_err());
     }
 
