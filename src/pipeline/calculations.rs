@@ -87,6 +87,22 @@ impl CalculationRegistry {
         Ok(Self { calculations })
     }
 
+    /// Returns the field names and types produced by this calculation sequence.
+    pub(crate) fn output_field_types(&self) -> Vec<(&'static str, FieldType)> {
+        let mut fields = Vec::new();
+        for calculation in &self.calculations {
+            match calculation {
+                Calculation::DewPoint => fields.push(("dew_point_c", FieldType::Float)),
+                Calculation::HeatIndex => fields.push(("heat_index_c", FieldType::Float)),
+                Calculation::Iaq => {
+                    fields.push(("iaq_score", FieldType::Float));
+                    fields.push(("iaq_text", FieldType::String));
+                }
+            }
+        }
+        fields
+    }
+
     /// Applies the compiled calculations and returns the enriched record.
     ///
     /// # Errors
