@@ -119,7 +119,7 @@ pub struct FieldMapping {
 }
 
 /// Scalar types accepted by route field mappings.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
     /// A finite floating-point number.
@@ -440,7 +440,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<RouteBundle> {
 
 /// Reports deprecated topic-routing environment variable names.
 ///
-/// `MQTT_TOPIC_*` variables ending in `_DLQ` are retained and are not reported.
+/// `MQTT_TOPIC_DLQ` is retained and is not reported.
 ///
 /// This function does not return a `Result`; it returns `None` when no deprecated
 /// variables are present, otherwise a migration message naming them.
@@ -454,7 +454,7 @@ where
         .filter_map(|name| {
             let name = name.as_ref();
             let is_removed = name == "ENFORCE_TOPIC_DEVICE_MATCH"
-                || (name.starts_with("MQTT_TOPIC_") && !name.ends_with("_DLQ"));
+                || (name.starts_with("MQTT_TOPIC_") && name != "MQTT_TOPIC_DLQ");
             is_removed.then(|| name.to_owned())
         })
         .collect();
