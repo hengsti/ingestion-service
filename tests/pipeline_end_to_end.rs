@@ -13,8 +13,8 @@ use smarthome_ingest::{
     },
 };
 
-const SENSOR_SCHEMA: &str = include_str!("../schema/sensor.schema.json");
-const STATUS_SCHEMA: &str = include_str!("../schema/status.schema.json");
+const SENSOR_SCHEMA: &str = include_str!("../config/schemas/sensor.schema.json");
+const STATUS_SCHEMA: &str = include_str!("../config/schemas/status.schema.json");
 
 // ── happy-path tests ─────────────────────────────────────────────────────────
 

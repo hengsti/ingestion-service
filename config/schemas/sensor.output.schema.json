@@ -1,0 +1,181 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Canonical firmware sensor record",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "route_id": {
+      "const": "firmware-sensor"
+    },
+    "device_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "measurement": {
+      "const": "bme680"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "room": {
+          "type": "string",
+          "minLength": 1
+        },
+        "device_class": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "device_id",
+        "room",
+        "device_class"
+      ]
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/scalar"
+      },
+      "properties": {
+        "firmware_version": {
+          "type": "string"
+        },
+        "temp_c": {
+          "type": "number"
+        },
+        "rel_hum_perc": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "pressure_hpa": {
+          "type": "number",
+          "minimum": 300,
+          "maximum": 1200
+        },
+        "gas_ohm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "altitude_m": {
+          "type": "number"
+        },
+        "time_valid": {
+          "type": "boolean"
+        },
+        "boot_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "warmed_up": {
+          "type": "boolean"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "dew_point_c": {
+          "type": "number"
+        },
+        "heat_index_c": {
+          "type": "number"
+        },
+        "iaq_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "iaq_text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mqtt_retained": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "firmware_version",
+        "temp_c",
+        "rel_hum_perc",
+        "pressure_hpa",
+        "gas_ohm",
+        "altitude_m",
+        "time_valid",
+        "dew_point_c",
+        "heat_index_c",
+        "mqtt_retained"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "iaq_score",
+            "iaq_text"
+          ]
+        },
+        {
+          "properties": {
+            "warmed_up": {
+              "const": false
+            }
+          },
+          "required": [
+            "warmed_up"
+          ]
+        }
+      ]
+    },
+    "source_topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "retained": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "route_id",
+    "device_id",
+    "measurement",
+    "timestamp_ms",
+    "tags",
+    "fields",
+    "source_topic",
+    "retained"
+  ],
+  "definitions": {
+    "scalar": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    }
+  }
+}

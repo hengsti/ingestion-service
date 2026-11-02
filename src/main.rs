@@ -324,8 +324,8 @@ fn build_router(cfg: &Config) -> Result<Router> {
         };
 
         let schema = match message_type_name.as_str() {
-            "SENSOR" => include_str!("../schema/sensor.schema.json"),
-            "STATUS" => include_str!("../schema/status.schema.json"),
+            "SENSOR" => include_str!("../config/schemas/sensor.schema.json"),
+            "STATUS" => include_str!("../config/schemas/status.schema.json"),
             _ => unreachable!(),
         };
 

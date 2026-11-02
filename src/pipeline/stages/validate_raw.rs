@@ -88,8 +88,8 @@ mod tests {
         pipeline::stage::StageFlow,
     };
 
-    const SENSOR_SCHEMA: &str = include_str!("../../../schema/sensor.schema.json");
-    const STATUS_SCHEMA: &str = include_str!("../../../schema/status.schema.json");
+    const SENSOR_SCHEMA: &str = include_str!("../../../config/schemas/sensor.schema.json");
+    const STATUS_SCHEMA: &str = include_str!("../../../config/schemas/status.schema.json");
 
     /// Router with a single sensor route on `smarthome/+/sensor`.
     fn sensor_router() -> Arc<Router> {

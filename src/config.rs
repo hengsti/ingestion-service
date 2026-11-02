@@ -1,3 +1,8 @@
+/// Versioned route-bundle DTOs and the pure configuration loader.
+// The runtime adopts this module only during the atomic route cutover in issue #28.
+#[allow(dead_code)]
+pub mod routes;
+
 use anyhow::{bail, Context, Result};
 use secrecy::SecretString;
 use std::collections::HashMap;
