@@ -99,7 +99,7 @@
       }
     },
     "legacy_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=false",
-    "unified_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room altitude_m=500,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",mqtt_retained=false,pressure_hpa=1013.25,rel_hum_perc=45,time_valid=false 1700000000456"
+    "unified_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room altitude_m=500,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",mqtt_retained=false,pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=false 1700000000456"
   },
   {
     "id": "valid-time-zero",
