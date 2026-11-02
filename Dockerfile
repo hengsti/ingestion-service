@@ -2,7 +2,7 @@ FROM rust:1.87.0-bookworm AS build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY config/schemas ./config/schemas
+COPY config ./config
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
