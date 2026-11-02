@@ -64,17 +64,10 @@ const COUNTERS: &[&str] = &[
     "ingest_incoming_non_utf8_total",
     "ingest_incoming_invalid_json_total",
     "ingest_validate_raw_success_total",
-    "ingest_validate_raw_ignored_total",
     "ingest_validate_raw_failed_total",
-    "ingest_transform_attempt_total",
     "ingest_transform_success_total",
-    "ingest_transform_failed_total",
-    "ingest_transform_deserialize_failed_total",
-    "ingest_transform_ignored_total",
     "dlq_messages_published_total",
     "dlq_publish_errors_total",
-    "ingest_sensor_messages_processed_total",
-    "ingest_status_messages_processed_total",
     "influx_lines_written_total",
     "influx_write_success_total",
     "influx_write_errors_total",
@@ -85,28 +78,12 @@ const COUNTERS: &[&str] = &[
     "wal_segment_rotations_total",
 ];
 
-const KIND_COUNTERS: &[&str] = &[
-    "ingest_validate_business_success_total",
-    "ingest_validate_business_failed_total",
-    "ingest_cache_updates_total",
-    "ingest_messages_enqueued_total",
-    "ingest_queue_full_total",
-    "ingest_queue_closed_total",
-    "ingest_durability_ack_failed_total",
-    "ingest_messages_processed_total",
-];
-
 const WAL_WRITER_FATAL_REASONS: &[&str] =
     &["flush_before_rotation", "open_next_segment", "write_all"];
 
 fn register_metrics() {
     for &name in COUNTERS {
         counter!(name).absolute(0);
-    }
-    for &name in KIND_COUNTERS {
-        for kind in ["sensor", "status"] {
-            counter!(name, "kind" => kind).absolute(0);
-        }
     }
     for &reason in WAL_WRITER_FATAL_REASONS {
         counter!("wal_writer_fatal_total", "reason" => reason).absolute(0);
@@ -135,14 +112,7 @@ mod tests {
         for &name in COUNTERS {
             assert!(body.contains(&format!("\n{name} 0\n")), "missing {name}");
         }
-        for &name in KIND_COUNTERS {
-            for kind in ["sensor", "status"] {
-                assert!(
-                    body.contains(&format!("{name}{{kind=\"{kind}\"}} 0\n")),
-                    "missing {name}{{kind={kind}}}"
-                );
-            }
-        }
+        assert!(!body.contains("kind="));
         for &reason in WAL_WRITER_FATAL_REASONS {
             assert!(body.contains(&format!(
                 "wal_writer_fatal_total{{reason=\"{reason}\"}} 0\n"
