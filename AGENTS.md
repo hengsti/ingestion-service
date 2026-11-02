@@ -18,10 +18,11 @@ to verify behavior; older explanatory docs can drift.
 
 ## Application and code map
 
-A Rust 2021 service that ingests smart-home telemetry, validates and transforms it,
-stages encoded output in a local write-ahead log (WAL), and forwards batches to a sink.
-MQTT and InfluxDB v2 are the only implemented input/output pair today. Axum serves
-latest sensor state over HTTP/SSE; Prometheus metrics and JSON tracing expose operation.
+A Rust 2021 service that ingests smart-home telemetry, validates and maps it through a
+configured route, stages encoded output in a local write-ahead log (WAL), and forwards
+batches to a sink. MQTT and InfluxDB v2 are the only implemented input/output pair today.
+Axum serves latest cached device state over HTTP/SSE; Prometheus metrics and JSON tracing
+expose operation.
 Broker/database administration, device firmware, and dashboards are outside this repo.
 
 | Area | Start here |
@@ -30,16 +31,16 @@ Broker/database administration, device firmware, and dashboards are outside this
 | Environment parsing and source/sink selection | `src\config.rs` |
 | Input transport, dispatch, DLQ publishing | `src\infrastructure\source\mod.rs`, `src\infrastructure\source\mqtt.rs` |
 | Stage interface, context, runner, implementations | `src\pipeline\stage.rs`, `src\pipeline\context.rs`, `src\pipeline\runner.rs`, `src\pipeline\stages` |
-| Message types, topic matching, routing, schemas | `src\model`, `src\infrastructure\router.rs`, `src\infrastructure\schema.rs`, `schema` |
+| Telemetry types, topic matching, routing, schemas | `src\model`, `src\infrastructure\router.rs`, `src\infrastructure\schema.rs`, `config` |
 | Encoding, sink errors, InfluxDB line protocol | `src\infrastructure\sink\mod.rs`, `src\infrastructure\sink\influx.rs`, `src\infrastructure\sink\point.rs` |
 | WAL append, writer thread, recovery, cursor, forwarding | `src\infrastructure\wal` |
-| Latest sensor cache, HTTP/SSE, metrics | `src\infrastructure\cache`, `src\infrastructure\prometheus.rs` |
+| Latest-state cache, HTTP/SSE, metrics | `src\infrastructure\cache`, `src\infrastructure\prometheus.rs` |
 | Integration tests and reusable fixtures | `tests`, `tests\common\mod.rs` |
 | Build/deployment contracts | `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `compose.yaml`, `.github\workflows` |
 
 ```text
 Source -> IngestDispatcher -> bounded worker queues -> Pipeline
-Pipeline: decode -> validate_raw -> transform -> validate_business
+Pipeline: decode -> validate_raw -> transform -> validate_output
           -> cache_update -> persist -> observe
 persist: Encoder -> WAL append -> WAL forwarder -> Sink
 Context marked for DLQ -> failure stage -> active source's DlqPublisher
@@ -51,12 +52,13 @@ dispatch does not guarantee per-device processing order across workers.
 ## Contracts to preserve
 
 - **Validate before parsing:** enforce the 64 KiB input limit before UTF-8/JSON decoding.
-  Raw schemas validate publisher input; business schemas validate canonical transformed
-  messages. Schemas are embedded with `include_str!`, so changes require recompilation.
+  The selected route's raw schema validates publisher input; its optional output schema
+  validates the normalized typed record. Schema paths are loaded from `INGEST_ROUTES_FILE`.
 - **Stop is not rejection:** `Err` from a stage makes `PipelineRunner` mark the context
   for DLQ. `StageFlow::Stop` only stops execution; it does not automatically mark DLQ.
-  Use `ctx.mark_dlq(reason)` for explicit rejection, or `ctx.mark_ignored(reason)` for
-  intentional non-DLQ stops. A DLQ publish failure is logged, not recursively republished.
+  Use `ctx.mark_dlq(reason)` for explicit rejection; an intentional non-DLQ stop returns
+  `StageFlow::Stop` without marking the context. A DLQ publish failure is logged, not
+  recursively republished.
 - **Context carries stage state:** use `PipelineContext` accessors and propagate missing
   state errors with `?`. Do not bypass validation or silently synthesize missing values.
 - **Transport boundaries stay paired:** `build_source` constructs `Source` and
@@ -77,9 +79,9 @@ dispatch does not guarantee per-device processing order across workers.
   pipeline, increments `ingest_event_queue_full_total`, and does not publish DLQ.
   WAL append failures inside `PersistStage` do mark DLQ. Do not silently change either
   policy or replace bounded queues with unbounded buffering.
-- **Cache is not a delivery receipt:** only sensor messages update the latest-state
-  cache, and that update occurs before WAL persistence. Preserve HTTP/SSE contracts;
-  cached state does not prove successful persistence or sink delivery.
+- **Cache is not a delivery receipt:** only routes with `cache: true` update the
+  latest-state cache, and that update occurs before WAL persistence. Preserve HTTP/SSE
+  envelopes; cached state does not prove successful persistence or sink delivery.
 - **Shutdown must drain:** preserve queued-worker draining and the forwarder's final
   partial-batch flush. WAL recovery, cursor commits, and segment deletion must not
   discard uncommitted data.
@@ -90,15 +92,15 @@ dispatch does not guarantee per-device processing order across workers.
   external crates, then internal modules. Getter names omit `get_`.
 - Async object-safe traits use explicit `Pin<Box<dyn Future<...> + Send + 'a>>` and
   `Box::pin(async move { ... })`; do not introduce `async_trait` just for a new stage.
-  Keep the consuming builder style used by `PipelineRunner` and `Router`.
+  Keep the consuming builder style used by `PipelineRunner`.
 - Reuse existing error types; use `anyhow::Result` and `.context`/`.with_context` for
   service errors. Prefer `?` over production `unwrap()`. Document new public APIs,
   including `# Errors` and `# Panics` where applicable. Do not add unsafe service logic.
 - Keep lock scopes short and never hold a blocking lock across `.await`. Preserve the
   WAL writer's dedicated thread and existing blocking-I/O boundaries.
 - New stages must be registered in both `src\main.rs` and test pipeline builders.
-  Message changes must keep Rust models, raw/business schemas, transforms, routing,
-  encoders, and relevant cache/API contracts consistent. See `docs\development.md`.
+  Telemetry changes must keep the route bundle, raw/output schemas, mappings,
+  calculations, encoder, and cache/API contracts consistent. See `docs\development.md`.
 - Do not casually change persisted formats, external payloads, retry classifications,
   or configuration defaults. Make compatibility implications explicit and cover the
   changed behavior with focused tests. Keep dependency and lockfile edits scoped.
@@ -130,8 +132,8 @@ content/path review, not a Rust build.
 - Keep unit tests inline in `#[cfg(test)] mod tests`; integration tests belong in
   `tests`. Use descriptive behavior names, Arrange-Act-Assert, `#[tokio::test]` for
   async cases, and fallible test return values where practical.
-- Reuse `tests\common\mod.rs`: `build_pipeline`, `build_router`, `open_temp_wal`,
-  `valid_sensor_payload`, and `valid_status_payload`. Keep the returned `TempDir`
+- Reuse `tests\common\mod.rs`: `build_pipeline`, `build_pipeline_with_routes`,
+  `open_temp_wal`, and `valid_sensor_payload`. Keep the returned `TempDir`
   alive for the whole test or its WAL files disappear.
 - The shared DLQ client's event loop is intentionally dropped: publish warnings are
   expected, and these tests do not prove delivery to a broker. Sink integration tests
@@ -149,9 +151,10 @@ Release build: `cargo build --release --locked`. Container build:
   `.env` itself. Most runtime settings are required. Existing defaults include the
   WAL segment/queue sizes, input queue capacity, and `MQTT_CLEAN_SESSION=true`.
   Compose supplies its own values; do not confuse them with code defaults.
-- MQTT configuration populates generic `topic_routes` keyed by suffix
-  (`SENSOR`, `STATUS`, `DLQ`). DLQ is required at startup and is not a subscription.
-  Keep source-specific environment parsing out of the generic router.
+- `INGEST_ROUTES_FILE` supplies the route bundle; MQTT subscriptions derive only from
+  its compiled filters. `MQTT_TOPIC_DLQ` is required and publish-only. Removed
+  sensor/status subscription variables and `ENFORCE_TOPIC_DEVICE_MATCH` must fail
+  startup with a migration hint.
 - Change `src\config.rs`, `compose.yaml`, and `docs\configuration.md` together when
   changing the environment contract. CI renders Compose and checks its environment
   keys against the code; update that check when the contract requires it.
