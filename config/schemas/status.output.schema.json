@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Canonical firmware status record",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "route_id": {
+      "const": "firmware-status"
+    },
+    "device_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "measurement": {
+      "const": "device_status"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "device_class": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "device_id",
+        "device_class"
+      ]
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/scalar"
+      },
+      "properties": {
+        "firmware_version": {
+          "type": "string"
+        },
+        "ip_address": {
+          "type": "string",
+          "minLength": 1
+        },
+        "time_valid": {
+          "type": "boolean"
+        },
+        "rssi": {
+          "type": "integer"
+        },
+        "uptime": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "free_mem": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ssid": {
+          "type": "string"
+        },
+        "queued": {
+          "type": "integer"
+        },
+        "dropped_total": {
+          "type": "integer"
+        },
+        "samples_failed_total": {
+          "type": "integer"
+        },
+        "mqtt_connects_total": {
+          "type": "integer"
+        },
+        "sensor_read_failures_total": {
+          "type": "integer"
+        },
+        "reset_reason": {
+          "type": "string"
+        },
+        "mqtt_retained": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "firmware_version",
+        "ip_address",
+        "time_valid",
+        "rssi",
+        "uptime",
+        "free_mem",
+        "ssid",
+        "mqtt_retained"
+      ]
+    },
+    "source_topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "retained": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "route_id",
+    "device_id",
+    "measurement",
+    "timestamp_ms",
+    "tags",
+    "fields",
+    "source_topic",
+    "retained"
+  ],
+  "definitions": {
+    "scalar": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    }
+  }
+}
