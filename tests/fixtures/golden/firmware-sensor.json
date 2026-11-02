@@ -1,0 +1,153 @@
+[
+  {
+    "id": "default",
+    "topic": "smarthome/esp32-1/sensor",
+    "retained": false,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "room": "living_room",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 1700000000000,
+      "time_iso": "2023-11-14T22:13:20Z",
+      "time_valid": true,
+      "data": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "altitude_m": 500.0
+      }
+    },
+    "legacy_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=true 1700000000000",
+    "unified_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room altitude_m=500,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",mqtt_retained=false,pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=true 1700000000000"
+  },
+  {
+    "id": "warm-replayed-with-sequence",
+    "topic": "smarthome/esp32-1/sensor",
+    "retained": true,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "room": "living_room",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 1700000000000,
+      "time_iso": "2023-11-14T22:13:20Z",
+      "time_valid": true,
+      "boot_id": 7,
+      "seq": 42,
+      "warmed_up": true,
+      "replayed": true,
+      "data": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "altitude_m": 500.0
+      }
+    },
+    "legacy_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room boot_id=7u,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",pressure_hpa=1013.25,rel_hum_perc=45,replayed=true,seq=42u,temp_c=22.5,time_valid=true,warmed_up=true 1700000000000",
+    "unified_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room altitude_m=500,boot_id=7u,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",mqtt_retained=true,pressure_hpa=1013.25,rel_hum_perc=45,replayed=true,seq=42u,temp_c=22.5,time_valid=true,warmed_up=true 1700000000000"
+  },
+  {
+    "id": "not-warmed-replayed-false",
+    "topic": "smarthome/esp32-1/sensor",
+    "retained": false,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "room": "living_room",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 1700000000000,
+      "time_iso": "2023-11-14T22:13:20Z",
+      "time_valid": true,
+      "warmed_up": false,
+      "replayed": false,
+      "data": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "altitude_m": 500.0
+      }
+    },
+    "legacy_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=true,warmed_up=false 1700000000000",
+    "unified_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room altitude_m=500,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,mqtt_retained=false,pressure_hpa=1013.25,rel_hum_perc=45,replayed=false,temp_c=22.5,time_valid=true,warmed_up=false 1700000000000"
+  },
+  {
+    "id": "invalid-time",
+    "topic": "smarthome/esp32-1/sensor",
+    "retained": false,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "room": "living_room",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 0,
+      "time_iso": "1970-01-01T00:00:00Z",
+      "time_valid": false,
+      "data": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "altitude_m": 500.0
+      }
+    },
+    "legacy_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=false",
+    "unified_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room altitude_m=500,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",mqtt_retained=false,pressure_hpa=1013.25,rel_hum_perc=45,time_valid=false 1700000000456"
+  },
+  {
+    "id": "valid-time-zero",
+    "topic": "smarthome/esp32-1/sensor",
+    "retained": false,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "room": "living_room",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 0,
+      "time_iso": "1970-01-01T00:00:00Z",
+      "time_valid": true,
+      "data": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "altitude_m": 500.0
+      }
+    },
+    "legacy_line_protocol": "bme680,device_class=esp32p4-bme680,device_id=esp32-1,room=living_room dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=true",
+    "unified_line_protocol": null,
+    "unified_rejection": "timestamp_ms must be at least 1"
+  },
+  {
+    "id": "escaped-tags",
+    "topic": "smarthome/esp32-1/sensor",
+    "retained": false,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "room": "lab,west=1 room",
+      "device_class": "esp32,p4=bme 680",
+      "fw_version": "1.0.0",
+      "time_ms": 1700000000000,
+      "time_iso": "2023-11-14T22:13:20Z",
+      "time_valid": true,
+      "data": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "altitude_m": 500.0
+      }
+    },
+    "legacy_line_protocol": "bme680,device_class=esp32\\,p4\\=bme\\ 680,device_id=esp32-1,room=lab\\,west\\=1\\ room dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=true 1700000000000",
+    "unified_line_protocol": "bme680,device_class=esp32\\,p4\\=bme\\ 680,device_id=esp32-1,room=lab\\,west\\=1\\ room altitude_m=500,dew_point_c=9.964857762639978,firmware_version=\"1.0.0\",gas_ohm=50000,heat_index_c=21.980555555555554,iaq_score=97.91666666666666,iaq_text=\"Air quality is Good\",mqtt_retained=false,pressure_hpa=1013.25,rel_hum_perc=45,temp_c=22.5,time_valid=true 1700000000000"
+  }
+]

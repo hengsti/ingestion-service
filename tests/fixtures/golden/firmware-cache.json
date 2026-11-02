@@ -1,0 +1,71 @@
+{
+  "received_at_ms": 1700000000456,
+  "device_id": "esp32-1",
+  "homekit_keys": [
+    "device_id",
+    "last_seen_ms",
+    "value.temp_c",
+    "value.rel_hum_perc",
+    "value.iaq_score",
+    "value.iaq_text"
+  ],
+  "state_list": {
+    "ttl_ms": 60000,
+    "sensors": [
+      {
+        "device_id": "esp32-1",
+        "stale": false,
+        "last_seen_ms": 1700000000456,
+        "value": {
+          "temp_c": 22.5,
+          "rel_hum_perc": 45.0,
+          "pressure_hpa": 1013.25,
+          "gas_ohm": 50000.0,
+          "dew_point_c": 9.964857762639978,
+          "heat_index_c": 21.98055555555555,
+          "iaq_score": 97.91666666666666,
+          "iaq_text": "Air quality is Good",
+          "altitude_m": 500.0
+        }
+      }
+    ]
+  },
+  "device_state": {
+    "ttl_ms": 60000,
+    "device_id": "esp32-1",
+    "sensor": {
+      "stale": false,
+      "last_seen_ms": 1700000000456,
+      "value": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "dew_point_c": 9.964857762639978,
+        "heat_index_c": 21.98055555555555,
+        "iaq_score": 97.91666666666666,
+        "iaq_text": "Air quality is Good",
+        "altitude_m": 500.0
+      }
+    }
+  },
+  "sse": {
+    "event": "sensor",
+    "data": {
+      "kind": "sensor",
+      "device_id": "esp32-1",
+      "last_seen_ms": 1700000000456,
+      "value": {
+        "temp_c": 22.5,
+        "rel_hum_perc": 45.0,
+        "pressure_hpa": 1013.25,
+        "gas_ohm": 50000.0,
+        "dew_point_c": 9.964857762639978,
+        "heat_index_c": 21.98055555555555,
+        "iaq_score": 97.91666666666666,
+        "iaq_text": "Air quality is Good",
+        "altitude_m": 500.0
+      }
+    }
+  }
+}
