@@ -1,33 +1,55 @@
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::model::messages::message::HandledMessage;
+use crate::{infrastructure::router::CompiledRoute, model::messages::telemetry::TelemetryRecord};
 
-#[derive(Debug)]
 pub struct PipelineContext {
     topic: String,
     raw_payload: Bytes,
+    received_at_ms: i64,
+    receive_sequence: u64,
+    retained: bool,
     payload_utf8: Option<String>,
     payload_json: Option<Value>,
-    handled_message: Option<HandledMessage>,
+    route: Option<Arc<CompiledRoute>>,
+    telemetry_record: Option<TelemetryRecord>,
     dlq_reason: Option<String>,
-    ignored_reason: Option<String>,
     started_at: Instant,
 }
 
 impl PipelineContext {
+    /// Creates a context for locally constructed messages with current receive time.
+    #[allow(dead_code)]
     pub fn new(topic: impl Into<String>, raw_payload: impl Into<Bytes>) -> Self {
+        Self::new_with_metadata(
+            topic,
+            raw_payload,
+            chrono::Utc::now().timestamp_millis(),
+            false,
+        )
+    }
+
+    /// Creates a context with metadata captured by the input source.
+    pub fn new_with_metadata(
+        topic: impl Into<String>,
+        raw_payload: impl Into<Bytes>,
+        received_at_ms: i64,
+        retained: bool,
+    ) -> Self {
         Self {
             topic: topic.into(),
             raw_payload: raw_payload.into(),
+            received_at_ms,
+            receive_sequence: 0,
+            retained,
             payload_utf8: None,
             payload_json: None,
-            handled_message: None,
+            route: None,
+            telemetry_record: None,
             dlq_reason: None,
-            ignored_reason: None,
             started_at: Instant::now(),
         }
     }
@@ -38,6 +60,26 @@ impl PipelineContext {
 
     pub fn raw_payload(&self) -> &[u8] {
         &self.raw_payload
+    }
+
+    /// Returns the receive time captured at intake.
+    pub fn received_at_ms(&self) -> i64 {
+        self.received_at_ms
+    }
+
+    /// Sets the source-assigned intake order for cache update ordering.
+    pub fn set_receive_sequence(&mut self, receive_sequence: u64) {
+        self.receive_sequence = receive_sequence;
+    }
+
+    /// Returns the source-assigned intake order.
+    pub fn receive_sequence(&self) -> u64 {
+        self.receive_sequence
+    }
+
+    /// Returns whether the broker marked the source message as retained.
+    pub fn retained(&self) -> bool {
+        self.retained
     }
 
     pub fn started_at(&self) -> Instant {
@@ -65,20 +107,36 @@ impl PipelineContext {
             .ok_or_else(|| anyhow!("payload_json missing in pipeline context"))
     }
 
-    pub fn payload_json_mut(&mut self) -> Result<&mut Value> {
-        self.payload_json
-            .as_mut()
-            .ok_or_else(|| anyhow!("payload_json missing in pipeline context"))
+    /// Stores the compiled route selected during raw validation.
+    pub fn set_route(&mut self, route: Arc<CompiledRoute>) {
+        self.route = Some(route);
     }
 
-    pub fn set_handled_message(&mut self, msg: HandledMessage) {
-        self.handled_message = Some(msg);
+    /// Returns the selected compiled route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if route selection has not completed.
+    pub fn route(&self) -> Result<&CompiledRoute> {
+        self.route
+            .as_deref()
+            .ok_or_else(|| anyhow!("selected route missing in pipeline context"))
     }
 
-    pub fn handled_message(&self) -> Result<&HandledMessage> {
-        self.handled_message
+    /// Stores the mapped and calculated telemetry record.
+    pub fn set_telemetry_record(&mut self, record: TelemetryRecord) {
+        self.telemetry_record = Some(record);
+    }
+
+    /// Returns the mapped and calculated telemetry record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if mapping has not completed.
+    pub fn telemetry_record(&self) -> Result<&TelemetryRecord> {
+        self.telemetry_record
             .as_ref()
-            .ok_or_else(|| anyhow!("handled_message missing in pipeline context"))
+            .ok_or_else(|| anyhow!("telemetry_record missing in pipeline context"))
     }
 
     pub fn mark_dlq(&mut self, reason: impl Into<String>) {
@@ -93,16 +151,6 @@ impl PipelineContext {
 
     pub fn should_publish_dlq(&self) -> bool {
         self.dlq_reason.is_some()
-    }
-
-    pub fn mark_ignored(&mut self, reason: impl Into<String>) {
-        if self.ignored_reason.is_none() {
-            self.ignored_reason = Some(reason.into());
-        }
-    }
-
-    pub fn ignored_reason(&self) -> Option<&str> {
-        self.ignored_reason.as_deref()
     }
 
     pub fn payload_for_dlq(&self) -> String {

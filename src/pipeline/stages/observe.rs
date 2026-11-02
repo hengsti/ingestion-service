@@ -2,12 +2,9 @@ use std::{future::Future, pin::Pin};
 
 use metrics::{counter, histogram};
 
-use crate::{
-    model::messages::message::HandledMessage,
-    pipeline::{
-        context::PipelineContext,
-        stage::{PipelineStage, StageFlow, StageResult},
-    },
+use crate::pipeline::{
+    context::PipelineContext,
+    stage::{PipelineStage, StageFlow, StageResult},
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -29,17 +26,9 @@ impl PipelineStage for ObserveStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            let kind = match ctx.handled_message()? {
-                HandledMessage::Sensor(_) => {
-                    counter!("ingest_sensor_messages_processed_total").increment(1);
-                    "sensor"
-                }
-                HandledMessage::Status(_) => {
-                    counter!("ingest_status_messages_processed_total").increment(1);
-                    "status"
-                }
-            };
-            counter!("ingest_messages_processed_total", "kind" => kind).increment(1);
+            let route_id = ctx.route()?.id().to_owned();
+            ctx.telemetry_record()?;
+            counter!("ingest_messages_processed_total", "route" => route_id).increment(1);
 
             histogram!("ingest_pipeline_duration_seconds")
                 .record(ctx.started_at().elapsed().as_secs_f64());
@@ -51,98 +40,53 @@ impl PipelineStage for ObserveStage {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use anyhow::{Context, Result};
+
     use super::*;
     use crate::{
-        model::messages::{
-            message::HandledMessage,
-            sensor::{SensorData, SensorMessage},
-            status::StatusMessage,
-        },
+        config::routes,
+        infrastructure::router::RouteSet,
+        model::messages::telemetry::{TelemetryRecord, TelemetryValue},
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    fn sensor_message() -> HandledMessage {
-        HandledMessage::Sensor(SensorMessage {
-            device_id: "esp32-1".to_string(),
-            room: "living_room".to_string(),
-            device_class: "esp32p4-bme680".to_string(),
-            fw_version: "1.0.0".to_string(),
-            time_ms: 1_700_000_000_000,
-            time_iso: "2023-11-14T22:13:20Z".to_string(),
-            time_valid: true,
-            boot_id: None,
-            seq: None,
-            warmed_up: None,
-            replayed: false,
-            data: SensorData {
-                temp_c: 22.5,
-                rel_hum_perc: 45.0,
-                pressure_hpa: 1013.25,
-                gas_ohm: 50_000.0,
-                iaq_score: 85.0,
-                iaq_text: "Air quality is Good".to_string(),
-                dew_point_c: 9.5,
-                heat_index_c: 22.0,
-                altitude_m: 500.0,
-            },
-        })
-    }
-
-    fn status_message() -> HandledMessage {
-        HandledMessage::Status(StatusMessage {
-            device_id: "esp32-1".to_string(),
-            device_class: "esp32p4-bme680".to_string(),
-            fw_version: "1.0.0".to_string(),
-            ip: "192.168.1.42".to_string(),
-            rssi: -65,
-            time_ms: 1_700_000_000_000,
-            time_iso: "2023-11-14T22:13:20Z".to_string(),
-            time_valid: true,
-            uptime: 3600,
-            free_mem: 200_000,
-            ssid: "HomeNet".to_string(),
-            queued: None,
-            dropped_total: None,
-            samples_failed_total: None,
-            mqtt_connects_total: None,
-            sensor_read_failures_total: None,
-            reset_reason: None,
-        })
-    }
-
-    fn ctx_with_message(handled: HandledMessage) -> PipelineContext {
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
-        ctx.set_handled_message(handled);
-        ctx
-    }
-
     #[tokio::test]
-    async fn run_on_sensor_message_returns_continue() {
-        let mut ctx = ctx_with_message(sensor_message());
+    async fn run_on_configured_record_returns_continue() -> Result<()> {
+        let topic = "smarthome/ESP32-1/sensor";
+        let routes = Arc::new(RouteSet::compile(
+            routes::load("config/routes.json")?,
+            "smarthome/_dlq/ingest",
+        )?);
+        let route = routes.select(topic).context("route should match")?;
+        let record = TelemetryRecord {
+            route_id: route.id().to_owned(),
+            device_id: "ESP32-1".to_owned(),
+            measurement: route.config().measurement.clone(),
+            timestamp_ms: 1_700_000_000_000,
+            tags: BTreeMap::new(),
+            fields: BTreeMap::from([("mqtt_retained".to_owned(), TelemetryValue::Boolean(false))]),
+            source_topic: topic.to_owned(),
+            retained: false,
+        };
+        let mut ctx = PipelineContext::new(topic, vec![]);
+        ctx.set_route(route);
+        ctx.set_telemetry_record(record);
 
-        let result = ObserveStage::new().run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Continue)));
+        assert!(matches!(
+            ObserveStage::new().run(&mut ctx).await?,
+            StageFlow::Continue
+        ));
         assert!(!ctx.should_publish_dlq());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_on_status_message_returns_continue() {
-        let mut ctx = ctx_with_message(status_message());
+    async fn run_without_selected_route_returns_error() {
+        let mut ctx = PipelineContext::new("smarthome/ESP32-1/sensor", vec![]);
 
-        let result = ObserveStage::new().run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
-    }
-
-    #[tokio::test]
-    async fn run_without_handled_message_returns_error() {
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
-
-        let result = ObserveStage::new().run(&mut ctx).await;
-
-        assert!(result.is_err());
+        assert!(ObserveStage::new().run(&mut ctx).await.is_err());
         assert!(!ctx.should_publish_dlq());
     }
 }

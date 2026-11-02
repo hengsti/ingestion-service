@@ -227,7 +227,7 @@ fn map_payload_timestamp(config: &TimestampConfig, payload: &Value) -> Result<i6
     validate_timestamp_range(timestamp_ms)
 }
 
-fn validate_timestamp_range(timestamp_ms: i64) -> Result<i64> {
+pub(crate) fn validate_timestamp_range(timestamp_ms: i64) -> Result<i64> {
     if !(-MAX_INFLUX_TIMESTAMP_MS..=MAX_INFLUX_TIMESTAMP_MS).contains(&timestamp_ms) {
         bail!("timestamp_ms is outside the supported Influx timestamp range");
     }
