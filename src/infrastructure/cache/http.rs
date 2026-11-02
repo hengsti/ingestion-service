@@ -1,8 +1,8 @@
-use std::convert::Infallible;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::{collections::BTreeMap, convert::Infallible};
 
 use axum::{
     extract::{Path, State},
@@ -21,7 +21,7 @@ use tokio_stream::{
 };
 
 use super::state::{CacheEvent, CacheState};
-use crate::model::messages::sensor::SensorData;
+use crate::model::messages::telemetry::TelemetryValue;
 
 /// Builds the cache HTTP API router.
 pub fn router(state: CacheState, source_ready: Arc<AtomicBool>) -> Router {
@@ -48,33 +48,33 @@ async fn readyz(Extension(source_ready): Extension<Arc<AtomicBool>>) -> StatusCo
 }
 
 #[derive(Serialize)]
-struct SensorDto {
+struct DeviceDto {
     device_id: String,
     stale: bool,
     last_seen_ms: u64,
-    value: SensorData,
+    value: Arc<BTreeMap<String, TelemetryValue>>,
 }
 
 #[derive(Serialize)]
 struct SensorStateResponse {
     ttl_ms: u64,
-    sensors: Vec<SensorDto>,
+    sensors: Vec<DeviceDto>,
 }
 
 #[derive(Serialize)]
-struct SseSensorEvent {
+struct SseTelemetryEvent {
     kind: &'static str,
     device_id: String,
     last_seen_ms: u64,
-    value: SensorData,
+    value: Arc<BTreeMap<String, TelemetryValue>>,
 }
 
 async fn list_state(State(cache_state): State<CacheState>) -> impl IntoResponse {
     let ttl_ms = cache_state.ttl_ms();
     let sensors = cache_state
-        .snapshot_all_sensors()
+        .snapshot_all_devices()
         .into_iter()
-        .map(|(device_id, state, stale)| SensorDto {
+        .map(|(device_id, state, stale)| DeviceDto {
             device_id,
             stale,
             last_seen_ms: state.last_seen_ms,
@@ -86,17 +86,17 @@ async fn list_state(State(cache_state): State<CacheState>) -> impl IntoResponse 
 }
 
 #[derive(Serialize)]
-struct SensorDtoNoId {
+struct DeviceDtoNoId {
     stale: bool,
     last_seen_ms: u64,
-    value: SensorData,
+    value: Arc<BTreeMap<String, TelemetryValue>>,
 }
 
 #[derive(Serialize)]
 struct DeviceStateResponse {
     ttl_ms: u64,
     device_id: String,
-    sensor: Option<SensorDtoNoId>,
+    sensor: Option<DeviceDtoNoId>,
 }
 
 async fn get_state(
@@ -105,8 +105,8 @@ async fn get_state(
 ) -> impl IntoResponse {
     let ttl_ms = cache_state.ttl_ms();
     let sensor = cache_state
-        .snapshot_sensor(&device_id)
-        .map(|(state, stale)| SensorDtoNoId {
+        .snapshot_device(&device_id)
+        .map(|(state, stale)| DeviceDtoNoId {
             stale,
             last_seen_ms: state.last_seen_ms,
             value: state.value,
@@ -126,12 +126,12 @@ async fn stream_updates(
 
     let stream = BroadcastStream::new(rx).filter_map(|msg| {
         match msg {
-            Ok(CacheEvent::Sensor {
+            Ok(CacheEvent::Telemetry {
                 device_id,
                 last_seen_ms,
                 value,
             }) => {
-                let payload = SseSensorEvent {
+                let payload = SseTelemetryEvent {
                     kind: "sensor",
                     device_id,
                     last_seen_ms,
