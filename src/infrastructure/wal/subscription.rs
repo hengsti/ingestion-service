@@ -3,13 +3,11 @@ use std::sync::Arc;
 use std::{
     fs::File,
     io::{BufReader, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use anyhow::{Context, Result};
-use metrics::counter;
 use tokio::sync::Notify;
-use tracing::warn;
 
 #[cfg(test)]
 use crate::infrastructure::wal::test_support::{run_test_io_hook, TestIoHookSlot, TestIoStep};
@@ -70,8 +68,34 @@ impl WalSubscription {
         }
     }
 
-    pub async fn next(&mut self) -> Option<WalEntry> {
+    /// Reads the next record at or before the writer's synced head.
+    ///
+    /// # Errors
+    /// Returns an error when a segment or record inside the durable range cannot
+    /// be read. The reader position remains at the offending record.
+    pub async fn next(&mut self) -> Result<Option<WalEntry>> {
         loop {
+            let head = self.head.load();
+            let segment_id = self.cur_segment_id;
+            let byte_offset = self.cur_byte_offset;
+            if segment_id > head.segment_id
+                || (segment_id == head.segment_id && byte_offset > head.byte_offset)
+            {
+                anyhow::bail!(
+                    "WAL reader position {segment_id}:{byte_offset} exceeds durable head {head:?}"
+                );
+            }
+
+            if segment_id == head.segment_id && byte_offset == head.byte_offset {
+                if !self.wait_or_advance().await {
+                    if self.writer_state.failure().is_some() {
+                        anyhow::bail!("WAL writer failed at {segment_id}:{byte_offset}");
+                    }
+                    return Ok(None);
+                }
+                continue;
+            }
+
             // Offload the blocking open/seek/decode to a blocking thread so a
             // slow disk can't stall a runtime worker. The reader and payload
             // scratch buffer are moved in and handed back to preserve the cached
@@ -79,16 +103,26 @@ impl WalSubscription {
             // per-record allocation). `dir` is an `Arc<Path>`, so the clone is a
             // refcount bump, not a path allocation.
             let journal = Arc::clone(&self.journal);
-            let segment_id = self.cur_segment_id;
-            let byte_offset = self.cur_byte_offset;
             let reader = self.cur_reader.take();
             let payload = std::mem::take(&mut self.payload_buf);
+            let max_bytes = if segment_id == head.segment_id {
+                Some(head.byte_offset - byte_offset)
+            } else {
+                None
+            };
 
             let (outcome, reader, payload) = tokio::task::spawn_blocking(move || {
-                read_one(journal.dir(), segment_id, byte_offset, reader, payload)
+                read_one(
+                    journal.dir(),
+                    segment_id,
+                    byte_offset,
+                    max_bytes,
+                    reader,
+                    payload,
+                )
             })
             .await
-            .expect("WAL read_one blocking task panicked");
+            .with_context(|| format!("WAL read task failed at {segment_id}:{byte_offset}"))?;
 
             self.cur_reader = reader;
             self.payload_buf = payload;
@@ -100,134 +134,65 @@ impl WalSubscription {
                     event,
                     bytes_consumed,
                 } => {
-                    let record_start = WalOffset {
-                        segment_id: self.cur_segment_id,
-                        byte_offset: self.cur_byte_offset,
+                    let Some(byte_offset_after) =
+                        self.cur_byte_offset.checked_add(bytes_consumed as u64)
+                    else {
+                        self.cur_reader = None;
+                        anyhow::bail!("WAL reader offset overflowed at {segment_id}:{byte_offset}");
                     };
-                    self.cur_byte_offset += bytes_consumed as u64;
+                    if segment_id == head.segment_id && byte_offset_after > head.byte_offset {
+                        self.cur_reader = None;
+                        anyhow::bail!(
+                            "WAL record at {segment_id}:{byte_offset} extends past durable head {head:?}"
+                        );
+                    }
+                    let record_start = WalOffset {
+                        segment_id,
+                        byte_offset,
+                    };
+                    self.cur_byte_offset = byte_offset_after;
                     let offset_after = WalOffset {
-                        segment_id: self.cur_segment_id,
+                        segment_id,
                         byte_offset: self.cur_byte_offset,
                     };
 
-                    return Some(WalEntry {
+                    return Ok(Some(WalEntry {
                         offset: record_start,
                         offset_after,
                         event,
-                    });
+                    }));
                 }
 
-                // Segment file doesn't exist yet — the writer hasn't rolled into
-                // it. Wait-or-advance and retry.
-                ReadOutcome::NotFound => {
-                    if !self.wait_or_advance().await {
-                        return None;
-                    }
-                }
-
-                // Transient open error from our point of view; log and retry once
-                // we get a notification.
-                ReadOutcome::OpenError { path, error } => {
-                    warn!(
-                        error = %error,
-                        path = %path.display(),
-                        "WAL subscription: failed to open segment; retrying after notify"
-                    );
-                    if !self.wait_or_advance().await {
-                        return None;
-                    }
-                }
-
-                ReadOutcome::SeekError(error) => {
-                    warn!(error = %error, "WAL subscription: seek failed; retrying after notify");
-                    if !self.wait_or_advance().await {
-                        return None;
-                    }
-                }
-
-                // Reader saw EOF (or a torn tail). Keep the same descriptor open
-                // and wait for notify/head advance; the next read on this
-                // descriptor observes newly appended bytes without reopen churn.
+                ReadOutcome::NotFound => anyhow::bail!(
+                    "WAL segment {segment_id} is missing at durable offset {byte_offset}"
+                ),
+                ReadOutcome::OpenError(error) => anyhow::bail!(
+                    "WAL segment {segment_id} open failed at durable offset {byte_offset}: {}",
+                    error.kind()
+                ),
+                ReadOutcome::SeekError(error) => anyhow::bail!(
+                    "WAL segment {segment_id} seek failed at durable offset {byte_offset}: {}",
+                    error.kind()
+                ),
                 ReadOutcome::Eof => {
-                    if !self.wait_or_advance().await {
-                        return None;
-                    }
-                }
-
-                // A fully-framed record whose payload failed to decode. Torn tails
-                // are healed at `open` (recovery truncation), so this is either the
-                // *active* tail mid-flush or a durable-but-corrupt record with
-                // committed data after it. Wait for the former, skip the latter.
-                ReadOutcome::Corrupt(e) => {
-                    let head = self.head.load();
-                    let at_active_tail = head.segment_id == self.cur_segment_id
-                        && self.cur_byte_offset >= head.byte_offset;
-
-                    if at_active_tail {
-                        // Not yet marked durable by the writer's head — treat as a
-                        // torn active tail and wait, preserving prior behavior.
-                        warn!(
-                            error = %e,
-                            "WAL subscription: decode error at active tail; treating as torn, waiting"
-                        );
-                        if !self.wait_or_advance().await {
-                            return None;
-                        }
+                    if segment_id < head.segment_id {
+                        self.cur_segment_id = segment_id
+                            .checked_add(1)
+                            .context("WAL segment identifier overflowed")?;
+                        self.cur_byte_offset = 0;
+                        self.cur_reader = None;
                         continue;
                     }
-
-                    // Durable poison: committed bytes follow this record. Retrying
-                    // the same offset would stall the pipeline forever, so skip it.
-                    warn!(
-                        error = %e,
-                        segment_id = self.cur_segment_id,
-                        byte_offset = self.cur_byte_offset,
-                        "WAL subscription: corrupt durable record; skipping"
+                    anyhow::bail!(
+                        "unexpected WAL EOF at durable offset {segment_id}:{byte_offset} (head {head:?})"
                     );
-                    counter!("wal_subscription_corrupt_skipped_total").increment(1);
-                    if !self.skip_corrupt_record().await {
-                        return None;
-                    }
+                }
+                ReadOutcome::Corrupt(error) => {
+                    return Err(error).context(format!(
+                        "WAL record is corrupt at durable offset {segment_id}:{byte_offset}"
+                    ));
                 }
             }
-        }
-    }
-
-    /// Advances the read cursor past a corrupt-but-durable record at the current
-    /// offset so the pipeline isn't stalled re-reading it forever.
-    ///
-    /// Reads the record's 4-byte length prefix directly to compute its on-disk
-    /// width and skips `4 + len`. If the prefix is unreadable (defensive — a
-    /// durable record's prefix is always present), it falls back to
-    /// `wait_or_advance`, which rolls to the next segment if the writer has
-    /// sealed this one. Returns `false` only when there is nothing left to read.
-    async fn skip_corrupt_record(&mut self) -> bool {
-        let journal = Arc::clone(&self.journal);
-        let segment_id = self.cur_segment_id;
-        let byte_offset = self.cur_byte_offset;
-        let len = tokio::task::spawn_blocking(move || {
-            let path = segment::segment_path(journal.dir(), segment_id);
-            read_len_prefix(&path, byte_offset)
-        })
-        .await
-        .expect("WAL skip_corrupt_record blocking task panicked");
-
-        match len {
-            Some(len) => {
-                const MAX_SKIP_BYTES: u64 = 1024 * 1024;
-                if u64::from(len) > MAX_SKIP_BYTES {
-                    warn!(
-                        segment_id,
-                        byte_offset,
-                        len,
-                        "WAL subscription: corrupt record length too large; cannot skip safely"
-                    );
-                    return self.wait_or_advance().await;
-                }
-                self.cur_byte_offset += 4 + u64::from(len);
-                true
-            }
-            None => self.wait_or_advance().await,
         }
     }
 
@@ -368,7 +333,7 @@ impl WalSubscription {
         let head = self.head.load();
 
         // The writer rotated into a newer segment: the current one is fully
-        // written and flushed, so move on and read the next segment.
+        // written and synced, so move on and read the next segment.
         if head.segment_id > self.cur_segment_id {
             self.cur_segment_id += 1;
             self.cur_byte_offset = 0;
@@ -407,7 +372,7 @@ impl WalSubscription {
 
 /// Outcome of a single blocking read attempt performed off-runtime by
 /// [`read_one`]. The async [`WalSubscription::next`] inspects this to drive its
-/// control flow (advance, wait, or skip) without ever touching the disk itself.
+/// control flow without ever touching the disk itself.
 //
 // `Record` (the hot, common case) carries the decoded `WalEvent` inline. Boxing
 // it to equalise the variant sizes would add a heap allocation per record on the
@@ -420,18 +385,15 @@ enum ReadOutcome {
         event: WalEvent,
         bytes_consumed: usize,
     },
-    /// Segment file not present yet — the writer hasn't rolled into it.
+    /// Segment file is missing inside the durable range.
     NotFound,
-    /// The segment couldn't be opened (transient); carries the path for logging.
-    OpenError {
-        path: PathBuf,
-        error: std::io::Error,
-    },
-    /// Seeking to the read cursor failed (transient).
+    /// The segment couldn't be opened.
+    OpenError(std::io::Error),
+    /// Seeking to the read cursor failed.
     SeekError(std::io::Error),
-    /// Clean EOF or a torn tail — wait for the writer to append more.
+    /// Clean EOF at a sealed segment boundary.
     Eof,
-    /// A fully-framed record whose payload won't decode.
+    /// A record whose framing or payload failed to decode.
     Corrupt(anyhow::Error),
 }
 
@@ -447,6 +409,7 @@ fn read_one(
     dir: &Path,
     segment_id: u64,
     byte_offset: u64,
+    max_bytes: Option<u64>,
     mut reader: Option<BufReader<File>>,
     mut payload: Vec<u8>,
 ) -> (ReadOutcome, Option<BufReader<File>>, Vec<u8>) {
@@ -458,7 +421,7 @@ fn read_one(
                 return (ReadOutcome::NotFound, None, payload);
             }
             Err(e) => {
-                return (ReadOutcome::OpenError { path, error: e }, None, payload);
+                return (ReadOutcome::OpenError(e), None, payload);
             }
         };
 
@@ -475,7 +438,11 @@ fn read_one(
     }
 
     let r = reader.as_mut().expect("reader just initialised above");
-    match codec::decode_into(r, &mut payload) {
+    let decoded = match max_bytes {
+        Some(max_bytes) => codec::decode_into(&mut r.take(max_bytes), &mut payload),
+        None => codec::decode_into(r, &mut payload),
+    };
+    match decoded {
         Ok(Some((event, bytes_consumed))) => (
             ReadOutcome::Record {
                 event,
@@ -489,16 +456,6 @@ fn read_one(
     }
 }
 
-/// Reads the 4-byte little-endian length prefix of a record at `offset` in the
-/// segment at `path`. Returns `None` if the file or prefix can't be read.
-fn read_len_prefix(path: &Path, offset: u64) -> Option<u32> {
-    let mut file = File::open(path).ok()?;
-    file.seek(SeekFrom::Start(offset)).ok()?;
-    let mut len_buf = [0u8; 4];
-    file.read_exact(&mut len_buf).ok()?;
-    Some(u32::from_le_bytes(len_buf))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,15 +467,8 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
-    async fn recv_one(sub: &mut WalSubscription, ms: u64) -> Option<WalEntry> {
-        tokio::time::timeout(Duration::from_millis(ms), sub.next())
-            .await
-            .ok()
-            .flatten()
-    }
-
     #[tokio::test]
-    async fn test_next_corrupt_record_in_sealed_segment_skips_and_yields_following_record() {
+    async fn test_wal_read_failure_corrupt_record_stops_at_offending_offset() -> Result<()> {
         let dir = tempdir().unwrap();
 
         // Build segment 1 by hand: good record A, a fully-framed but corrupt
@@ -535,22 +485,22 @@ mod tests {
         f.write_all(&buf).unwrap();
         f.write_all(&8u32.to_le_bytes()).unwrap();
         f.write_all(&[0xFFu8; 8]).unwrap();
-        encode_into(&mut buf, &sample_event(3)).unwrap();
-        f.write_all(&buf).unwrap();
         drop(f);
 
-        // A second, empty segment makes segment 1 "sealed" (head points past it),
-        // so the corrupt record is classified as durable poison, not a torn tail.
-        OpenOptions::new()
+        let later_path = dir.path().join(segment_filename(2));
+        let mut later_file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(dir.path().join(segment_filename(2)))
+            .open(later_path)
             .unwrap();
+        encode_into(&mut buf, &sample_event(3)).unwrap();
+        later_file.write_all(&buf).unwrap();
+        drop(later_file);
 
         let head = Arc::new(AtomicWalOffset::new(WalOffset {
             segment_id: 2,
-            byte_offset: 0,
+            byte_offset: buf.len() as u64,
         }));
         let notify = Arc::new(Notify::new());
         let mut sub = WalSubscription::new(
@@ -565,15 +515,212 @@ mod tests {
             },
         );
 
-        let a = recv_one(&mut sub, 500).await.expect("record A");
+        let a = sub.next().await?.context("record A")?;
         assert_eq!(a.event.ts_ms, sample_event(1).ts_ms);
 
-        let c = recv_one(&mut sub, 500).await.expect("record C after skip");
-        assert_eq!(c.event.ts_ms, sample_event(3).ts_ms);
-        assert_eq!(c.offset.segment_id, 1);
+        let error = match sub.next().await {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("a corrupt durable frame must fail instead of being skipped"),
+        };
+        assert!(error.to_string().contains("corrupt"));
+        assert_eq!(sub.cur_segment_id, a.offset_after.segment_id);
+        assert_eq!(sub.cur_byte_offset, a.offset_after.byte_offset);
+        Ok(())
+    }
 
-        // Nothing else durable: the subscription parks on the empty segment 2.
-        assert!(recv_one(&mut sub, 150).await.is_none());
+    #[tokio::test]
+    async fn test_wal_read_failure_missing_segment_does_not_skip_to_later_segment() -> Result<()> {
+        let dir = tempdir()?;
+        let first = sample_event(1);
+        let later = sample_event(3);
+        let mut first_frame = Vec::new();
+        let mut later_frame = Vec::new();
+        encode_into(&mut first_frame, &first)?;
+        encode_into(&mut later_frame, &later)?;
+        fs::write(dir.path().join(segment_filename(1)), first_frame)?;
+        fs::write(dir.path().join(segment_filename(3)), &later_frame)?;
+
+        let mut sub = new_sub_with_head(
+            dir.path(),
+            WalOffset {
+                segment_id: 1,
+                byte_offset: 0,
+            },
+            WalOffset {
+                segment_id: 3,
+                byte_offset: later_frame.len() as u64,
+            },
+        )?;
+        let first_read = sub.next().await?.context("first segment record")?;
+        assert_eq!(first_read.event.ts_ms, first.ts_ms);
+
+        let error = match sub.next().await {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("reader must not roll over a missing durable segment"),
+        };
+        assert!(error.to_string().contains("missing"));
+        assert_eq!(sub.cur_segment_id, 2);
+        assert_eq!(sub.cur_byte_offset, 0);
+        assert!(crate::infrastructure::wal::cursor::read_cursor(dir.path())?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_read_failure_retries_same_offset_after_restore() -> Result<()> {
+        let dir = tempdir()?;
+        let event = sample_event(1);
+        let mut frame = Vec::new();
+        encode_into(&mut frame, &event)?;
+        let path = dir.path().join(segment_filename(1));
+        fs::write(&path, &frame)?;
+        let mut sub = new_sub_with_head(
+            dir.path(),
+            WalOffset {
+                segment_id: 1,
+                byte_offset: 0,
+            },
+            WalOffset {
+                segment_id: 1,
+                byte_offset: frame.len() as u64,
+            },
+        )?;
+
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        assert!(sub.next().await.is_err());
+        assert_eq!(sub.cur_byte_offset, 0);
+
+        fs::remove_dir(&path)?;
+        fs::write(&path, frame)?;
+        let replayed = sub.next().await?.context("replayed record")?;
+        assert_eq!(replayed.offset.byte_offset, 0);
+        assert_eq!(replayed.event.ts_ms, event.ts_ms);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_read_failure_cancelled_wait_replays_from_same_offset() -> Result<()> {
+        let dir = tempdir()?;
+        let event = sample_event(1);
+        let mut frame = Vec::new();
+        encode_into(&mut frame, &event)?;
+        fs::write(dir.path().join(segment_filename(1)), &frame)?;
+
+        let start = WalOffset {
+            segment_id: 1,
+            byte_offset: 0,
+        };
+        let head = Arc::new(AtomicWalOffset::new(start));
+        let notify = Arc::new(Notify::new());
+        let mut sub = WalSubscription::new(
+            Arc::new(Journal::open(dir.path().to_path_buf())?),
+            Capacity::recover(dir.path(), 128 * 1024 * 1024)?,
+            head.clone(),
+            notify.clone(),
+            Arc::new(WriterState::default()),
+            start,
+        );
+
+        {
+            let next = sub.next();
+            tokio::pin!(next);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut next)
+                    .await
+                    .is_err(),
+                "bytes past the published head must not be read"
+            );
+        }
+
+        head.store(WalOffset {
+            segment_id: 1,
+            byte_offset: frame.len() as u64,
+        });
+        notify.notify_waiters();
+        let replayed = tokio::time::timeout(Duration::from_millis(500), sub.next())
+            .await
+            .context("waiting for the synced head")??
+            .context("synced record")?;
+        assert_eq!(replayed.offset.byte_offset, 0);
+        assert_eq!(replayed.event.ts_ms, event.ts_ms);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_read_failure_waits_for_future_segment_until_head_advances() -> Result<()> {
+        let dir = tempdir()?;
+        let event = sample_event(1);
+        let mut frame = Vec::new();
+        encode_into(&mut frame, &event)?;
+        make_segment(dir.path(), 1);
+        fs::write(dir.path().join(segment_filename(2)), &frame)?;
+
+        let start = WalOffset {
+            segment_id: 1,
+            byte_offset: 0,
+        };
+        let head = Arc::new(AtomicWalOffset::new(start));
+        let notify = Arc::new(Notify::new());
+        let mut sub = WalSubscription::new(
+            Arc::new(Journal::open(dir.path().to_path_buf())?),
+            Capacity::recover(dir.path(), 128 * 1024 * 1024)?,
+            head.clone(),
+            notify.clone(),
+            Arc::new(WriterState::default()),
+            start,
+        );
+
+        {
+            let next = sub.next();
+            tokio::pin!(next);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut next)
+                    .await
+                    .is_err(),
+                "a segment beyond the durable head must not be read"
+            );
+        }
+
+        head.store(WalOffset {
+            segment_id: 2,
+            byte_offset: frame.len() as u64,
+        });
+        notify.notify_waiters();
+        let entry = tokio::time::timeout(Duration::from_millis(500), sub.next())
+            .await
+            .context("waiting for the next durable segment")??
+            .context("future segment record")?;
+        assert_eq!(entry.event.ts_ms, event.ts_ms);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_read_failure_short_record_stops_at_original_offset() -> Result<()> {
+        let dir = tempdir()?;
+        let mut frame = Vec::new();
+        encode_into(&mut frame, &sample_event(1))?;
+        let head_offset = frame.len() as u64;
+        fs::write(
+            dir.path().join(segment_filename(1)),
+            &frame[..frame.len() - 1],
+        )?;
+        let start = WalOffset {
+            segment_id: 1,
+            byte_offset: 0,
+        };
+        let mut sub = new_sub_with_head(
+            dir.path(),
+            start,
+            WalOffset {
+                segment_id: 1,
+                byte_offset: head_offset,
+            },
+        )?;
+
+        assert!(sub.next().await.is_err());
+        assert_eq!(sub.cur_segment_id, start.segment_id);
+        assert_eq!(sub.cur_byte_offset, start.byte_offset);
+        Ok(())
     }
 
     #[tokio::test]
@@ -615,7 +762,7 @@ mod tests {
             .open(seg)
             .unwrap();
 
-        let (outcome, reader, payload) = read_one(dir.path(), 1, 0, None, Vec::new());
+        let (outcome, reader, payload) = read_one(dir.path(), 1, 0, None, None, Vec::new());
         assert!(matches!(outcome, ReadOutcome::Eof));
         assert!(
             reader.is_some(),
@@ -634,14 +781,18 @@ mod tests {
     }
 
     fn new_sub(dir: &Path, start: WalOffset) -> WalSubscription {
-        WalSubscription::new(
-            Arc::new(Journal::open(dir.to_path_buf()).unwrap()),
-            Capacity::recover(dir, 128 * 1024 * 1024).unwrap(),
-            Arc::new(AtomicWalOffset::new(start)),
+        new_sub_with_head(dir, start, start).expect("create WAL subscription")
+    }
+
+    fn new_sub_with_head(dir: &Path, start: WalOffset, head: WalOffset) -> Result<WalSubscription> {
+        Ok(WalSubscription::new(
+            Arc::new(Journal::open(dir.to_path_buf())?),
+            Capacity::recover(dir, 128 * 1024 * 1024)?,
+            Arc::new(AtomicWalOffset::new(head)),
             Arc::new(Notify::new()),
             Arc::new(WriterState::default()),
             start,
-        )
+        ))
     }
 
     fn remaining_segments(dir: &Path) -> Vec<u64> {
