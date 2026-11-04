@@ -87,6 +87,7 @@ A complete walkthrough is available in [docs/tutorial.md](docs/tutorial.md).
 For Docker Compose (standalone or in the Server stack), use [`compose.yaml`](compose.yaml). See [docs/operations.md](docs/operations.md#run-with-docker-compose).
 
 The Docker image healthcheck probes `http://localhost:8085/healthz`, so set `CACHE_BIND=0.0.0.0:8085` when running the container.
+The image includes the default route bundle and schemas under `/app/config`.
 
 ```bash
 docker build -t smarthome-ingest .
@@ -109,12 +110,12 @@ docker run --rm \
   -e INFLUX_TOKEN=change-me \
   -e BATCH_SIZE=500 \
   -e FLUSH_INTERVAL_MS=1000 \
-  -e WAL_DIR=/app/wal \
+  -e WAL_DIR=/data/wal \
   -e METRICS_BIND=0.0.0.0:9090 \
   -e CACHE_BIND=0.0.0.0:8085 \
   -e CACHE_TTL_MS=60000 \
   -e CACHE_BUFFER=1024 \
-  -v smarthome-ingest-wal:/app/wal \
+  -v smarthome-ingest-wal:/data/wal \
   smarthome-ingest
 ```
 

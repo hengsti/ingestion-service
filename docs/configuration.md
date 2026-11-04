@@ -20,7 +20,11 @@ The service ingests messages through a swappable `Source` abstraction (see `docs
 
 The shipped bundle is [`config/routes.json`](../config/routes.json). It is compiled once at startup;
 an empty route list or invalid route/schema fails startup. Schema-resource paths are relative to the
-bundle's directory. Keep the bundle and its `schemas/` directory together when deploying.
+bundle's directory. Keep the bundle and its `schemas/` directory together when deploying. The
+image includes them at `/app/config`; Compose can override them with a bind mount.
+
+The bundled firmware sensor filter is `smarthome/+/bme680`. If publishers use a different
+topic, configure the sensor route's `topic` to match.
 
 The former `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other non-DLQ `MQTT_TOPIC_*` variables, and
 `ENFORCE_TOPIC_DEVICE_MATCH` are rejected at startup with a migration hint to use the route bundle.
@@ -44,7 +48,11 @@ the publish destination for rejected messages; it is not a subscription.
 
 With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
 
-The source subscribes to the route bundle's filters on each connection.
+The source subscribes to the route bundle's filters on each connection. A persistent broker
+session retains obsolete subscriptions when filters change; remove those subscriptions or
+migrate to a new client ID. Resetting or replacing a session can discard its queued messages.
+Messages from obsolete subscriptions that reach the pipeline without a matching route are
+routed to the DLQ.
 
 ## InfluxDB
 
@@ -112,8 +120,9 @@ The service divides `INPUT_QUEUE_CAPACITY` by worker count to create one bounded
 - Maximum number of devices retained in the latest-state cache.
 - Number of events retained in the SSE broadcast channel.
 
-Only routes with `cache: true` update the cache. When it is full and a new device arrives, the
-stalest cached device is evicted.
+Only routes with `cache: true` update the cache. When it is full, a new device replaces the
+least recently received entry only if its receive sequence is newer; older delayed records
+are ignored by the cache but continue through the pipeline.
 
 ## Docker Compose
 
