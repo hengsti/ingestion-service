@@ -83,6 +83,9 @@ impl PipelineStage for PersistStage {
 
                     Ok(StageFlow::Stop)
                 }
+                Err(AppendDurableError::TooLarge(_)) => {
+                    anyhow::bail!("encoded telemetry exceeds the WAL reader record limit")
+                }
                 Err(AppendDurableError::Durability(reason)) => {
                     counter!("ingest_durability_ack_failed_total", "route" => route_id.clone())
                         .increment(1);
