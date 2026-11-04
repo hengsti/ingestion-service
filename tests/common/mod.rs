@@ -114,11 +114,11 @@ pub async fn build_pipeline_with_routes_and_encoder(
 /// Pulls the next persisted event from the WAL, returning `None` if none
 /// arrives within `ms` milliseconds (used to assert "nothing was persisted").
 pub async fn recv_event(sub: &mut WalSubscription, ms: u64) -> Option<WalEvent> {
-    tokio::time::timeout(Duration::from_millis(ms), sub.next())
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.event)
+    match tokio::time::timeout(Duration::from_millis(ms), sub.next()).await {
+        Ok(Ok(Some(entry))) => Some(entry.event),
+        Ok(Ok(None)) | Err(_) => None,
+        Ok(Err(error)) => panic!("WAL subscription failed: {error:#}"),
+    }
 }
 
 pub fn valid_sensor_payload(device_id: &str) -> Vec<u8> {

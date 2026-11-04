@@ -23,7 +23,7 @@ pub(super) fn validate_committed_offset(path: &Path, offset: u64) -> Result<()> 
             codec::DecodeOutcome::CleanEof => {
                 bail!("committed WAL cursor {offset} points beyond a complete record");
             }
-            codec::DecodeOutcome::FrameCorrupt(_) => {
+            codec::DecodeOutcome::FrameCorrupt => {
                 bail!("committed WAL segment contains a corrupt record at {position}");
             }
         }
@@ -44,19 +44,15 @@ pub(super) fn validate_committed_offset(path: &Path, offset: u64) -> Result<()> 
 /// next record *after* those torn bytes, permanently mis-framing the reader.
 /// This scan finds the safe resume point instead.
 ///
-/// Decoding stops on the first of:
-/// - `Ok(None)` — clean EOF or a torn tail (short read).
-/// - Decodable-corrupt record: A fully-framed record (valid length prefix and
-///   complete payload bytes) whose payload fails to bincode-deserialize. Recovery
-///   skips this record and continues scanning for subsequent valid records.
-/// - Torn payload: An incomplete frame (short read of either length prefix or
-///   payload) is treated as a torn tail and stops the scan.
+/// An incomplete final frame is treated as a torn tail. Complete corrupt frames
+/// and invalid lengths fail recovery rather than allowing later records to pass
+/// the damaged record.
 ///
 /// Returns `0` for a missing or empty file.
 ///
 /// # Errors
-/// Returns an error if the segment exists but cannot be opened or read for
-/// reasons other than reaching EOF.
+/// Returns an error if the segment cannot be read, contains an invalid length,
+/// or contains a complete corrupt record.
 pub fn last_valid_offset(path: &Path) -> Result<u64> {
     let file = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
@@ -76,8 +72,11 @@ pub fn last_valid_offset(path: &Path) -> Result<u64> {
             codec::DecodeOutcome::CleanEof => {
                 break;
             }
-            codec::DecodeOutcome::FrameCorrupt(consumed) => {
-                valid_len += consumed as u64;
+            codec::DecodeOutcome::FrameCorrupt => {
+                bail!(
+                    "WAL segment {} contains a corrupt record at {valid_len}",
+                    path.display()
+                );
             }
         }
     }
@@ -197,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn test_last_valid_offset_decodable_corrupt_record_skips_and_continues() {
+    fn test_last_valid_offset_decodable_corrupt_record_fails_without_skipping() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("00000000000000000001.log");
 
@@ -242,8 +241,10 @@ mod tests {
             + valid3_size as u64
             + valid4_size as u64;
 
-        // Recovery should skip the corrupt record and return the offset of the last
-        // valid record (record 4), not truncate at the corrupt record boundary.
-        assert_eq!(last_valid_offset(&path).unwrap(), final_valid_offset);
+        assert!(
+            last_valid_offset(&path).is_err(),
+            "recovery must stop at a complete corrupt record"
+        );
+        assert_eq!(fs::metadata(path).unwrap().len(), final_valid_offset);
     }
 }

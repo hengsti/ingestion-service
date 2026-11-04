@@ -29,7 +29,7 @@ fn initial_backoff_ms(flush_interval_ms: u64) -> u64 {
 ///
 /// A flush is triggered when either the batch reaches `batch_size` or the
 /// `flush_interval_ms` ticker fires with a non-empty batch. The loop exits
-/// cleanly when the subscription is closed (`next()` returns `None`).
+/// cleanly when the subscription is closed (`next()` returns `Ok(None)`).
 ///
 /// On any sink failure the batch is held and retried with bounded backoff
 /// without advancing the cursor, so the WAL buffers across the outage; new
@@ -37,9 +37,9 @@ fn initial_backoff_ms(flush_interval_ms: u64) -> u64 {
 /// a flush is in flight.
 ///
 /// # Errors
-/// This function only returns `Ok(())` on normal shutdown. Sink failures are
-/// handled in-loop with bounded backoff, and cursor commit failures are
-/// retried in-loop until durable.
+/// Returns an error on WAL read failure without committing the affected batch.
+/// Sink failures are handled in-loop with bounded backoff, and cursor commit
+/// failures are retried in-loop until durable.
 pub async fn run_forwarder(
     mut sub: WalSubscription,
     sink: Arc<dyn Sink>,
@@ -59,6 +59,7 @@ pub async fn run_forwarder(
                 }
             }
             maybe = sub.next() => {
+                let maybe = maybe?;
                 match maybe {
                     Some(entry) => {
                         batch.push(entry);
@@ -184,6 +185,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::future::Future;
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -273,6 +275,7 @@ mod tests {
             let entry = tokio::time::timeout(Duration::from_millis(500), sub.next())
                 .await
                 .expect("timed out draining")
+                .expect("WAL subscription failed")
                 .expect("subscription closed early");
             out.push(entry);
         }
@@ -418,6 +421,55 @@ mod tests {
 
         assert_eq!(mock.call_count(), 1);
         assert_eq!(read_cursor(dir.path()).unwrap(), Some(highest));
+    }
+
+    #[tokio::test]
+    async fn test_forwarder_stops_on_corrupt_record_without_committing() -> Result<()> {
+        let dir = tempdir()?;
+        let (wal, sub) = Wal::open(opts(dir.path())).await?;
+        let first = sample_event(0);
+        let first_payload = first.payload.clone();
+        let mut first_frame = Vec::new();
+        crate::infrastructure::wal::codec::encode_into(&mut first_frame, &first)?;
+        assert!(wal.append_durable(first).await.is_ok());
+        assert!(wal.append_durable(sample_event(1)).await.is_ok());
+
+        let path = crate::infrastructure::wal::segment::segment_path(dir.path(), 1);
+        let mut file = fs::OpenOptions::new().write(true).open(path)?;
+        file.seek(SeekFrom::Start(first_frame.len() as u64 + 4))?;
+        file.write_all(&[0xFF; 8])?;
+        file.sync_all()?;
+
+        let mock = Arc::new(MockSink::new(Vec::new()));
+        let sink: Arc<dyn Sink> = mock.clone();
+        let result = run_forwarder(sub, sink, 10, 60_000).await;
+
+        let error = result.expect_err("WAL read failures must stop the forwarder");
+        assert!(
+            error.to_string().contains("durable offset 1:"),
+            "failure should identify its WAL offset: {error:#}"
+        );
+        let batches = mock.batches.lock().unwrap();
+        assert!(batches.len() <= 1, "only the valid record may be flushed");
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .all(|payload| payload == &first_payload),
+            "corrupt records must not reach the sink: {batches:?}"
+        );
+        drop(batches);
+        let cursor = read_cursor(dir.path())?;
+        assert!(
+            cursor.is_none()
+                || cursor
+                    == Some(WalOffset {
+                        segment_id: 1,
+                        byte_offset: first_frame.len() as u64,
+                    }),
+            "cursor must stop at or before the corrupt record, got {cursor:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

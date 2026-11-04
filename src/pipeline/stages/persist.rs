@@ -205,11 +205,11 @@ mod tests {
     }
 
     async fn recv_one(sub: &mut WalSubscription, ms: u64) -> Option<WalEvent> {
-        tokio::time::timeout(Duration::from_millis(ms), sub.next())
-            .await
-            .ok()
-            .flatten()
-            .map(|entry| entry.event)
+        match tokio::time::timeout(Duration::from_millis(ms), sub.next()).await {
+            Ok(Ok(Some(entry))) => Some(entry.event),
+            Ok(Ok(None)) | Err(_) => None,
+            Ok(Err(error)) => panic!("WAL subscription failed: {error:#}"),
+        }
     }
 
     #[tokio::test]
@@ -272,8 +272,16 @@ mod tests {
                 .await
                 .is_err()
         );
-        let first = sub.next().await.context("first record")?;
-        let second = sub.next().await.context("second record")?;
+        let first = sub
+            .next()
+            .await
+            .context("reading first record")?
+            .context("first record")?;
+        let second = sub
+            .next()
+            .await
+            .context("reading second record")?
+            .context("second record")?;
         sub.commit(first.offset_after).await?;
         sub.commit(second.offset_after).await?;
         let result = tokio::time::timeout(Duration::from_secs(2), run.as_mut()).await?;
@@ -327,8 +335,16 @@ mod tests {
                 .is_err()
         );
 
-        let first = sub.next().await.context("first record")?;
-        let second = sub.next().await.context("second record")?;
+        let first = sub
+            .next()
+            .await
+            .context("reading first record")?
+            .context("first record")?;
+        let second = sub
+            .next()
+            .await
+            .context("reading second record")?
+            .context("second record")?;
         sub.commit(first.offset_after).await?;
         sub.commit(second.offset_after).await?;
 
