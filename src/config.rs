@@ -108,8 +108,11 @@ pub struct Config {
     pub batch_size: usize,
     pub flush_interval_ms: u64,
     pub wal_dir: PathBuf,
+    pub wal_max_bytes: u64,
     pub wal_segment_bytes: u64,
     pub wal_queue_capacity: usize,
+    pub quarantine_dir: PathBuf,
+    pub quarantine_max_bytes: u64,
     pub input_queue_capacity: usize,
     pub metrics_bind: String,
     pub cache_ttl_ms: u64,
@@ -129,8 +132,11 @@ impl fmt::Debug for Config {
             .field("batch_size", &self.batch_size)
             .field("flush_interval_ms", &self.flush_interval_ms)
             .field("wal_dir", &self.wal_dir)
+            .field("wal_max_bytes", &self.wal_max_bytes)
             .field("wal_segment_bytes", &self.wal_segment_bytes)
             .field("wal_queue_capacity", &self.wal_queue_capacity)
+            .field("quarantine_dir", &self.quarantine_dir)
+            .field("quarantine_max_bytes", &self.quarantine_max_bytes)
             .field("input_queue_capacity", &self.input_queue_capacity)
             .field("metrics_bind", &self.metrics_bind)
             .field("cache_ttl_ms", &self.cache_ttl_ms)
@@ -218,6 +224,11 @@ impl Config {
             .context("FLUSH_INTERVAL_MS must be a valid u64")?;
 
         let wal_dir = PathBuf::from(env_var("WAL_DIR").context("WAL_DIR must be set")?);
+        let wal_max_bytes = required_positive_u64(env_var("WAL_MAX_BYTES"), "WAL_MAX_BYTES")?;
+        let quarantine_dir =
+            PathBuf::from(env_var("QUARANTINE_DIR").context("QUARANTINE_DIR must be set")?);
+        let quarantine_max_bytes =
+            required_positive_u64(env_var("QUARANTINE_MAX_BYTES"), "QUARANTINE_MAX_BYTES")?;
 
         let wal_segment_bytes = match env_var("WAL_SEGMENT_BYTES") {
             Some(v) => v
@@ -225,6 +236,16 @@ impl Config {
                 .context("WAL_SEGMENT_BYTES must be a valid u64")?,
             None => 64 * 1024 * 1024,
         };
+        crate::infrastructure::wal::capacity::validate_limit(
+            "WAL_MAX_BYTES",
+            wal_max_bytes,
+            wal_segment_bytes,
+        )?;
+        crate::infrastructure::wal::capacity::validate_limit(
+            "QUARANTINE_MAX_BYTES",
+            quarantine_max_bytes,
+            wal_segment_bytes,
+        )?;
 
         let wal_queue_capacity = match env_var("WAL_QUEUE_CAPACITY") {
             Some(v) => v
@@ -232,6 +253,9 @@ impl Config {
                 .context("WAL_QUEUE_CAPACITY must be a valid usize")?,
             None => 16_384,
         };
+        if wal_queue_capacity == 0 {
+            bail!("WAL_QUEUE_CAPACITY must be greater than zero");
+        }
 
         let input_queue_capacity = match env_var("INPUT_QUEUE_CAPACITY") {
             Some(v) => v
@@ -264,8 +288,11 @@ impl Config {
             batch_size,
             flush_interval_ms,
             wal_dir,
+            wal_max_bytes,
             wal_segment_bytes,
             wal_queue_capacity,
+            quarantine_dir,
+            quarantine_max_bytes,
             input_queue_capacity,
             metrics_bind,
             cache_ttl_ms,
@@ -273,6 +300,17 @@ impl Config {
             cache_buffer,
         })
     }
+}
+
+fn required_positive_u64(value: Option<String>, name: &str) -> Result<u64> {
+    let value = value.with_context(|| format!("{name} must be set"))?;
+    let value = value
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a valid u64"))?;
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
 }
 
 fn required_routes_file(value: Option<String>) -> Result<PathBuf> {
@@ -428,5 +466,85 @@ mod tests {
     fn test_config_requires_dlq_topic() {
         assert!(required_dlq_topic(None).is_err());
         assert!(required_dlq_topic(Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn test_wal_capacity_rejects_nonpositive_or_invalid_limits() {
+        for name in ["WAL_MAX_BYTES", "QUARANTINE_MAX_BYTES"] {
+            for value in [None, Some("0"), Some("-1"), Some("invalid")] {
+                let error = required_positive_u64(value.map(str::to_owned), name)
+                    .expect_err("invalid byte limit must fail");
+                assert!(format!("{error:#}").contains(name));
+            }
+        }
+    }
+
+    #[test]
+    fn test_wal_capacity_requires_explicit_journal_configuration() -> Result<()> {
+        const CHILD: &str = "INGEST_TEST_MISSING_JOURNAL_SETTING";
+        if let Ok(missing) = env::var(CHILD) {
+            let error = Config::from_env()
+                .err()
+                .context("missing journal configuration was accepted")?;
+            assert!(format!("{error:#}").contains(&missing));
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        for missing in [
+            "WAL_MAX_BYTES",
+            "QUARANTINE_DIR",
+            "QUARANTINE_MAX_BYTES",
+            "WAL_QUEUE_CAPACITY",
+        ] {
+            let mut command = std::process::Command::new(env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "config::tests::test_wal_capacity_requires_explicit_journal_configuration",
+                ])
+                .env_clear()
+                .env(CHILD, missing)
+                .env("INGEST_ROUTES_FILE", "routes.json")
+                .env("INPUT_SOURCE", "mqtt")
+                .env("MQTT_HOST", "localhost")
+                .env("MQTT_PORT", "1883")
+                .env("MQTT_CLIENT_ID", "test")
+                .env("MQTT_TOPIC_DLQ", "test/dlq")
+                .env("OUTPUT_SINK", "influx")
+                .env("INFLUX_URL", "http://localhost:8086")
+                .env("INFLUX_ORG", "test")
+                .env("INFLUX_BUCKET", "test")
+                .env("INFLUX_TOKEN", "test")
+                .env("BATCH_SIZE", "1")
+                .env("FLUSH_INTERVAL_MS", "1")
+                .env("WAL_DIR", dir.path().join("wal"))
+                .env("WAL_MAX_BYTES", "268435456")
+                .env("QUARANTINE_DIR", dir.path().join("quarantine"))
+                .env("QUARANTINE_MAX_BYTES", "268435456")
+                .env("METRICS_BIND", "127.0.0.1:9090")
+                .env("CACHE_TTL_MS", "1")
+                .env("CACHE_BIND", "127.0.0.1:8080")
+                .env("CACHE_BUFFER", "1");
+            if missing == "WAL_QUEUE_CAPACITY" {
+                command.env(missing, "0");
+            } else {
+                command.env_remove(missing);
+            }
+            if let Some(system_root) = env::var_os("SystemRoot") {
+                command.env("SystemRoot", system_root);
+            }
+
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "configuration probe for {missing} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(!dir.path().join("wal").exists());
+        assert!(!dir.path().join("quarantine").exists());
+        Ok(())
     }
 }
