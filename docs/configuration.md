@@ -40,8 +40,8 @@ the publish destination for rejected messages; it is not a subscription.
 |---|---:|---|---|
 | `MQTT_HOST` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker host |
 | `MQTT_PORT` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker port as `u16` |
-| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Base client id. The service appends `-<unix_timestamp>` at startup only when `MQTT_CLEAN_SESSION=true`; otherwise it is used verbatim |
-| `MQTT_CLEAN_SESSION` | No | `true` | Boolean. `false` requests a persistent session: the client id is used verbatim and the broker queues QoS 1 messages while ingest is offline |
+| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Stable client id used verbatim for the required persistent MQTT session |
+| `MQTT_CLEAN_SESSION` | No | `false` | Boolean. `true` is rejected; durable intake requires a persistent session so the broker can queue QoS 1 messages while ingest is offline |
 | `MQTT_USERNAME` | No | None | Optional MQTT username |
 | `MQTT_PASSWORD` | No | None | Optional MQTT password |
 | `MQTT_TOPIC_DLQ` | Yes at runtime | None | DLQ publish topic |
