@@ -18,6 +18,8 @@ INFLUX_URL=http://<influx-host>:8086
 INFLUX_ORG=<org>
 INFLUX_BUCKET=<bucket>
 INFLUX_TOKEN=<write-token>
+WAL_MAX_BYTES=268435456
+QUARANTINE_MAX_BYTES=268435456
 ```
 
 ```bash
@@ -43,7 +45,9 @@ include:
 
 - The stack `.env` provides all required variables listed in [Configuration](configuration.md#docker-compose), including `INGEST_TAG` (rewritten by CD). The same token is used by `influxdb` and `grafana`. Rotate it if it was ever committed.
 - `ingest.override.yaml` in the stack holds the stack-only wiring: `depends_on` (`influxdb` healthy, `emqx` healthy) and the Traefik labels (`ingest.smarthome.local` and `/ingest` with strip-prefix; the HomeKit bridge uses `/ingest/v1/stream`).
-- The stack file must not define an `ingest` service or a `wal` volume itself. The included `wal` key keeps the existing `<project>_wal` volume, so unforwarded WAL data survives the switch.
+- The stack file must not define an `ingest` service or duplicate the included `wal` and
+  `quarantine` volumes. The included `wal` key keeps the existing `<project>_wal` volume,
+  so unforwarded WAL data survives the switch.
 - CD runs `docker compose pull ingest` and `docker compose up -d --no-deps ingest` in `DEPLOY_PATH`. This works unchanged through the include.
 
 Check the effective service with `docker compose config ingest` in `DEPLOY_PATH`.
@@ -75,12 +79,16 @@ docker run --rm \
   -e INFLUX_TOKEN=change-me \
   -e BATCH_SIZE=500 \
   -e FLUSH_INTERVAL_MS=1000 \
-  -e WAL_DIR=/app/wal \
+  -e WAL_DIR=/data/wal \
+  -e WAL_MAX_BYTES=268435456 \
+  -e QUARANTINE_DIR=/data/quarantine \
+  -e QUARANTINE_MAX_BYTES=268435456 \
   -e METRICS_BIND=0.0.0.0:9090 \
   -e CACHE_BIND=0.0.0.0:8085 \
   -e CACHE_TTL_MS=60000 \
   -e CACHE_BUFFER=1024 \
-  -v smarthome-ingest-wal:/app/wal \
+  -v smarthome-ingest-wal:/data/wal \
+  -v smarthome-ingest-quarantine:/data/quarantine \
   smarthome-ingest
 ```
 
@@ -137,7 +145,7 @@ Useful signals:
 | MQTT input is arriving | `mqtt_messages_received_total` |
 | Input workers are overloaded | `ingest_event_queue_full_total` |
 | Payloads are invalid | `ingest_incoming_invalid_json_total`, `ingest_validate_raw_failed_total`, configured output-schema validation failures |
-| WAL is saturated or failing | `ingest_queue_full_total`, `ingest_queue_closed_total`, `ingest_durability_ack_failed_total`, `wal_writer_fatal_total` |
+| WAL is saturated or failing | `wal_accounted_bytes`, `wal_capacity_bytes`, `wal_capacity_full_total`, `ingest_queue_full_total`, `ingest_queue_closed_total`, `ingest_durability_ack_failed_total`, `wal_writer_fatal_total` |
 | InfluxDB writes are failing | `influx_write_errors_total`, `wal_forwarder_retry_total`, `wal_forwarder_retry_outage_active` |
 | Forwarder is blocked by a permanent sink error | `wal_forwarder_retry_outage_active`; inspect the logged HTTP status and repair the destination or pending output |
 
@@ -149,11 +157,15 @@ Steps:
 
 1. Confirm `wal_forwarder_retry_outage_active` is `1`.
 2. Check InfluxDB availability, credentials, organization, bucket, and the pending line-protocol output.
-3. Watch available disk space for `WAL_DIR`.
+3. Watch `wal_accounted_bytes`, `wal_capacity_bytes`, and available disk space for both journal directories.
 4. After recovery, confirm `wal_forwarder_retry_outage_active` returns to `0`.
 5. Confirm `wal_forwarder_committed_total` increases.
 
 Do not delete WAL files while the service is running. Deleting segments can make the cursor point outside available segments and cause startup failure.
+When the WAL budget is full, workers wait for reclaim and graceful shutdown can wait indefinitely
+until the sink recovers. The current MQTT acknowledgement path can still lose messages when
+input queues fill or the process is forcibly terminated; journal capacity limits alone do not
+guarantee broker-to-sink delivery.
 
 ## Handle DLQ Growth
 

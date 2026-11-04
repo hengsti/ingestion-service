@@ -8,7 +8,7 @@ route bundle. It follows one firmware sensor payload through the configured inge
 - Rust toolchain compatible with edition `2021`. CI uses Rust `1.87.0`.
 - An MQTT broker reachable from the service.
 - An InfluxDB v2 instance with an organization, bucket, and write token.
-- A writable local directory for the WAL.
+- Separate writable local directories for the WAL and reserved quarantine journal.
 
 ## 1. Build and Test
 
@@ -41,6 +41,9 @@ $env:INFLUX_TOKEN="change-me"
 $env:BATCH_SIZE="500"
 $env:FLUSH_INTERVAL_MS="1000"
 $env:WAL_DIR="./data/wal"
+$env:WAL_MAX_BYTES="268435456"
+$env:QUARANTINE_DIR="./data/quarantine"
+$env:QUARANTINE_MAX_BYTES="268435456"
 $env:METRICS_BIND="0.0.0.0:9090"
 $env:CACHE_BIND="0.0.0.0:8085"
 $env:CACHE_TTL_MS="60000"
@@ -64,6 +67,9 @@ export INFLUX_TOKEN=change-me
 export BATCH_SIZE=500
 export FLUSH_INTERVAL_MS=1000
 export WAL_DIR=./data/wal
+export WAL_MAX_BYTES=268435456
+export QUARANTINE_DIR=./data/quarantine
+export QUARANTINE_MAX_BYTES=268435456
 export METRICS_BIND=0.0.0.0:9090
 export CACHE_BIND=0.0.0.0:8085
 export CACHE_TTL_MS=60000

@@ -31,6 +31,7 @@ WAL files live in `WAL_DIR`.
 | `00000000000000000001.log`, `00000000000000000002.log`, ... | Segment files |
 | `commit.cursor` | 16-byte committed offset, encoded as big-endian segment id and byte offset |
 | `commit.cursor.tmp` | Temporary cursor file used before atomic rename |
+| `.journal.lock` | Persistent lock file held open while the journal is in use |
 
 Segment names use 20 decimal digits plus `.log`.
 
@@ -41,7 +42,8 @@ The WAL writer runs on a dedicated OS thread because it performs blocking file I
 Append flow:
 
 1. Pipeline creates a `WalEvent`.
-2. `append_durable` rejects bodies over 1 MiB and sends the event through a bounded sync channel.
+2. `append_durable` rejects bodies over 1 MiB, reserves journal capacity, and sends the event
+   through a bounded sync channel. Capacity rejection returns the event to the caller.
 3. The writer encodes and writes the record to a `BufWriter`.
 4. The writer batches records for up to 5 ms, or until pending receipts reach the queue capacity,
    then flushes the buffer and calls `File::sync_data`.
@@ -54,6 +56,13 @@ append latency. The head uses a mutex-free, single-writer atomic snapshot: reade
 its version is odd or changes and may spin during publication. It represents the last
 successfully synced offset. `Wal::writer_failure()` exposes a terminal writer failure
 independently of thread liveness.
+
+When capacity is full, the persist stage retains its current event and waits for a successful
+reclaim rather than treating storage pressure as a schema rejection. If the writer queue is
+full during a retry, that event remains pending until the writer progresses. Worker queues
+remain bounded; a long outage can fill them and prevent graceful shutdown until the sink recovers.
+Current MQTT acknowledgements are not deferred by this wait, so incoming messages can still
+be lost before reaching the WAL, including on forced termination.
 
 On Linux, file sync uses `fdatasync` and directory sync uses `fsync`. These calls are meaningful
 only when the filesystem, volume driver, and storage device honor flush requests; they cannot
@@ -84,14 +93,20 @@ Fatal writer failures are counted by `wal_writer_fatal_total` with reasons:
 
 On startup, `Wal::open`:
 
-1. Creates `WAL_DIR` if needed and syncs the relevant parent directory entries.
+1. Creates `WAL_DIR` if needed, syncs relevant parent entries, acquires exclusive ownership,
+   and probes file create/write/sync/rename/read capability.
 2. Lists segment files.
 3. Reads `commit.cursor` and validates its segment and record boundary before changing files.
 4. Syncs retained older segments before publishing a recovered head.
 5. Scans the active segment for the last complete offset.
 6. Truncates and syncs an incomplete trailing record only after the committed cursor is validated.
-7. Starts the subscription at the committed cursor, or at the first segment offset `0` when no cursor exists.
-8. Syncs the active segment and directory, then starts the writer at the recovered offset.
+7. Reclaims segments older than the validated committed cursor and syncs their removal.
+8. Reconciles existing segment sizes against the byte limit, starts the subscription at the
+   committed cursor (or the first segment offset `0`), and starts the writer at the recovered
+   offset after syncing its active segment and directory.
+
+If the active segment is empty after an interrupted rotation, recovery accounts for the
+preceding retained segment and preserves enough headroom to admit a maximum-sized record.
 
 A corrupt or inconsistent committed cursor is a startup error, including an existing empty
 cursor file; recovery preserves the segment instead of truncating through it. Complete corrupt
@@ -123,9 +138,15 @@ On commit, the subscription:
 3. Only after those steps succeed, deletes segment files with ids strictly lower than the
    committed segment and keeps the segment containing the committed offset.
 
-Segment deletion failures are logged but do not fail the durable commit. The current reclaim
-watermark may defer another attempt until a later segment advance; issue #30 owns reclaim retry
-and disk-budget accounting.
+Segment deletion or directory-sync failures fail the commit operation and are retried at the
+same cursor without repeating the successful sink write. Deleted bytes remain accounted until
+the directory sync succeeds. Startup also reclaims older segments left behind after a crash.
+
+`WAL_MAX_BYTES` and `QUARANTINE_MAX_BYTES` are independent logical budgets. Each counts segment
+lengths, recovered journal metadata, pending reservations, a per-segment allowance, and fixed
+metadata headroom. The separate quarantine directory is currently reserved and locked; local
+rejection storage is not implemented yet. See [Configuration](configuration.md#wal) for the
+exact limits and minimum.
 
 ## Forwarder Guarantees
 
@@ -173,6 +194,7 @@ The WAL is not a general event archive. Committed older segments are deleted.
 
 - Put `WAL_DIR` on persistent storage with enough capacity for the expected sink outage duration.
 - Alert on `wal_forwarder_retry_outage_active == 1`.
-- Alert on sustained growth of WAL segment files.
+- Alert on `wal_accounted_bytes` approaching `wal_capacity_bytes`, `wal_capacity_full_total`,
+  and underlying filesystem free space.
 - Investigate permanent sink-error logs and repair the cause; the forwarder retains the failed batch and does not advance the cursor.
 - Investigate `wal_writer_fatal_total`; it means the WAL writer exited and subsequent appends will fail.

@@ -85,8 +85,14 @@ dispatch does not guarantee per-device processing order across workers.
   do not claim exactly-once or lossless end-to-end delivery.
 - **Overflow paths differ:** a full input worker queue drops the message before the
   pipeline, increments `ingest_event_queue_full_total`, and does not publish DLQ.
-  WAL append failures inside `PersistStage` do mark DLQ. Do not silently change either
-  policy or replace bounded queues with unbounded buffering.
+  WAL capacity pressure retains the current event and waits for reclaim, including through
+  subsequent writer-queue contention. An initially full queue and terminal writer failures
+  inside `PersistStage` still mark DLQ. MQTT acknowledgements remain independent of WAL
+  persistence. Do not replace bounded queues with unbounded buffering.
+- **Journal ownership and budgets:** WAL and quarantine use separate, exclusively locked
+  directories and required byte limits. Count recovered segments, pending reservations,
+  metadata headroom, and pending deletions; release reclaimed bytes only after directory
+  sync. Do not scan the filesystem per append or claim these budgets are filesystem quotas.
 - **Cache is not a delivery receipt:** only routes with `cache: true` update the
   latest-state cache, and that update occurs before WAL persistence. Preserve HTTP/SSE
   envelopes; cached state does not prove successful persistence or sink delivery. When
@@ -159,7 +165,8 @@ Release build: `cargo build --release --locked`. Container build:
 - The binary reads process environment through `Config::from_env`; it does not load
   `.env` itself. Most runtime settings are required. Existing defaults include the
   WAL segment/queue sizes, input queue capacity, and `MQTT_CLEAN_SESSION=true`.
-  Compose supplies its own values; do not confuse them with code defaults.
+  `WAL_QUEUE_CAPACITY` must be positive. Compose supplies its own values; do not
+  confuse them with code defaults.
 - `INGEST_ROUTES_FILE` supplies the route bundle; MQTT subscriptions derive only from
   its compiled filters. The shipped firmware sensor filter is `smarthome/+/bme680`.
   `MQTT_TOPIC_DLQ` is required and publish-only. Removed
@@ -171,8 +178,8 @@ Release build: `cargo build --release --locked`. Container build:
   changing the environment contract. CI renders Compose and checks its environment
   keys against the code; update that check when the contract requires it.
 - The Docker healthcheck targets port 8085 and `/healthz`; keep `CACHE_BIND` compatible.
-  Keep the WAL volume mount and `WAL_DIR` aligned. Use disposable WAL directories and
-  separate MQTT client IDs for local experiments, never production state.
+  Keep both journal volume mounts and their directory settings aligned. Use disposable WAL
+  directories and separate MQTT client IDs for local experiments, never production state.
 - Never expose tokens, passwords, raw sensitive payloads, or personal data in logs,
   fixtures, commits, or responses. Preserve `SecretString` handling and redacted
   configuration debug output. Use structured `tracing` fields and bounded metric

@@ -93,10 +93,43 @@ Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a sma
 | Variable | Required | Default | Description |
 |---|---:|---|---|
 | `WAL_DIR` | Yes | None | Directory for WAL segment files and `commit.cursor` |
+| `WAL_MAX_BYTES` | Yes | None | Maximum accounted WAL bytes, including pending appends and metadata reserves |
 | `WAL_SEGMENT_BYTES` | No | `67108864` | Segment rotation threshold in bytes |
-| `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer |
+| `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer; must be greater than zero |
+| `QUARANTINE_DIR` | Yes | None | Separate directory reserved and exclusively owned for the quarantine journal |
+| `QUARANTINE_MAX_BYTES` | Yes | None | Maximum accounted bytes for the quarantine journal |
 
-Use persistent local storage for `WAL_DIR` in production. The WAL buffers sink outages (InfluxDB today) and replays uncommitted records after restart.
+Use separate writable, persistent local directories for `WAL_DIR` and `QUARANTINE_DIR`.
+The service acquires an OS-backed exclusive lock and checks file creation, writing, syncing,
+renaming, and reading in each directory before starting MQTT. Quarantine storage is reserved
+for future rejection persistence; rejections are still published through the MQTT DLQ today.
+Locks are advisory and require a filesystem that supports them; all journal users must honor the
+same lock file. Do not remove `.journal.lock` while a process may still own the directory.
+
+Both byte limits must be positive and at least:
+
+```text
+65536 + 2 * (max(WAL_SEGMENT_BYTES, 1048580) + 4096) + 4096
+```
+
+The minimum provides room for a retained segment, an empty post-rotation segment, one maximum
+1 MiB record plus its four-byte frame header, and metadata. With the default segment size it is
+134295552 bytes. Existing journal metadata or a recovered retained segment larger than the
+configured segment size can require a larger WAL limit; startup reports the computed minimum.
+
+Accounting covers segment file lengths, existing journal lock/cursor/probe file lengths, a
+4096-byte allowance per segment, a 65536-byte fixed metadata reserve, and reservations for queued
+appends. The reserve covers up to 32768 bytes of existing metadata while keeping at least 32768
+bytes for future housekeeping; existing metadata above that amount is charged on top,
+conservatively until restart. These are logical accounting limits, not filesystem quotas: other
+processes, filesystem allocation overhead, or a shared disk can still exhaust free space. Provision
+and monitor the underlying storage separately.
+
+When WAL capacity is exhausted, a pipeline worker keeps its current event and waits for committed
+segments to be reclaimed. If the sink does not recover, graceful shutdown can wait indefinitely.
+The current MQTT source acknowledges independently of WAL persistence and can still drop messages
+when input queues fill; forced termination can also lose already-acknowledged, unpersisted events.
+These limits do not provide end-to-end delivery guarantees.
 
 ## Input Queue
 
@@ -138,9 +171,12 @@ are ignored by the cache but continue through the pipeline.
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Passed to the container only when set |
 | `INFLUX_URL` | Yes | InfluxDB URL |
 | `INFLUX_ORG` / `INFLUX_BUCKET` | Yes | |
+| `WAL_MAX_BYTES` / `QUARANTINE_MAX_BYTES` | Yes | Independent journal byte limits |
 | `RUST_LOG` | Yes | Log filter, e.g. `info` |
 
-`WAL_DIR` is `/data/wal`, and the `wal` named volume is mounted at that path. Keep the two in sync. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set, so the code defaults apply. The image `HEALTHCHECK` is used as-is.
+`WAL_DIR` is `/data/wal` and `QUARANTINE_DIR` is `/data/quarantine`; each has a matching named
+volume. Keep paths and mounts aligned. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set,
+so the code defaults apply. The image `HEALTHCHECK` is used as-is.
 
 Compose mounts the repository's `config/` directory read-only at `/app/config` and sets
 `INGEST_ROUTES_FILE=/app/config/routes.json`; no route-file path is needed in the host `.env`.
@@ -183,6 +219,9 @@ INFLUX_TOKEN=change-me
 BATCH_SIZE=500
 FLUSH_INTERVAL_MS=1000
 WAL_DIR=./data/wal
+WAL_MAX_BYTES=268435456
+QUARANTINE_DIR=./data/quarantine
+QUARANTINE_MAX_BYTES=268435456
 METRICS_BIND=0.0.0.0:9090
 CACHE_BIND=0.0.0.0:8085
 CACHE_TTL_MS=60000

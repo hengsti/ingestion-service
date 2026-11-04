@@ -15,7 +15,9 @@ Returns `200 OK` when the cache HTTP server is alive.
 ### `GET /readyz`
 
 Returns `200` when the active input source is ready (for MQTT, after a successful `SubAck`)
-and `503` while it is not ready.
+and the WAL has room for one maximum-sized record. Returns `503` otherwise. A ready service
+has acquired exclusive locks on both journal directories; startup fails if either lock cannot
+be acquired.
 
 ### `GET /v1/state`
 
@@ -93,6 +95,10 @@ startup. Route-labeled histograms appear when first recorded.
 | `influx_lines_written_total` | none | Lines accepted by Influx write calls |
 | `influx_write_success_total` / `influx_write_errors_total` | none | Influx write outcomes |
 | `wal_forwarder_retry_outage_active` | none | Whether the forwarder is retaining a failed batch |
+| `wal_accounted_bytes` / `wal_capacity_bytes` | none | Current accounted WAL bytes and configured limit |
+| `quarantine_accounted_bytes` / `quarantine_capacity_bytes` | none | Accounted quarantine bytes and configured limit |
+| `wal_capacity_full_total` | none | Events that encountered WAL capacity pressure |
 
 Other decode, validation, DLQ, WAL, and forwarder counters are listed by their metric names
-in the `/metrics` output.
+in the `/metrics` output. Journal gauges read in-memory accounting when scraped; they do not
+measure total filesystem free space.
