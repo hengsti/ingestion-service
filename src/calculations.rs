@@ -1,3 +1,5 @@
+//! Stateless calculations resolved against route mappings at startup.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
@@ -17,6 +19,34 @@ enum Calculation {
     DewPoint,
     HeatIndex,
     Iaq,
+}
+
+impl Calculation {
+    fn output_field_types(self) -> &'static [(&'static str, FieldType)] {
+        match self {
+            Self::DewPoint => &[("dew_point_c", FieldType::Float)],
+            Self::HeatIndex => &[("heat_index_c", FieldType::Float)],
+            Self::Iaq => &[
+                ("iaq_score", FieldType::Float),
+                ("iaq_text", FieldType::String),
+            ],
+        }
+    }
+}
+
+pub(crate) fn output_can_be_omitted(field: &str, record: &TelemetryRecord) -> bool {
+    if !matches!(
+        record.fields.get(WARMED_UP_FIELD),
+        Some(TelemetryValue::Boolean(false))
+    ) {
+        return false;
+    }
+
+    match field {
+        "iaq_score" => !record.fields.contains_key("iaq_text"),
+        "iaq_text" => !record.fields.contains_key("iaq_score"),
+        _ => false,
+    }
 }
 
 /// A route's compiled calculation sequence.
@@ -40,25 +70,18 @@ impl CalculationRegistry {
         let mut outputs = BTreeSet::new();
 
         for name in names {
-            let (calculation, name, inputs, calculation_outputs) = match name {
+            let (calculation, name, inputs) = match name {
                 CalculationName::DewPoint => (
                     Calculation::DewPoint,
                     "dew_point",
                     &[TEMPERATURE_FIELD, HUMIDITY_FIELD][..],
-                    &["dew_point_c"][..],
                 ),
                 CalculationName::HeatIndex => (
                     Calculation::HeatIndex,
                     "heat_index",
                     &[TEMPERATURE_FIELD, HUMIDITY_FIELD][..],
-                    &["heat_index_c"][..],
                 ),
-                CalculationName::Iaq => (
-                    Calculation::Iaq,
-                    "iaq",
-                    &[GAS_FIELD, HUMIDITY_FIELD][..],
-                    &["iaq_score", "iaq_text"][..],
-                ),
+                CalculationName::Iaq => (Calculation::Iaq, "iaq", &[GAS_FIELD, HUMIDITY_FIELD][..]),
             };
 
             if !seen_names.insert(name) {
@@ -76,8 +99,8 @@ impl CalculationRegistry {
                 }
             }
 
-            for output in calculation_outputs {
-                if fields.contains_key(*output) || !outputs.insert(*output) {
+            for &(output, _) in calculation.output_field_types() {
+                if fields.contains_key(output) || !outputs.insert(output) {
                     bail!("calculation output '{output}' collides with another telemetry field");
                 }
             }
@@ -88,19 +111,12 @@ impl CalculationRegistry {
     }
 
     /// Returns the field names and types produced by this calculation sequence.
-    pub(crate) fn output_field_types(&self) -> Vec<(&'static str, FieldType)> {
-        let mut fields = Vec::new();
-        for calculation in &self.calculations {
-            match calculation {
-                Calculation::DewPoint => fields.push(("dew_point_c", FieldType::Float)),
-                Calculation::HeatIndex => fields.push(("heat_index_c", FieldType::Float)),
-                Calculation::Iaq => {
-                    fields.push(("iaq_score", FieldType::Float));
-                    fields.push(("iaq_text", FieldType::String));
-                }
-            }
-        }
-        fields
+    pub(crate) fn output_field_types(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, FieldType)> + '_ {
+        self.calculations
+            .iter()
+            .flat_map(|calculation| calculation.output_field_types().iter().copied())
     }
 
     /// Applies the compiled calculations and returns the enriched record.
