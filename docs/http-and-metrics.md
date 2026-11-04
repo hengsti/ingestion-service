@@ -43,7 +43,8 @@ typed field map produced by the selected route:
 ```
 
 `stale` is computed from the current time and `last_seen_ms` using `CACHE_TTL_MS`.
-When the cache reaches `CACHE_BUFFER`, the stalest entry is evicted.
+When the cache is full, a new device replaces the least recently received entry only if its
+receive sequence is newer; older delayed records are ignored by the cache, not the pipeline.
 
 ### `GET /v1/state/{device_id}`
 

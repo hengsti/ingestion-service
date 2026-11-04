@@ -85,7 +85,8 @@ dispatch does not guarantee per-device processing order across workers.
   policy or replace bounded queues with unbounded buffering.
 - **Cache is not a delivery receipt:** only routes with `cache: true` update the
   latest-state cache, and that update occurs before WAL persistence. Preserve HTTP/SSE
-  envelopes; cached state does not prove successful persistence or sink delivery.
+  envelopes; cached state does not prove successful persistence or sink delivery. When
+  full, reject an uncached device update that is not newer than the oldest retained entry.
 - **Shutdown must drain:** preserve queued-worker draining and the forwarder's final
   partial-batch flush. WAL recovery, cursor commits, and segment deletion must not
   discard uncommitted data.
@@ -156,7 +157,8 @@ Release build: `cargo build --release --locked`. Container build:
   WAL segment/queue sizes, input queue capacity, and `MQTT_CLEAN_SESSION=true`.
   Compose supplies its own values; do not confuse them with code defaults.
 - `INGEST_ROUTES_FILE` supplies the route bundle; MQTT subscriptions derive only from
-  its compiled filters. `MQTT_TOPIC_DLQ` is required and publish-only. Removed
+  its compiled filters. The shipped firmware sensor filter is `smarthome/+/bme680`.
+  `MQTT_TOPIC_DLQ` is required and publish-only. Removed
   sensor/status subscription variables and `ENFORCE_TOPIC_DEVICE_MATCH` must fail
   startup with a migration hint.
 - Register each configured route's six route-labeled counters at zero before workers run;

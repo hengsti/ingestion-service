@@ -77,17 +77,18 @@ impl CacheState {
                 return false;
             }
 
-            // Evict the stalest entry only when a new device would exceed the cap.
             // Updates to existing devices never change the map size.
             if self.max_devices > 0
                 && !map.contains_key(&device_id)
                 && map.len() >= self.max_devices
             {
-                if let Some(oldest_key) = map
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.receive_sequence)
-                    .map(|(k, _)| k.clone())
+                if let Some((oldest_key, oldest_entry)) =
+                    map.iter().min_by_key(|(_, entry)| entry.receive_sequence)
                 {
+                    if receive_sequence <= oldest_entry.receive_sequence {
+                        return false;
+                    }
+                    let oldest_key = oldest_key.clone();
                     map.remove(&oldest_key);
                 }
             }
@@ -246,6 +247,39 @@ mod tests {
         );
         assert!(all.iter().any(|(id, _, _)| id == "dev-a"));
         assert!(all.iter().any(|(id, _, _)| id == "dev-b"));
+    }
+
+    #[test]
+    fn update_record_rejects_delayed_evicted_device_without_broadcasting() {
+        let cache = CacheState::new(60_000, 2);
+        assert!(cache.update_record(&record("dev-a"), 2_000, 2));
+        assert!(cache.update_record(&record("dev-b"), 4_000, 4));
+        assert!(cache.update_record(&record("dev-c"), 6_000, 6));
+        let mut events = cache.subscribe_events();
+
+        assert!(!cache.update_record(&record("dev-a"), 1_000, 1));
+
+        assert!(cache.snapshot_device("dev-a").is_none());
+        assert!(cache.snapshot_device("dev-b").is_some());
+        assert!(cache.snapshot_device("dev-c").is_some());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn update_record_evicts_only_for_newer_receive_sequence() {
+        let cache = CacheState::new(60_000, 2);
+        assert!(cache.update_record(&record("dev-a"), 2_000, 2));
+        assert!(cache.update_record(&record("dev-b"), 4_000, 4));
+
+        assert!(!cache.update_record(&record("dev-c"), 9_000, 2));
+        assert!(cache.update_record(&record("dev-c"), 1_000, 3));
+
+        assert!(cache.snapshot_device("dev-a").is_none());
+        assert!(cache.snapshot_device("dev-b").is_some());
+        assert!(cache.snapshot_device("dev-c").is_some());
     }
 
     #[test]
