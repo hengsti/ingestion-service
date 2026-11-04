@@ -62,6 +62,8 @@ pub enum TryAppendError {
     Full(WalEvent),
     #[allow(dead_code)]
     Closed(WalEvent),
+    /// The encoded record would exceed the reader's payload limit.
+    TooLarge(WalEvent),
 }
 
 /// Reason a durability-bound append failed.
@@ -71,5 +73,8 @@ pub enum AppendDurableError {
     Full(WalEvent),
     #[allow(dead_code)]
     Closed(WalEvent),
+    /// The encoded record would exceed the reader's payload limit.
+    #[allow(dead_code)]
+    TooLarge(WalEvent),
     Durability(String),
 }

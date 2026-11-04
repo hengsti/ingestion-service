@@ -11,17 +11,22 @@ use metrics::counter;
 use tokio::sync::Notify;
 use tracing::warn;
 
+#[cfg(test)]
+use crate::infrastructure::wal::test_support::TestIoHookSlot;
 use crate::infrastructure::wal::{codec, cursor};
 use crate::infrastructure::wal::{
     segment,
     types::{WalEntry, WalEvent, WalOffset},
-    writer::AtomicWalOffset,
+    writer::{AtomicWalOffset, WriterState},
 };
 
 pub struct WalSubscription {
     dir: Arc<Path>,
     head: Arc<AtomicWalOffset>,
     notify: Arc<Notify>,
+    writer_state: Arc<WriterState>,
+    #[cfg(test)]
+    test_io_hook: Option<TestIoHookSlot>,
     cur_segment_id: u64,
     cur_byte_offset: u64,
     cur_reader: Option<BufReader<File>>,
@@ -42,12 +47,16 @@ impl WalSubscription {
         dir: Arc<Path>,
         head: Arc<AtomicWalOffset>,
         notify: Arc<Notify>,
+        writer_state: Arc<WriterState>,
         start: WalOffset,
     ) -> Self {
         Self {
             dir,
             head,
             notify,
+            writer_state,
+            #[cfg(test)]
+            test_io_hook: None,
             cur_segment_id: start.segment_id,
             cur_byte_offset: start.byte_offset,
             cur_reader: None,
@@ -219,31 +228,40 @@ impl WalSubscription {
 
     /// Marks `up_to` as durably processed by the downstream sink.
     ///
-    /// Persists the cursor atomically and garbage-collects every segment file
-    /// strictly older than `up_to.segment_id`. Safe to call repeatedly with
-    /// the same or older offsets — re-commits simply rewrite the cursor and
-    /// find nothing left to delete.
+    /// Syncs the cursor and garbage-collects segments strictly older than
+    /// `up_to.segment_id`. Callers must commit monotonically advancing offsets;
+    /// retrying the same offset is safe.
     ///
     /// # Errors
-    /// Returns an error only if the cursor file cannot be written. Segment
-    /// deletion failures are logged but non-fatal: the watermark is already
-    /// durable, and a later commit will retry the reclaim.
+    /// Returns an error if `up_to` exceeds the synced head or cursor persistence
+    /// fails. Segment deletion failures are logged but do not undo the commit.
     pub async fn commit(&mut self, up_to: WalOffset) -> Result<()> {
+        let head = self.head.load();
+        if up_to > head {
+            anyhow::bail!("WAL commit {up_to:?} exceeds durable head {head:?}");
+        }
         let dir = Arc::clone(&self.dir);
         // Only scan for reclaimable segments when the committed segment has
         // advanced past the last one we GC'd; commits that stay within the same
         // segment have nothing new to delete. Computed before the move so the
         // blocking closure can capture `dir` by value.
         let run_gc = up_to.segment_id > self.last_gc_segment_id;
+        #[cfg(test)]
+        let test_io_hook = self.test_io_hook.clone();
 
         // The cursor write (write-tmp + rename) and the segment GC are blocking
         // filesystem ops; run them on a blocking thread so they can't stall a
         // runtime worker.
         tokio::task::spawn_blocking(move || -> Result<()> {
-            // (1) Persist the new read watermark first. `write_cursor` does a
-            //     write-tmp + rename, so a crash mid-commit either leaves the old
-            //     cursor intact or atomically swaps in the new one — never torn.
-            cursor::write_cursor(&dir, up_to)
+            // Persist and sync the cursor before reclaiming older segments.
+            #[cfg(test)]
+            let cursor_result = match test_io_hook.as_ref() {
+                Some(hook) => cursor::write_cursor_inner(&dir, up_to, Some(hook)),
+                None => cursor::write_cursor(&dir, up_to),
+            };
+            #[cfg(not(test))]
+            let cursor_result = cursor::write_cursor(&dir, up_to);
+            cursor_result
                 .with_context(|| format!("writing WAL cursor to {}", dir.display()))?;
 
             // (2) Reclaim disk: drop every segment whose id is strictly below the
@@ -264,8 +282,7 @@ impl WalSubscription {
                         // A prior commit already removed it — commit is idempotent.
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
 
-                        // Non-fatal: the watermark is already persisted. Log so a
-                        // filling disk is visible; the next commit will try again.
+                        // Non-fatal: a later segment advance triggers another scan.
                         Err(e) => {
                             warn!(
                                 error = %e,
@@ -316,11 +333,9 @@ impl WalSubscription {
             return true;
         }
 
-        // Writer is gone and there is nothing newer to read: terminate. The
-        // `enable()` above guarantees the writer's shutdown `notify_waiters`
-        // is observed even if it races with this check.
-        if Arc::strong_count(&self.notify) == 1 {
-            // The writer has finished its final flush, so `head` is now durable
+        // Completion is published before the writer wakes waiting readers.
+        if self.writer_state.stopped() {
+            // The writer has finished its final sync, so `head` is now durable
             // and final. Re-load it and drain any records we haven't consumed
             // yet before terminating — this guarantees a graceful shutdown
             // delivers every committed record instead of dropping the tail when
@@ -489,14 +504,11 @@ mod tests {
             byte_offset: 0,
         }));
         let notify = Arc::new(Notify::new());
-        // Keep an extra reference so the subscription parks (instead of
-        // terminating) once it reaches the empty active segment.
-        let _writer_notify = notify.clone();
-
         let mut sub = WalSubscription::new(
             Arc::from(dir.path()),
             head,
             notify,
+            Arc::new(WriterState::default()),
             WalOffset {
                 segment_id: 1,
                 byte_offset: 0,
@@ -522,14 +534,11 @@ mod tests {
             byte_offset: 128,
         }));
         let notify = Arc::new(Notify::new());
-        // Keep a writer-like reference alive so wait_or_advance does not take the
-        // writer-shutdown fast-path.
-        let _writer_notify = notify.clone();
-
         let mut sub = WalSubscription::new(
             Arc::from(dir.path()),
             head,
             notify,
+            Arc::new(WriterState::default()),
             WalOffset {
                 segment_id: 1,
                 byte_offset: 64,
@@ -578,12 +587,95 @@ mod tests {
             Arc::from(dir),
             Arc::new(AtomicWalOffset::new(start)),
             Arc::new(Notify::new()),
+            Arc::new(WriterState::default()),
             start,
         )
     }
 
     fn remaining_segments(dir: &Path) -> Vec<u64> {
         crate::infrastructure::wal::segment::list_segments(dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_wal_sync_commit_cannot_advance_past_durable_head() -> Result<()> {
+        let dir = tempdir()?;
+        make_segment(dir.path(), 1);
+        make_segment(dir.path(), 2);
+        let head = WalOffset {
+            segment_id: 1,
+            byte_offset: 10,
+        };
+        let mut sub = new_sub(dir.path(), head);
+
+        let result = sub
+            .commit(WalOffset {
+                segment_id: 2,
+                byte_offset: 0,
+            })
+            .await;
+
+        assert!(result.is_err(), "unsynced records cannot be committed");
+        assert!(cursor::read_cursor(dir.path())?.is_none());
+        assert_eq!(remaining_segments(dir.path()), vec![1, 2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_sync_failed_cursor_write_does_not_reclaim_segments() -> Result<()> {
+        let dir = tempdir()?;
+        make_segment(dir.path(), 1);
+        make_segment(dir.path(), 2);
+        fs::create_dir(dir.path().join("commit.cursor.tmp"))?;
+        let mut sub = new_sub(
+            dir.path(),
+            WalOffset {
+                segment_id: 2,
+                byte_offset: 0,
+            },
+        );
+
+        let result = sub
+            .commit(WalOffset {
+                segment_id: 2,
+                byte_offset: 0,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(remaining_segments(dir.path()), vec![1, 2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_sync_failed_cursor_directory_sync_is_retried_before_reclaim() -> Result<()> {
+        use crate::infrastructure::wal::test_support::TestIoStep;
+
+        let dir = tempdir()?;
+        make_segment(dir.path(), 1);
+        make_segment(dir.path(), 2);
+        let offset = WalOffset {
+            segment_id: 2,
+            byte_offset: 0,
+        };
+        let mut sub = new_sub(dir.path(), offset);
+        let hook: TestIoHookSlot = Arc::new(std::sync::Mutex::new(None));
+        *hook.lock().unwrap() = Some(Arc::new(|step| {
+            if step == TestIoStep::CursorDirectorySync {
+                return Err(std::io::Error::other(
+                    "injected cursor directory sync failure",
+                ));
+            }
+            Ok(())
+        }));
+        sub.test_io_hook = Some(hook);
+
+        assert!(sub.commit(offset).await.is_err());
+        assert_eq!(remaining_segments(dir.path()), vec![1, 2]);
+
+        sub.test_io_hook = None;
+        sub.commit(offset).await?;
+        assert_eq!(remaining_segments(dir.path()), vec![2]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -600,6 +692,10 @@ mod tests {
                 byte_offset: 0,
             },
         );
+        sub.head.store(WalOffset {
+            segment_id: 3,
+            byte_offset: 0,
+        });
 
         // Commit within segment 1: nothing older than 1 exists, keeps 1..=3.
         sub.commit(WalOffset {
@@ -636,6 +732,10 @@ mod tests {
                 byte_offset: 0,
             },
         );
+        sub.head.store(WalOffset {
+            segment_id: 2,
+            byte_offset: 5,
+        });
 
         // The very first commit (even at the start segment) must run GC once and
         // reclaim the stale 0 and 1.

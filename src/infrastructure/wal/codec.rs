@@ -34,6 +34,7 @@ pub enum DecodeOutcome {
 }
 
 pub fn encode_into(buf: &mut Vec<u8>, event: &WalEvent) -> Result<()> {
+    wal_record_frame_size(event.topic.len(), event.payload.len())?;
     buf.clear();
     buf.extend_from_slice(&[0u8; 4]); // Placeholder for the length of the encoded event
 
@@ -180,6 +181,27 @@ mod tests {
             wal_record_frame_size(event.topic.len(), event.payload.len())?,
             expected
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_sync_codec_enforces_body_limit_with_framing_overhead() -> Result<()> {
+        let mut event = WalEvent {
+            topic: "t".to_owned(),
+            ts_ms: 1,
+            payload: "x".repeat(MAX_WAL_RECORD_PAYLOAD_BYTES - WAL_EVENT_FIXED_BYTES - 1),
+        };
+        let mut frame = Vec::new();
+
+        encode_into(&mut frame, &event)?;
+        assert_eq!(
+            frame.len(),
+            MAX_WAL_RECORD_PAYLOAD_BYTES + WAL_FRAME_HEADER_BYTES
+        );
+        assert!(decode_from(&mut std::io::Cursor::new(&frame))?.is_some());
+
+        event.payload.push('x');
+        assert!(encode_into(&mut frame, &event).is_err());
         Ok(())
     }
 

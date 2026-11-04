@@ -2,9 +2,38 @@ use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::infrastructure::wal::codec;
+
+pub(super) fn validate_committed_offset(path: &Path, offset: u64) -> Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("opening committed WAL segment {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut payload = Vec::new();
+    let mut position = 0u64;
+
+    while position < offset {
+        match codec::decode_for_recovery(&mut reader, &mut payload)? {
+            codec::DecodeOutcome::ValidRecord(_, consumed) => {
+                position += consumed as u64;
+            }
+            codec::DecodeOutcome::CleanEof => {
+                bail!("committed WAL cursor {offset} points beyond a complete record");
+            }
+            codec::DecodeOutcome::FrameCorrupt(_) => {
+                bail!("committed WAL segment contains a corrupt record at {position}");
+            }
+        }
+    }
+
+    if position != offset {
+        bail!("committed WAL cursor {offset} is not on a record boundary");
+    }
+    Ok(())
+}
 
 /// Scans `path` and returns the byte offset immediately after the last
 /// **complete** record, i.e. the length the active segment must be truncated to
@@ -58,19 +87,20 @@ pub fn last_valid_offset(path: &Path) -> Result<u64> {
 
 /// Physically truncates `path` to `len` bytes.
 ///
-/// No fsync is issued — this matches the WAL's page-cache durability contract.
-/// Callers should only invoke this when `len` is strictly less than the current
-/// file length (a torn tail was detected).
+/// The shortened file is synced before returning. Callers should only invoke
+/// this when `len` is strictly less than the current file length.
 ///
 /// # Errors
 /// Returns an error if the segment cannot be opened or resized.
 pub fn truncate_to(path: &Path, len: u64) -> Result<()> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .open(path)
-        .with_context(|| format!("opening WAL segment for truncation {}", path.display()))?
-        .set_len(len)
+        .with_context(|| format!("opening WAL segment for truncation {}", path.display()))?;
+    file.set_len(len)
         .with_context(|| format!("truncating WAL segment {} to {len} bytes", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing truncated WAL segment {}", path.display()))?;
     Ok(())
 }
 

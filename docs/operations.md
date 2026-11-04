@@ -195,7 +195,7 @@ Adjust:
 
 ## Restart Safely
 
-Use a normal stop signal. The service drains worker queues, drops WAL senders, flushes the writer, and gives the forwarder up to 5 seconds to write its final batch.
+Use a normal stop signal. The service drains worker queues, drops WAL senders, flushes and syncs the writer, and gives the forwarder up to 5 seconds to write its final batch.
 
 If shutdown logs show:
 

@@ -41,13 +41,26 @@ The WAL writer runs on a dedicated OS thread because it performs blocking file I
 Append flow:
 
 1. Pipeline creates a `WalEvent`.
-2. `append_durable` sends it through a bounded sync channel.
+2. `append_durable` rejects bodies over 1 MiB and sends the event through a bounded sync channel.
 3. The writer encodes and writes the record to a `BufWriter`.
-4. The writer flushes buffered bytes at least every 5 ms while dirty.
-5. The writer advances the in-memory head offset and notifies readers.
-6. `append_durable` returns after the writer acknowledges the flush boundary.
+4. The writer batches records for up to 5 ms, or until pending receipts reach the queue capacity,
+   then flushes the buffer and calls `File::sync_data`.
+5. Only after a successful sync does the writer advance the in-memory head and resolve the
+   group's append receipts. A write, flush, sync, or rotation failure stops the writer, fails
+   affected receipts, and leaves the head at the last successful sync.
 
-Important durability detail: `append_durable` waits for `BufWriter::flush`, not for a storage-media `fsync`. This means bytes have left process memory and are readable from the WAL file, but the code does not claim a power-loss-safe fsync boundary.
+Sync adds storage latency to each batch; 5 ms is the batching deadline, not a bound on total
+append latency. The head uses a mutex-free, single-writer atomic snapshot: readers retry when
+its version is odd or changes and may spin during publication. It represents the last
+successfully synced offset. `Wal::writer_failure()` exposes a terminal writer failure
+independently of thread liveness.
+
+On Linux, file sync uses `fdatasync` and directory sync uses `fsync`. These calls are meaningful
+only when the filesystem, volume driver, and storage device honor flush requests; they cannot
+protect against lost media or unsupported network/virtual storage guarantees. On Windows the
+code also attempts real file and directory-handle syncs and reports failures, but Windows'
+directory-entry crash guarantees are not claimed. Linux/ARM64 is the production target;
+Windows tests do not establish its power-loss behavior.
 
 ## Segment Rotation
 
@@ -55,14 +68,14 @@ The writer rotates when appending the next record would exceed `WAL_SEGMENT_BYTE
 
 Rotation flow:
 
-1. Flush current segment.
-2. Advance the head offset.
-3. Notify readers and acknowledge pending durable appends.
-4. Open the next numbered segment.
-5. Continue writing at byte offset `0`.
+1. Flush and sync any pending records in the current segment.
+2. Publish the synced head and acknowledge those records.
+3. Create and sync the next numbered segment, then sync its directory entry.
+4. Continue writing at byte offset `0`. Failure leaves the new record unacknowledged.
 
 Fatal writer failures are counted by `wal_writer_fatal_total` with reasons:
 
+- `flush_or_sync`
 - `flush_before_rotation`
 - `open_next_segment`
 - `write_all`
@@ -71,15 +84,19 @@ Fatal writer failures are counted by `wal_writer_fatal_total` with reasons:
 
 On startup, `Wal::open`:
 
-1. Creates `WAL_DIR` if needed.
+1. Creates `WAL_DIR` if needed and syncs the relevant parent directory entries.
 2. Lists segment files.
-3. Scans the active segment for the last valid offset.
-4. Truncates a torn tail if the file contains incomplete trailing bytes.
-5. Reads `commit.cursor` if present.
-6. Starts the subscription at the committed cursor, or at the first segment offset `0` when no cursor exists.
-7. Starts the writer at the recovered active segment and valid byte offset.
+3. Reads `commit.cursor` and validates its segment and record boundary before changing files.
+4. Syncs retained older segments before publishing a recovered head.
+5. Scans the active segment for the last complete offset.
+6. Truncates and syncs an incomplete trailing record only after the committed cursor is validated.
+7. Starts the subscription at the committed cursor, or at the first segment offset `0` when no cursor exists.
+8. Syncs the active segment and directory, then starts the writer at the recovered offset.
 
-A corrupt cursor file is a startup error. For example, a cursor length other than 16 bytes is rejected.
+A corrupt or inconsistent committed cursor is a startup error, including an existing empty
+cursor file; recovery preserves the segment instead of truncating through it. Complete corrupt
+records beyond the committed cursor are still handled by the existing recovery/reader policy,
+not repaired by this change.
 
 ## Subscription
 
@@ -92,15 +109,23 @@ The subscription:
 - Keeps a reusable payload buffer to reduce allocation.
 - Waits for writer notifications when it reaches EOF.
 - Advances to the next segment when the writer rotates.
-- Skips durable corrupt records that would otherwise stall replay.
+- Can currently inspect visible bytes past the synced head and skip corrupt records.
+
+The commit operation rejects offsets beyond the synced head. This prevents a cursor or segment
+reclamation from passing unsynced data, but the reader's existing corruption-skipping and
+read-error behavior is not fail-closed. Issue #39 must address those paths before the service
+can claim end-to-end durable delivery.
 
 On commit, the subscription:
 
-1. Writes `commit.cursor` through temp file and rename.
-2. Deletes segment files with ids strictly lower than the committed segment.
-3. Keeps the segment that contains the committed offset because it can still contain uncommitted records after that byte offset.
+1. Writes and syncs `commit.cursor.tmp`.
+2. Renames it to `commit.cursor` and syncs the directory.
+3. Only after those steps succeed, deletes segment files with ids strictly lower than the
+   committed segment and keeps the segment containing the committed offset.
 
-Segment deletion failures are logged but do not fail the commit once the cursor has been written.
+Segment deletion failures are logged but do not fail the durable commit. The current reclaim
+watermark may defer another attempt until a later segment advance; issue #30 owns reclaim retry
+and disk-budget accounting.
 
 ## Forwarder Guarantees
 
@@ -128,6 +153,8 @@ Cursor commit failures after a successful sink write are retried in-loop. The si
 ## Delivery Semantics
 
 The service retains WAL batches and retries delivery after both retryable and permanent sink failures.
+The current MQTT acknowledgement and rejection paths are not yet coupled to the synced WAL
+boundary; this change alone does not provide durable QoS 1 ingestion.
 
 With the current `InfluxSink`, cases to understand are:
 

@@ -69,15 +69,19 @@ dispatch does not guarantee per-device processing order across workers.
   `DlqPublisher` together; `build_output` constructs `Encoder` and `Sink` together.
   Keep concrete MQTT/InfluxDB dependencies out of generic pipeline and WAL code.
   `Encoder::encode` remains synchronous and performs no I/O.
-- **WAL acknowledgement is a flush boundary:** `PersistStage` must await
-  `Wal::append_durable`, not substitute `try_append`. Acknowledgement means
-  `BufWriter::flush`, not `fsync`/power-loss durability. WAL records contain already
-  encoded sink payloads, not raw input JSON; account for queued records when changing
-  encoders, sink formats, or on-disk serialization.
+- **WAL acknowledgement is a sync boundary:** `PersistStage` must await
+  `Wal::append_durable`, not substitute `try_append`. The writer flushes and syncs
+  the record before publishing its head or resolving its receipt; new segment and
+  cursor directory entries are synced before success or reclamation. Guarantees
+  depend on the filesystem and storage honoring sync, and do not yet imply durable
+  MQTT acknowledgement. WAL records contain already encoded sink payloads, not raw
+  input JSON; account for queued records when changing encoders or serialization.
 - **Replay and commit are coupled:** both retryable and permanent sink errors retain
   the batch without advancing the cursor. Only successful sink writes advance through
-  `offset_after`. Retry cursor commits without repeating an already-completed sink
-  write. A crash before commit can replay writes:
+  `offset_after`, never past the synced WAL head. Retry cursor commits without
+  repeating an already-completed sink write. The reader can still inspect visible
+  bytes past the head and skip corruption; #39 owns the fail-closed reader contract.
+  A crash before commit can replay writes:
   do not claim exactly-once or lossless end-to-end delivery.
 - **Overflow paths differ:** a full input worker queue drops the message before the
   pipeline, increments `ingest_event_queue_full_total`, and does not publish DLQ.

@@ -1,29 +1,30 @@
-use crate::infrastructure::wal::types::WalOffset;
-use anyhow::{anyhow, Result};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use anyhow::{anyhow, Context, Result};
+
+#[cfg(test)]
+use crate::infrastructure::wal::test_support::{run_test_io_hook, TestIoHookSlot, TestIoStep};
+use crate::infrastructure::wal::types::WalOffset;
+
 /// Reads the current commit cursor from the given directory.
-/// Returns `Ok(None)` if the cursor file does not exist or is empty.
+/// Returns `Ok(None)` if the cursor file does not exist.
+///
+/// # Errors
+/// Returns an error if the cursor cannot be read or has an invalid length.
 pub fn read_cursor(dir: &Path) -> Result<Option<WalOffset>> {
     let cursor_path = dir.join("commit.cursor");
 
-    if !cursor_path.exists() {
-        return Ok(None);
-    }
-
-    let mut file = match File::open(cursor_path) {
+    let mut file = match File::open(&cursor_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(anyhow!("Failed to open cursor file: {}", e)),
+        Err(e) => {
+            return Err(e).with_context(|| format!("opening WAL cursor {}", cursor_path.display()))
+        }
     };
 
     let file_len = file.metadata()?.len();
-
-    if file_len == 0 {
-        return Ok(None);
-    }
 
     if file_len != 16 {
         return Err(anyhow!(
@@ -38,14 +39,43 @@ pub fn read_cursor(dir: &Path) -> Result<Option<WalOffset>> {
     Ok(Some(offset))
 }
 
-/// Writes the given `WalOffset` to the commit cursor file in the specified directory.
-/// This operation is atomic: it first writes to a temporary file and then renames it to the final cursor file.
+/// Syncs a temporary cursor file, renames it, and syncs the containing directory.
+///
+/// # Errors
+/// Returns an error if writing, syncing, or renaming the cursor fails.
 pub fn write_cursor(dir: &Path, offset: WalOffset) -> Result<()> {
+    write_cursor_inner(
+        dir,
+        offset,
+        #[cfg(test)]
+        None,
+    )
+}
+
+pub(super) fn write_cursor_inner(
+    dir: &Path,
+    offset: WalOffset,
+    #[cfg(test)] test_io_hook: Option<&TestIoHookSlot>,
+) -> Result<()> {
     let cursor_path_tmp = dir.join("commit.cursor.tmp");
     let cursor_path_final = dir.join("commit.cursor");
     let mut file = File::create(&cursor_path_tmp)?;
     file.write_all(&offset.to_bytes())?;
-    std::fs::rename(&cursor_path_tmp, &cursor_path_final)?;
+    #[cfg(test)]
+    if let Some(hook) = test_io_hook {
+        run_test_io_hook(hook, TestIoStep::CursorFileSync)?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing WAL cursor {}", cursor_path_tmp.display()))?;
+    drop(file);
+    std::fs::rename(&cursor_path_tmp, &cursor_path_final)
+        .with_context(|| format!("renaming WAL cursor {}", cursor_path_final.display()))?;
+    #[cfg(test)]
+    if let Some(hook) = test_io_hook {
+        run_test_io_hook(hook, TestIoStep::CursorDirectorySync)?;
+    }
+    crate::infrastructure::wal::segment::sync_directory(dir)
+        .with_context(|| format!("syncing WAL cursor directory {}", dir.display()))?;
     Ok(())
 }
 
@@ -56,6 +86,37 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_wal_sync_cursor_sync_failures_are_reported() -> Result<()> {
+        for failed_step in [TestIoStep::CursorFileSync, TestIoStep::CursorDirectorySync] {
+            let dir = tempdir()?;
+            let old = WalOffset {
+                segment_id: 1,
+                byte_offset: 10,
+            };
+            let new = WalOffset {
+                segment_id: 2,
+                byte_offset: 20,
+            };
+            write_cursor(dir.path(), old)?;
+            let hook: TestIoHookSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            *hook.lock().unwrap() = Some(std::sync::Arc::new(move |step| {
+                if step == failed_step {
+                    return Err(std::io::Error::other("injected cursor sync failure"));
+                }
+                Ok(())
+            }));
+
+            let result = write_cursor_inner(dir.path(), new, Some(&hook));
+
+            assert!(result.is_err(), "{failed_step:?} failure was ignored");
+            if failed_step == TestIoStep::CursorFileSync {
+                assert_eq!(read_cursor(dir.path())?, Some(old));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_read_cursor_file_states_returns_expected_offsets() -> Result<()> {
         let dir = tempdir()?;
         let cursor_path = dir.path().join("commit.cursor");
@@ -63,7 +124,7 @@ mod tests {
         assert!(read_cursor(dir.path())?.is_none());
 
         File::create(&cursor_path)?;
-        assert!(read_cursor(dir.path())?.is_none());
+        assert!(read_cursor(dir.path()).is_err());
 
         let offset = WalOffset {
             segment_id: 42,
