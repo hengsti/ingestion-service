@@ -149,17 +149,20 @@ impl CalculationRegistry {
                         .insert("heat_index_c".to_owned(), TelemetryValue::Float(value));
                 }
                 Calculation::Iaq => {
-                    match record.fields.get(WARMED_UP_FIELD) {
-                        Some(TelemetryValue::Boolean(false)) => continue,
-                        Some(TelemetryValue::Boolean(true)) | None => {}
+                    let warmed_up = match record.fields.get(WARMED_UP_FIELD) {
+                        Some(TelemetryValue::Boolean(warmed_up)) => *warmed_up,
+                        None => true,
                         Some(_) => bail!("mapped field '{WARMED_UP_FIELD}' must be a boolean"),
-                    }
+                    };
 
                     let gas_ohm = required_float(&record, GAS_FIELD)?;
                     let rel_hum_perc = required_float(&record, HUMIDITY_FIELD)?;
                     validate_humidity(rel_hum_perc)?;
                     if gas_ohm <= 0.0 {
                         bail!("field '{GAS_FIELD}' must be greater than zero");
+                    }
+                    if !warmed_up {
+                        continue;
                     }
 
                     ensure_output_available(&record, "iaq_score")?;
@@ -494,6 +497,47 @@ mod tests {
         let record = registry.apply(record)?;
         assert!(!record.fields.contains_key("iaq_score"));
         assert!(!record.fields.contains_key("iaq_text"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_apply_rejects_invalid_iaq_inputs_when_not_warmed_up() -> Result<()> {
+        let fields = float_fields(&["gas_ohm", "rel_hum_perc"]);
+        let registry = CalculationRegistry::resolve(&[CalculationName::Iaq], &fields)?;
+
+        for (field, value) in [
+            (GAS_FIELD, -1.0),
+            (GAS_FIELD, 0.0),
+            (HUMIDITY_FIELD, 0.0),
+            (HUMIDITY_FIELD, 100.1),
+        ] {
+            let mut record = valid_record();
+            record
+                .fields
+                .insert(WARMED_UP_FIELD.to_owned(), TelemetryValue::Boolean(false));
+            record
+                .fields
+                .insert(field.to_owned(), TelemetryValue::Float(value));
+
+            assert!(
+                registry.apply(record).is_err(),
+                "invalid {field} value {value} must be rejected during warm-up"
+            );
+        }
+
+        for field in [GAS_FIELD, HUMIDITY_FIELD] {
+            let mut record = valid_record();
+            record
+                .fields
+                .insert(WARMED_UP_FIELD.to_owned(), TelemetryValue::Boolean(false));
+            record.fields.remove(field);
+
+            assert!(
+                registry.apply(record).is_err(),
+                "missing {field} must be rejected during warm-up"
+            );
+        }
+
         Ok(())
     }
 
