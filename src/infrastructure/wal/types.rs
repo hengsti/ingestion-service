@@ -48,13 +48,14 @@ pub struct WalEntry {
 #[derive(Debug, Clone)]
 pub struct WalOptions {
     pub dir: PathBuf,
+    /// Maximum accounted journal bytes, including pending writes and reserves.
+    pub max_bytes: u64,
     pub segment_bytes: u64,    // rotation threshold for segment files
     pub queue_capacity: usize, // bounded mpsc into the writer
 }
 
 /// Reason a non-blocking append was rejected. Each variant carries the rejected
-/// event so callers can recover it (mirrors `tokio`'s `TrySendError`); the
-/// pipeline currently routes to DLQ and drops the payload.
+/// event so callers can recover it (mirrors `tokio`'s `TrySendError`).
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum TryAppendError {
@@ -62,6 +63,8 @@ pub enum TryAppendError {
     Full(WalEvent),
     #[allow(dead_code)]
     Closed(WalEvent),
+    /// The journal byte budget is exhausted; the event has not been queued.
+    Capacity(WalEvent),
     /// The encoded record would exceed the reader's payload limit.
     TooLarge(WalEvent),
 }
@@ -73,6 +76,8 @@ pub enum AppendDurableError {
     Full(WalEvent),
     #[allow(dead_code)]
     Closed(WalEvent),
+    /// The journal byte budget is exhausted; the event has not been queued.
+    Capacity(WalEvent),
     /// The encoded record would exceed the reader's payload limit.
     #[allow(dead_code)]
     TooLarge(WalEvent),

@@ -14,6 +14,7 @@ pub(crate) enum TestIoStep {
     CursorDirectorySync,
     SegmentFileSync,
     SegmentDirectorySync,
+    ReclaimDirectorySync,
 }
 
 pub(crate) type TestIoHook = Arc<dyn Fn(TestIoStep) -> io::Result<()> + Send + Sync>;

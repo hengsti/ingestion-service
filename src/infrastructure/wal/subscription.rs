@@ -12,16 +12,19 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 #[cfg(test)]
-use crate::infrastructure::wal::test_support::TestIoHookSlot;
-use crate::infrastructure::wal::{codec, cursor};
+use crate::infrastructure::wal::test_support::{run_test_io_hook, TestIoHookSlot, TestIoStep};
 use crate::infrastructure::wal::{
+    capacity::{Capacity, SEGMENT_ALLOWANCE_BYTES},
+    journal::Journal,
     segment,
     types::{WalEntry, WalEvent, WalOffset},
     writer::{AtomicWalOffset, WriterState},
 };
+use crate::infrastructure::wal::{codec, cursor};
 
 pub struct WalSubscription {
-    dir: Arc<Path>,
+    journal: Arc<Journal>,
+    capacity: Arc<Capacity>,
     head: Arc<AtomicWalOffset>,
     notify: Arc<Notify>,
     writer_state: Arc<WriterState>,
@@ -44,14 +47,16 @@ pub struct WalSubscription {
 
 impl WalSubscription {
     pub(super) fn new(
-        dir: Arc<Path>,
+        journal: Arc<Journal>,
+        capacity: Arc<Capacity>,
         head: Arc<AtomicWalOffset>,
         notify: Arc<Notify>,
         writer_state: Arc<WriterState>,
         start: WalOffset,
     ) -> Self {
         Self {
-            dir,
+            journal,
+            capacity,
             head,
             notify,
             writer_state,
@@ -73,14 +78,14 @@ impl WalSubscription {
             // `BufReader` (no per-record reopen) and the reusable `Vec` (no
             // per-record allocation). `dir` is an `Arc<Path>`, so the clone is a
             // refcount bump, not a path allocation.
-            let dir = Arc::clone(&self.dir);
+            let journal = Arc::clone(&self.journal);
             let segment_id = self.cur_segment_id;
             let byte_offset = self.cur_byte_offset;
             let reader = self.cur_reader.take();
             let payload = std::mem::take(&mut self.payload_buf);
 
             let (outcome, reader, payload) = tokio::task::spawn_blocking(move || {
-                read_one(&dir, segment_id, byte_offset, reader, payload)
+                read_one(journal.dir(), segment_id, byte_offset, reader, payload)
             })
             .await
             .expect("WAL read_one blocking task panicked");
@@ -197,11 +202,11 @@ impl WalSubscription {
     /// `wait_or_advance`, which rolls to the next segment if the writer has
     /// sealed this one. Returns `false` only when there is nothing left to read.
     async fn skip_corrupt_record(&mut self) -> bool {
-        let dir = Arc::clone(&self.dir);
+        let journal = Arc::clone(&self.journal);
         let segment_id = self.cur_segment_id;
         let byte_offset = self.cur_byte_offset;
         let len = tokio::task::spawn_blocking(move || {
-            let path = segment::segment_path(&dir, segment_id);
+            let path = segment::segment_path(journal.dir(), segment_id);
             read_len_prefix(&path, byte_offset)
         })
         .await
@@ -234,13 +239,14 @@ impl WalSubscription {
     ///
     /// # Errors
     /// Returns an error if `up_to` exceeds the synced head or cursor persistence
-    /// fails. Segment deletion failures are logged but do not undo the commit.
+    /// or segment reclamation fails. A persisted cursor is safe to retry.
     pub async fn commit(&mut self, up_to: WalOffset) -> Result<()> {
         let head = self.head.load();
         if up_to > head {
             anyhow::bail!("WAL commit {up_to:?} exceeds durable head {head:?}");
         }
-        let dir = Arc::clone(&self.dir);
+        let journal = Arc::clone(&self.journal);
+        let capacity = Arc::clone(&self.capacity);
         // Only scan for reclaimable segments when the committed segment has
         // advanced past the last one we GC'd; commits that stay within the same
         // segment have nothing new to delete. Computed before the move so the
@@ -253,16 +259,26 @@ impl WalSubscription {
         // filesystem ops; run them on a blocking thread so they can't stall a
         // runtime worker.
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let dir = journal.dir();
+            let mut maintenance = journal.maintenance()?;
+            let committed = match maintenance.committed {
+                Some(offset) => Some(offset),
+                None => cursor::read_cursor(dir)?,
+            };
+            if committed.is_some_and(|offset| up_to < offset) {
+                anyhow::bail!("WAL commit {up_to:?} precedes the persisted cursor");
+            }
+            // A failed directory sync can still leave the newer cursor visible.
+            maintenance.committed = Some(up_to);
             // Persist and sync the cursor before reclaiming older segments.
             #[cfg(test)]
             let cursor_result = match test_io_hook.as_ref() {
-                Some(hook) => cursor::write_cursor_inner(&dir, up_to, Some(hook)),
-                None => cursor::write_cursor(&dir, up_to),
+                Some(hook) => cursor::write_cursor_inner(dir, up_to, Some(hook)),
+                None => cursor::write_cursor(dir, up_to),
             };
             #[cfg(not(test))]
-            let cursor_result = cursor::write_cursor(&dir, up_to);
-            cursor_result
-                .with_context(|| format!("writing WAL cursor to {}", dir.display()))?;
+            let cursor_result = cursor::write_cursor(dir, up_to);
+            cursor_result.with_context(|| format!("writing WAL cursor to {}", dir.display()))?;
 
             // (2) Reclaim disk: drop every segment whose id is strictly below the
             //     committed segment. The segment that *contains* the committed
@@ -270,27 +286,60 @@ impl WalSubscription {
             //     `up_to.byte_offset`. `list_segments` returns ids ascending, so
             //     once we hit one >= up_to.segment_id we can stop scanning.
             if run_gc {
-                for seg_id in segment::list_segments(&dir)? {
+                let mut reclaim_error = None;
+                for seg_id in segment::list_segments(dir)? {
                     if seg_id >= up_to.segment_id {
                         break;
                     }
 
-                    let path = segment::segment_path(&dir, seg_id);
+                    let path = segment::segment_path(dir, seg_id);
+                    let bytes = match fs::metadata(&path) {
+                        Ok(metadata) => metadata
+                            .len()
+                            .checked_add(SEGMENT_ALLOWANCE_BYTES)
+                            .context("reclaimed journal segment size overflowed")?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            reclaim_error =
+                                Some(anyhow::Error::new(error).context(format!(
+                                    "reading WAL segment size {}",
+                                    path.display()
+                                )));
+                            break;
+                        }
+                    };
                     match fs::remove_file(&path) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            maintenance.pending_deleted_bytes = maintenance
+                                .pending_deleted_bytes
+                                .checked_add(bytes)
+                                .context("reclaimed journal capacity overflowed")?;
+                        }
 
                         // A prior commit already removed it — commit is idempotent.
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
 
-                        // Non-fatal: a later segment advance triggers another scan.
                         Err(e) => {
-                            warn!(
-                                error = %e,
-                                path = %path.display(),
-                                "WAL subscription: failed to delete segment; will retry on next commit"
+                            reclaim_error = Some(
+                                anyhow::Error::new(e)
+                                    .context(format!("reclaiming WAL segment {}", path.display())),
                             );
+                            break;
                         }
                     }
+                }
+                if maintenance.pending_deleted_bytes != 0 {
+                    #[cfg(test)]
+                    if let Some(hook) = test_io_hook.as_ref() {
+                        run_test_io_hook(hook, TestIoStep::ReclaimDirectorySync)?;
+                    }
+                    segment::sync_directory(dir).with_context(|| {
+                        format!("syncing reclaimed WAL directory {}", dir.display())
+                    })?;
+                    capacity.release(std::mem::take(&mut maintenance.pending_deleted_bytes));
+                }
+                if let Some(error) = reclaim_error {
+                    return Err(error);
                 }
             }
 
@@ -505,7 +554,8 @@ mod tests {
         }));
         let notify = Arc::new(Notify::new());
         let mut sub = WalSubscription::new(
-            Arc::from(dir.path()),
+            Arc::new(Journal::open(dir.path().to_path_buf()).unwrap()),
+            Capacity::recover(dir.path(), 128 * 1024 * 1024).unwrap(),
             head,
             notify,
             Arc::new(WriterState::default()),
@@ -535,7 +585,8 @@ mod tests {
         }));
         let notify = Arc::new(Notify::new());
         let mut sub = WalSubscription::new(
-            Arc::from(dir.path()),
+            Arc::new(Journal::open(dir.path().to_path_buf()).unwrap()),
+            Capacity::recover(dir.path(), 128 * 1024 * 1024).unwrap(),
             head,
             notify,
             Arc::new(WriterState::default()),
@@ -584,7 +635,8 @@ mod tests {
 
     fn new_sub(dir: &Path, start: WalOffset) -> WalSubscription {
         WalSubscription::new(
-            Arc::from(dir),
+            Arc::new(Journal::open(dir.to_path_buf()).unwrap()),
+            Capacity::recover(dir, 128 * 1024 * 1024).unwrap(),
             Arc::new(AtomicWalOffset::new(start)),
             Arc::new(Notify::new()),
             Arc::new(WriterState::default()),
@@ -675,6 +727,64 @@ mod tests {
         sub.test_io_hook = None;
         sub.commit(offset).await?;
         assert_eq!(remaining_segments(dir.path()), vec![2]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_failed_reclaim_retries_at_the_same_cursor() -> Result<()> {
+        let dir = tempdir()?;
+        let blocked = dir.path().join(segment_filename(1));
+        fs::create_dir(&blocked)?;
+        make_segment(dir.path(), 2);
+        let offset = WalOffset {
+            segment_id: 2,
+            byte_offset: 0,
+        };
+        let mut sub = new_sub(dir.path(), offset);
+        let accounted = sub.capacity.snapshot().0;
+
+        assert!(sub.commit(offset).await.is_err());
+        assert!(blocked.exists());
+        assert_eq!(sub.capacity.snapshot().0, accounted);
+
+        fs::remove_dir(&blocked)?;
+        make_segment(dir.path(), 1);
+        sub.commit(offset).await?;
+        assert_eq!(remaining_segments(dir.path()), vec![2]);
+        assert!(sub.capacity.snapshot().0 < accounted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_reclaim_sync_failure_keeps_bytes_until_retry() -> Result<()> {
+        let dir = tempdir()?;
+        make_segment(dir.path(), 1);
+        make_segment(dir.path(), 2);
+        let offset = WalOffset {
+            segment_id: 2,
+            byte_offset: 0,
+        };
+        let mut sub = new_sub(dir.path(), offset);
+        let accounted = sub.capacity.snapshot().0;
+        let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_fail_once = Arc::clone(&fail_once);
+        let hook: TestIoHookSlot = Arc::new(std::sync::Mutex::new(Some(Arc::new(move |step| {
+            if step == TestIoStep::ReclaimDirectorySync
+                && hook_fail_once.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other(
+                    "injected reclaim directory sync failure",
+                ));
+            }
+            Ok(())
+        }))));
+        sub.test_io_hook = Some(hook);
+
+        assert!(sub.commit(offset).await.is_err());
+        assert_eq!(remaining_segments(dir.path()), vec![2]);
+        assert_eq!(sub.capacity.snapshot().0, accounted);
+        sub.commit(offset).await?;
+        assert!(sub.capacity.snapshot().0 < accounted);
         Ok(())
     }
 
