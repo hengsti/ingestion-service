@@ -53,11 +53,19 @@ above the MQTT wire limit are outside the local quarantine guarantee.
 
 With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
 
-The source subscribes to the route bundle's filters on each connection. A persistent broker
-session retains obsolete subscriptions when filters change; remove those subscriptions or
-migrate to a new client ID. Resetting or replacing a session can discard its queued messages.
-Messages from obsolete subscriptions that reach the pipeline without a matching route are
-routed to the DLQ.
+The source reconciles the route bundle's filters at startup and after reconnect. A synced,
+two-slot subscription manifest in `WAL_DIR` records the broker/client identity and known filters;
+each slot is limited to 16 KiB within the WAL metadata reserve. The
+service persists the union of known and desired filters before changing the broker session, then
+reports ready only after the current filters receive QoS 1 grants and obsolete filters are
+acknowledged as unsubscribed. Messages already queued or in flight for removed filters can still
+arrive; unmatched messages are durably rejected and may also be published to the DLQ.
+
+MQTT 3.1.1 cannot enumerate subscriptions in a resumed session. If a persistent session predates
+the manifest, startup fails closed until an operator verifies and supplies the old filters. See
+[route changes and subscription migration](operations.md#route-changes-and-subscription-migration).
+Do not delete the manifest or replace the broker session as a shortcut; either can hide queued
+work.
 
 ## InfluxDB
 
@@ -97,7 +105,7 @@ Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a sma
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `WAL_DIR` | Yes | None | Directory for WAL segment files and `commit.cursor` |
+| `WAL_DIR` | Yes | None | Directory for WAL segments, `commit.cursor`, and the MQTT subscription manifest |
 | `WAL_MAX_BYTES` | Yes | None | Maximum accounted WAL bytes, including pending appends and metadata reserves |
 | `WAL_SEGMENT_BYTES` | No | `67108864` | Segment rotation threshold in bytes |
 | `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer; must be greater than zero |

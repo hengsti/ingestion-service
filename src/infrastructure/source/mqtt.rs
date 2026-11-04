@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
@@ -17,9 +17,12 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use super::{AckKey, AckReceipt, DlqPublisher, IngestDispatcher, IngestJob, Source};
+mod subscriptions;
+
 use crate::config::{Config, MqttSourceConfig};
 use crate::infrastructure::router::RouteSet;
 use crate::infrastructure::wal::capacity::Capacity;
+use subscriptions::{filter_plan, BrokerIdentity, SubscriptionManifest};
 
 /// Delay between reconnect attempts after an event-loop poll error.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -29,14 +32,17 @@ const MAX_INFLIGHT_MESSAGES: usize = 100;
 const MQTT_REQUEST_CAPACITY: usize = 10;
 
 /// MQTT-backed [`Source`]. Rebuilds the client after connection errors and
-/// re-subscribes to `filters` on every `ConnAck`. Readiness is only reported
-/// once the broker acknowledges the subscription.
+/// reconciles the desired filters on every `ConnAck`. Readiness is only reported
+/// after current subscriptions and obsolete unsubscriptions are acknowledged.
 pub struct MqttSource {
     options: MqttOptions,
     eventloop: EventLoop,
     client: AsyncClient,
     publisher_client: Arc<Mutex<AsyncClient>>,
     filters: Vec<SubscribeFilter>,
+    manifest: SubscriptionManifest,
+    reconciliation: Option<Reconciliation>,
+    fresh_session_filters: Option<Vec<String>>,
     subscribe_pending: bool,
     expected_suback: Option<u16>,
     ready: Arc<AtomicBool>,
@@ -50,6 +56,14 @@ pub struct MqttSource {
     wal_capacity: Arc<Capacity>,
     quarantine_capacity: Arc<Capacity>,
     reconnect_pending: bool,
+}
+
+struct Reconciliation {
+    desired_filters: Vec<String>,
+    subscription_acked: bool,
+    unsubscribe_pending: VecDeque<String>,
+    queued_unsubscribes: usize,
+    expected_unsubacks: HashSet<u16>,
 }
 
 impl MqttSource {
@@ -164,9 +178,75 @@ impl MqttSource {
                 .all(|code| matches!(code, SubscribeReasonCode::Success(QoS::AtLeastOnce)))
     }
 
+    async fn start_reconciliation(&mut self, plan: subscriptions::FilterPlan) -> Result<()> {
+        self.manifest.persist(plan.pending).await?;
+        self.reconciliation = Some(Reconciliation {
+            desired_filters: plan.subscribe,
+            subscription_acked: false,
+            unsubscribe_pending: plan.unsubscribe.into(),
+            queued_unsubscribes: 0,
+            expected_unsubacks: HashSet::new(),
+        });
+        self.expected_suback = None;
+        self.subscribe_pending = true;
+        Ok(())
+    }
+
+    fn try_queue_unsubscribes(&mut self) {
+        let Some(reconciliation) = self.reconciliation.as_mut() else {
+            return;
+        };
+        if !reconciliation.subscription_acked {
+            return;
+        }
+
+        while let Some(filter) = reconciliation.unsubscribe_pending.front() {
+            match self.client.try_unsubscribe(filter.clone()) {
+                Ok(()) => {
+                    reconciliation.unsubscribe_pending.pop_front();
+                    reconciliation.queued_unsubscribes += 1;
+                }
+                Err(err) => {
+                    warn!(error = %err, "MQTT unsubscribe not queued; retrying");
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn finish_reconciliation(&mut self, dispatcher: &IngestDispatcher) -> Result<()> {
+        let complete = self.reconciliation.as_ref().is_some_and(|reconciliation| {
+            reconciliation.subscription_acked
+                && reconciliation.unsubscribe_pending.is_empty()
+                && reconciliation.queued_unsubscribes == 0
+                && reconciliation.expected_unsubacks.is_empty()
+        });
+        if !complete {
+            return Ok(());
+        }
+
+        let Some(desired_filters) = self
+            .reconciliation
+            .as_ref()
+            .map(|reconciliation| reconciliation.desired_filters.clone())
+        else {
+            return Ok(());
+        };
+        self.manifest.persist(desired_filters).await?;
+        self.reconciliation = None;
+        if self.has_intake_capacity(dispatcher) {
+            self.ready.store(true, Ordering::Relaxed);
+            info!(topics = self.filters.len(), "MQTT subscriptions reconciled");
+        } else {
+            self.reset_connection()?;
+        }
+        Ok(())
+    }
+
     fn reset_connection(&mut self) -> Result<()> {
         self.ready.store(false, Ordering::Relaxed);
         self.invalidate_acknowledgements()?;
+        self.reconciliation = None;
         self.subscribe_pending = false;
         self.expected_suback = None;
 
@@ -316,44 +396,94 @@ impl Source for MqttSource {
                         };
 
                         match &event {
-                            Event::Incoming(Incoming::ConnAck(_)) => {
+                            Event::Incoming(Incoming::ConnAck(connack)) => {
                                 info!("MQTT connected");
                                 self.invalidate_acknowledgements()?;
-                                // Always re-subscribe: brokers may report
-                                // `session_present` without restoring subscriptions.
-                                self.subscribe_pending = true;
+                                self.ready.store(false, Ordering::Relaxed);
+                                if !connack.session_present {
+                                    self.fresh_session_filters = Some(Vec::new());
+                                }
+                                let desired_filters: Vec<_> = self
+                                    .filters
+                                    .iter()
+                                    .map(|filter| filter.path.clone())
+                                    .collect();
+                                let known_filters = self
+                                    .fresh_session_filters
+                                    .as_deref()
+                                    .or_else(|| self.manifest.known_filters());
+                                let plan = filter_plan(
+                                    known_filters,
+                                    connack.session_present,
+                                    &desired_filters,
+                                )?;
+                                if let Err(err) = self.start_reconciliation(plan).await {
+                                    error!(
+                                        error = %err,
+                                        "could not sync MQTT subscription manifest; reconnecting"
+                                    );
+                                    self.reset_connection()?;
+                                } else {
+                                    self.fresh_session_filters = None;
+                                }
                             }
                             Event::Incoming(Incoming::SubAck(suback)) => {
-                                if self.subscription_granted_qos1(
-                                    suback.pkid,
-                                    &suback.return_codes,
-                                ) {
-                                    if self.has_intake_capacity(&dispatcher) {
-                                        self.ready.store(true, Ordering::Relaxed);
-                                        info!(topics = self.filters.len(), "subscribed to MQTT topics");
+                                if self.expected_suback == Some(suback.pkid) {
+                                    if self.subscription_granted_qos1(
+                                        suback.pkid,
+                                        &suback.return_codes,
+                                    ) {
+                                        self.expected_suback = None;
+                                        if let Some(reconciliation) = self.reconciliation.as_mut()
+                                        {
+                                            reconciliation.subscription_acked = true;
+                                        }
                                     } else {
+                                        self.ready.store(false, Ordering::Relaxed);
+                                        error!(
+                                            packet_id = suback.pkid,
+                                            codes = ?suback.return_codes,
+                                            "MQTT subscription was rejected or granted below QoS 1"
+                                        );
                                         self.reset_connection()?;
                                     }
-                                } else {
-                                    self.ready.store(false, Ordering::Relaxed);
-                                    error!(
-                                        packet_id = suback.pkid,
-                                        codes = ?suback.return_codes,
-                                        "MQTT subscription was rejected or granted below QoS 1"
-                                    );
+                                }
+                            }
+                            Event::Incoming(Incoming::UnsubAck(unsuback)) => {
+                                if let Some(reconciliation) = self.reconciliation.as_mut() {
+                                    reconciliation.expected_unsubacks.remove(&unsuback.pkid);
                                 }
                             }
                             Event::Incoming(Incoming::Disconnect) => {
                                 self.reset_connection()?;
                             }
                             Event::Outgoing(Outgoing::Subscribe(packet_id)) => {
-                                self.expected_suback = Some(*packet_id);
+                                if self.reconciliation.is_some() {
+                                    self.expected_suback = Some(*packet_id);
+                                }
+                            }
+                            Event::Outgoing(Outgoing::Unsubscribe(packet_id)) => {
+                                if let Some(reconciliation) = self.reconciliation.as_mut() {
+                                    reconciliation.queued_unsubscribes = reconciliation
+                                        .queued_unsubscribes
+                                        .checked_sub(1)
+                                        .context("unexpected MQTT unsubscribe request")?;
+                                    reconciliation.expected_unsubacks.insert(*packet_id);
+                                }
                             }
                             _ => {}
                         }
 
                         if self.subscribe_pending {
                             self.try_subscribe();
+                        }
+                        self.try_queue_unsubscribes();
+                        if let Err(err) = self.finish_reconciliation(&dispatcher).await {
+                            error!(
+                                error = %err,
+                                "could not commit MQTT subscription manifest; reconnecting"
+                            );
+                            self.reset_connection()?;
                         }
 
                         if let Event::Incoming(Incoming::Publish(publish)) = event {
@@ -414,7 +544,7 @@ impl DlqPublisher for MqttDlqPublisher {
 
 /// Builds an [`MqttSource`] + [`MqttDlqPublisher`] pair and returns both handles.
 /// The network connection is established once the source starts polling the
-/// returned event loop; the source subscribes to the compiled route filters on each `ConnAck`.
+/// returned event loop; the source reconciles the compiled route filters on each `ConnAck`.
 ///
 /// # Errors
 /// Returns an error if `cfg.mqtt` is `None` (should not happen — `Config::from_env`
@@ -430,6 +560,23 @@ pub async fn build(
         .mqtt
         .as_ref()
         .context("INPUT_SOURCE=mqtt requires MQTT_* connection variables")?;
+    let desired_filters: Vec<_> = routes
+        .subscriptions()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut manifest = SubscriptionManifest::open(
+        &cfg.wal_dir,
+        BrokerIdentity {
+            host: mqtt_cfg.host.clone(),
+            port: mqtt_cfg.port,
+            client_id: mqtt_cfg.client_id.clone(),
+        },
+    )?;
+    let known_filters = manifest.known_filters();
+    let initial_plan = filter_plan(known_filters, known_filters.is_some(), &desired_filters)?;
+    manifest.validate_filters(&initial_plan.pending)?;
+    manifest.initialize_if_missing().await?;
 
     let mut mqttoptions = mqtt_options(mqtt_cfg);
     mqttoptions.set_keep_alive(Duration::from_secs(30));
@@ -439,10 +586,9 @@ pub async fn build(
     let publisher_client = publisher.client.clone();
     let (ack_tx, ack_rx) = mpsc::channel(MAX_INFLIGHT_MESSAGES);
 
-    let filters = routes
-        .subscriptions()
+    let filters = desired_filters
         .into_iter()
-        .map(|topic| SubscribeFilter::new(topic.to_owned(), QoS::AtLeastOnce))
+        .map(|topic| SubscribeFilter::new(topic, QoS::AtLeastOnce))
         .collect();
 
     let source: Box<dyn Source> = Box::new(MqttSource {
@@ -451,6 +597,9 @@ pub async fn build(
         client: client.clone(),
         publisher_client: publisher_client.clone(),
         filters,
+        manifest,
+        reconciliation: None,
+        fresh_session_filters: None,
         subscribe_pending: false,
         expected_suback: None,
         ready,
@@ -483,11 +632,142 @@ fn mqtt_options(mqtt_cfg: &MqttSourceConfig) -> MqttOptions {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use rumqttc::MqttOptions as TestMqttOptions;
 
+    use super::subscriptions::{filter_plan, BrokerIdentity, SubscriptionManifest};
     use super::*;
     use crate::config::MqttSourceConfig;
     use crate::pipeline::outcome::{DeferredReason, PipelineOutcome};
+
+    #[test]
+    fn test_subscription_reconcile_preserves_union_until_broker_ack() -> Result<()> {
+        let known = ["route/a".to_owned(), "route/shared".to_owned()];
+        let desired = ["route/b".to_owned(), "route/shared".to_owned()];
+
+        let plan = filter_plan(Some(&known), true, &desired)?;
+
+        assert_eq!(plan.pending, ["route/a", "route/b", "route/shared"]);
+        assert_eq!(plan.subscribe, ["route/b", "route/shared"]);
+        assert_eq!(plan.unsubscribe, ["route/a"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_subscription_reconcile_ignores_old_filters_for_fresh_session() -> Result<()> {
+        let known = ["route/old".to_owned()];
+        let desired = ["route/current".to_owned()];
+
+        let plan = filter_plan(Some(&known), false, &desired)?;
+
+        assert_eq!(plan.pending, desired);
+        assert_eq!(plan.subscribe, desired);
+        assert!(plan.unsubscribe.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_subscription_reconcile_rejects_resumed_session_without_manifest() {
+        let desired = ["route/current".to_owned()];
+
+        assert!(filter_plan(None, true, &desired).is_err());
+        assert!(filter_plan(None, false, &desired).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_reconcile_untrusted_seed_requires_fresh_session() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut manifest = SubscriptionManifest::open(
+            dir.path(),
+            BrokerIdentity {
+                host: "broker.example".to_owned(),
+                port: 1883,
+                client_id: "ingest".to_owned(),
+            },
+        )?;
+        manifest.initialize_if_missing().await?;
+        let desired = ["route/current".to_owned()];
+
+        assert!(manifest.known_filters().is_none());
+        assert!(filter_plan(manifest.known_filters(), true, &desired).is_err());
+        assert!(filter_plan(manifest.known_filters(), false, &desired).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscription_reconcile_rejects_manifest_exceeding_metadata_budget() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut manifest = SubscriptionManifest::open(
+            dir.path(),
+            BrokerIdentity {
+                host: "broker.example".to_owned(),
+                port: 1883,
+                client_id: "ingest".to_owned(),
+            },
+        )?;
+
+        assert!(manifest.persist(vec!["x".repeat(16 * 1024)]).await.is_err());
+        assert!(manifest.known_filters().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscription_reconcile_manifest_round_trips_filters_and_identity() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let identity = BrokerIdentity {
+            host: "broker.example".to_owned(),
+            port: 1883,
+            client_id: "ingest".to_owned(),
+        };
+        let mut manifest = SubscriptionManifest::open(dir.path(), identity.clone())?;
+
+        assert!(manifest.known_filters().is_none());
+        manifest
+            .persist(vec!["route/old".to_owned(), "route/current".to_owned()])
+            .await?;
+
+        let reopened = SubscriptionManifest::open(dir.path(), identity)?;
+
+        assert_eq!(
+            reopened.known_filters(),
+            Some(["route/old".to_owned(), "route/current".to_owned()].as_slice())
+        );
+        assert!(SubscriptionManifest::open(
+            dir.path(),
+            BrokerIdentity {
+                host: "other.example".to_owned(),
+                port: 1883,
+                client_id: "ingest".to_owned(),
+            },
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscription_reconcile_recovers_previous_slot_after_interrupted_write(
+    ) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let identity = BrokerIdentity {
+            host: "broker.example".to_owned(),
+            port: 1883,
+            client_id: "ingest".to_owned(),
+        };
+        let mut manifest = SubscriptionManifest::open(dir.path(), identity.clone())?;
+
+        manifest.persist(vec!["route/known".to_owned()]).await?;
+        std::fs::write(dir.path().join(".mqtt-subscriptions.0.json"), b"{")?;
+
+        let recovered = SubscriptionManifest::open(dir.path(), identity)?;
+
+        assert_eq!(
+            recovered.known_filters(),
+            Some(["route/known".to_owned()].as_slice())
+        );
+        Ok(())
+    }
 
     fn test_source(
         options: MqttOptions,
@@ -500,6 +780,15 @@ mod tests {
         let capacity_dir = tempfile::tempdir().expect("capacity directory");
         let capacity =
             Capacity::recover(capacity_dir.path(), capacity_limit).expect("capacity snapshot");
+        let manifest = SubscriptionManifest::open(
+            capacity_dir.path(),
+            BrokerIdentity {
+                host: "localhost".to_owned(),
+                port: 1883,
+                client_id: "test".to_owned(),
+            },
+        )
+        .expect("subscription manifest");
         let (ack_tx, ack_rx) = mpsc::channel(MAX_INFLIGHT_MESSAGES);
         let publisher_client = Arc::new(Mutex::new(client.clone()));
 
@@ -510,6 +799,9 @@ mod tests {
                 client,
                 publisher_client,
                 filters,
+                manifest,
+                reconciliation: None,
+                fresh_session_filters: None,
                 subscribe_pending: false,
                 expected_suback: None,
                 ready,
@@ -537,6 +829,205 @@ mod tests {
             pkid: packet_id,
             payload: bytes::Bytes::from_static(b"{}"),
         }
+    }
+
+    async fn read_mqtt_packet(stream: &mut tokio::net::TcpStream) -> Result<(u8, Vec<u8>)> {
+        let header = stream.read_u8().await?;
+        let mut remaining = 0usize;
+        let mut multiplier = 1usize;
+        loop {
+            let byte = stream.read_u8().await?;
+            remaining += usize::from(byte & 0x7f) * multiplier;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            multiplier *= 128;
+        }
+        let mut body = vec![0; remaining];
+        stream.read_exact(&mut body).await?;
+        Ok((header, body))
+    }
+
+    fn parse_filter_packet(body: &[u8], has_qos: bool) -> Result<(u16, Vec<String>)> {
+        let packet_id = u16::from_be_bytes([body[0], body[1]]);
+        let mut filters = Vec::new();
+        let mut offset = 2;
+        while offset < body.len() {
+            let len = usize::from(u16::from_be_bytes([body[offset], body[offset + 1]]));
+            offset += 2;
+            filters.push(std::str::from_utf8(&body[offset..offset + len])?.to_owned());
+            offset += len + usize::from(has_qos);
+        }
+        Ok((packet_id, filters))
+    }
+
+    async fn write_mqtt_packet(
+        stream: &mut tokio::net::TcpStream,
+        header: u8,
+        body: &[u8],
+    ) -> Result<()> {
+        let len = u8::try_from(body.len())?;
+        stream.write_all(&[header, len]).await?;
+        stream.write_all(body).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscription_reconcile_subscribes_new_and_unsubscribes_obsolete() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (unsubscribed_tx, unsubscribed_rx) = tokio::sync::oneshot::channel();
+        let (release_broker_tx, release_broker_rx) = tokio::sync::oneshot::channel();
+        let broker = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await?;
+            let (header, _) = read_mqtt_packet(&mut first).await?;
+            anyhow::ensure!(header >> 4 == 1, "expected first MQTT CONNECT");
+            first.write_all(&[0x20, 0x02, 0x01, 0x00]).await?;
+            let (header, body) = read_mqtt_packet(&mut first).await?;
+            anyhow::ensure!(header >> 4 == 8, "expected first MQTT SUBSCRIBE");
+            let (packet_id, subscribed) = parse_filter_packet(&body, true)?;
+            anyhow::ensure!(subscribed == ["route/b"], "unexpected first subscriptions");
+            write_mqtt_packet(
+                &mut first,
+                0x90,
+                &[(packet_id >> 8) as u8, packet_id as u8, 1],
+            )
+            .await?;
+            let (header, body) = read_mqtt_packet(&mut first).await?;
+            anyhow::ensure!(header >> 4 == 10, "expected first MQTT UNSUBSCRIBE");
+            let (_, unsubscribed) = parse_filter_packet(&body, false)?;
+            anyhow::ensure!(
+                unsubscribed == ["route/a"],
+                "unexpected first unsubscriptions"
+            );
+            drop(first);
+
+            let (mut second, _) = listener.accept().await?;
+            let (header, _) = read_mqtt_packet(&mut second).await?;
+            anyhow::ensure!(header >> 4 == 1, "expected reconnect MQTT CONNECT");
+            second.write_all(&[0x20, 0x02, 0x01, 0x00]).await?;
+            let (header, body) = read_mqtt_packet(&mut second).await?;
+            anyhow::ensure!(header >> 4 == 8, "expected reconnect MQTT SUBSCRIBE");
+            let (packet_id, subscribed) = parse_filter_packet(&body, true)?;
+            anyhow::ensure!(
+                subscribed == ["route/b"],
+                "unexpected reconnect subscriptions"
+            );
+            write_mqtt_packet(
+                &mut second,
+                0x90,
+                &[(packet_id >> 8) as u8, packet_id as u8, 1],
+            )
+            .await?;
+            let (header, body) = read_mqtt_packet(&mut second).await?;
+            anyhow::ensure!(header >> 4 == 10, "expected reconnect MQTT UNSUBSCRIBE");
+            let (packet_id, unsubscribed) = parse_filter_packet(&body, false)?;
+            anyhow::ensure!(
+                unsubscribed == ["route/a"],
+                "unexpected reconnect unsubscriptions"
+            );
+            unsubscribed_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            write_mqtt_packet(
+                &mut second,
+                0xb0,
+                &[(packet_id >> 8) as u8, packet_id as u8],
+            )
+            .await?;
+            release_broker_rx.await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let mut options = TestMqttOptions::new("test-mqtt-reconcile", "127.0.0.1", address.port());
+        options.set_clean_session(false);
+        let (client, eventloop) = AsyncClient::new(options.clone(), MQTT_REQUEST_CAPACITY);
+        let ready = Arc::new(AtomicBool::new(false));
+        let client_id = options.client_id().to_owned();
+        let (mut source, capacity_dir) = test_source(
+            options,
+            client,
+            eventloop,
+            ready.clone(),
+            vec![SubscribeFilter::new("route/b".to_owned(), QoS::AtLeastOnce)],
+            u64::MAX,
+        );
+        source.manifest = SubscriptionManifest::open(
+            capacity_dir.path(),
+            BrokerIdentity {
+                host: "127.0.0.1".to_owned(),
+                port: address.port(),
+                client_id: client_id.clone(),
+            },
+        )?;
+        source.manifest.persist(vec!["route/a".to_owned()]).await?;
+        let (worker_tx, _worker_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let source_task =
+            tokio::spawn(Box::new(source).run(IngestDispatcher::new(vec![worker_tx]), shutdown_rx));
+
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), unsubscribed_rx).await,
+            Ok(Ok(()))
+        ) {
+            let source_state = if source_task.is_finished() {
+                format!("{:?}", source_task.await)
+            } else {
+                "still running".to_owned()
+            };
+            let broker_state = if broker.is_finished() {
+                format!("{:?}", broker.await)
+            } else {
+                "still running".to_owned()
+            };
+            anyhow::bail!(
+                "broker did not observe UNSUBSCRIBE; source={source_state}, broker={broker_state}"
+            );
+        }
+        assert!(!ready.load(Ordering::Relaxed));
+        let became_ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if became_ready.is_err() {
+            let _ = release_broker_tx.send(());
+            shutdown_tx.send(true)?;
+            let source_result = tokio::time::timeout(Duration::from_secs(5), source_task).await??;
+            let manifest = SubscriptionManifest::open(
+                capacity_dir.path(),
+                BrokerIdentity {
+                    host: "localhost".to_owned(),
+                    port: 1883,
+                    client_id: "test".to_owned(),
+                },
+            )?;
+            anyhow::bail!(
+                "source did not become ready; result={source_result:?}, manifest={:?}",
+                manifest.known_filters()
+            );
+        }
+        shutdown_tx.send(true)?;
+        tokio::time::timeout(Duration::from_secs(5), source_task).await???;
+        release_broker_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("test broker already stopped"))?;
+        broker.await??;
+        let manifest = SubscriptionManifest::open(
+            capacity_dir.path(),
+            BrokerIdentity {
+                host: "127.0.0.1".to_owned(),
+                port: address.port(),
+                client_id,
+            },
+        )?;
+        assert_eq!(
+            manifest.known_filters(),
+            Some(["route/b".to_owned()].as_slice())
+        );
+        Ok(())
     }
 
     #[test]
