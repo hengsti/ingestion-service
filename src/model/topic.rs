@@ -64,6 +64,13 @@ impl MqttTopicFilter {
         &self.raw
     }
 
+    pub(crate) fn has_fixed_segment(&self, index: usize) -> bool {
+        matches!(
+            self.segments.get(index),
+            Some(Segment::Lit(_) | Segment::One)
+        )
+    }
+
     /// Returns whether this filter matches the supplied MQTT topic name.
     #[must_use]
     pub fn matches(&self, topic: &str) -> bool {
@@ -135,11 +142,7 @@ impl MqttTopicFilter {
 }
 
 fn valid_topic_name(topic: &str) -> bool {
-    !topic.is_empty()
-        && !topic.contains('\0')
-        && !topic.contains('+')
-        && !topic.contains('#')
-        && topic.split('/').all(|level| !level.is_empty())
+    !topic.is_empty() && !topic.contains('\0') && !topic.contains('+') && !topic.contains('#')
 }
 
 fn wildcard_cannot_match_system_level(wildcard: &Segment, other: &Segment) -> bool {
@@ -156,7 +159,8 @@ mod configured_route_tests {
         assert!(MqttTopicFilter::new("sensor/room").is_ok_and(|f| f.matches("sensor/room")));
         assert!(!MqttTopicFilter::new("sensor/room").is_ok_and(|f| f.matches("sensor/room/")));
         assert!(MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/kitchen")));
-        assert!(!MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/")));
+        assert!(MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/")));
+        assert!(MqttTopicFilter::new("home/+/sensor").is_ok_and(|f| f.matches("home//sensor")));
         assert!(MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensor")));
         assert!(MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensor/a/b")));
         assert!(!MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensors/a")));

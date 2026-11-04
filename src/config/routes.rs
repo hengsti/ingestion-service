@@ -257,6 +257,9 @@ impl RouteConfig {
         if self.measurement.is_empty() {
             bail!("route measurement must not be empty");
         }
+        if self.measurement.starts_with('#') {
+            bail!("route measurement must not start with '#'");
+        }
         if self.fields.is_empty() {
             bail!("route fields must not be empty");
         }
@@ -303,7 +306,12 @@ fn validate_device_id(source: &DeviceIdSource) -> Result<()> {
 
 fn validate_tag_value(value: &TagValue) -> Result<()> {
     match value {
-        TagValue::Static(value) => validate_line_text(value, "tag value")?,
+        TagValue::Static(value) => {
+            if value.is_empty() {
+                bail!("static tag value must not be empty");
+            }
+            validate_line_text(value, "tag value")?;
+        }
         TagValue::Pointer(config) => validate_pointer(&config.pointer, "tag pointer")?,
     }
     Ok(())
@@ -681,6 +689,22 @@ mod tests {
         let mut fields = valid_bundle();
         fields["routes"][0]["fields"] = json!({});
         assert!(load_value(&fields).is_err());
+    }
+
+    #[test]
+    fn test_route_config_rejects_measurement_starting_with_comment_marker() {
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["measurement"] = json!("#weather");
+
+        assert!(load_value(&bundle).is_err());
+    }
+
+    #[test]
+    fn test_route_config_rejects_empty_static_tag_value() {
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["tags"] = json!({"source": ""});
+
+        assert!(load_value(&bundle).is_err());
     }
 
     #[test]
