@@ -80,6 +80,8 @@ impl MetricsServer {
 
 const COUNTERS: &[&str] = &[
     "mqtt_messages_received_total",
+    "mqtt_qos0_policy_violations_total",
+    "mqtt_unsupported_qos2_total",
     "ingest_event_queue_full_total",
     "ingest_decode_success_total",
     "ingest_incoming_oversized_total",
