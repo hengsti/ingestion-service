@@ -45,7 +45,6 @@ impl PipelineStage for DlqPublishStage {
                 return Ok(StageFlow::Stop);
             };
 
-            let start = Instant::now();
             self.quarantine
                 .append_durable(Rejection {
                     topic: ctx.topic(),
@@ -59,6 +58,7 @@ impl PipelineStage for DlqPublishStage {
                 .await?;
 
             let payload = ctx.payload_for_dlq();
+            let start = Instant::now();
 
             if self
                 .publisher
