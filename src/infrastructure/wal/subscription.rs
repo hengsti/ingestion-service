@@ -174,6 +174,11 @@ impl WalSubscription {
                     "WAL segment {segment_id} seek failed at durable offset {byte_offset}: {}",
                     error.kind()
                 ),
+                ReadOutcome::IoError(error) => {
+                    return Err(error).context(format!(
+                        "WAL read failed at durable offset {segment_id}:{byte_offset}"
+                    ));
+                }
                 ReadOutcome::Eof => {
                     if segment_id < head.segment_id {
                         self.cur_segment_id = segment_id
@@ -391,6 +396,8 @@ enum ReadOutcome {
     OpenError(std::io::Error),
     /// Seeking to the read cursor failed.
     SeekError(std::io::Error),
+    /// Reading the segment failed for an operational reason.
+    IoError(anyhow::Error),
     /// Clean EOF at a sealed segment boundary.
     Eof,
     /// A record whose framing or payload failed to decode.
@@ -403,8 +410,8 @@ enum ReadOutcome {
 /// caller can cache them across calls. Runs entirely on a blocking thread.
 ///
 /// The returned reader is retained across successful decodes and EOF so tail
-/// polling can re-read without reopen churn. It is dropped only on corruption or
-/// open/seek failures, where forcing a reopen is safer.
+/// polling can re-read without reopen churn. It is dropped only on read failures,
+/// where forcing a reopen is safer.
 fn read_one(
     dir: &Path,
     segment_id: u64,
@@ -452,7 +459,18 @@ fn read_one(
             payload,
         ),
         Ok(None) => (ReadOutcome::Eof, reader, payload),
-        Err(e) => (ReadOutcome::Corrupt(e), None, payload),
+        Err(error) => (classify_decode_error(error), None, payload),
+    }
+}
+
+fn classify_decode_error(error: anyhow::Error) -> ReadOutcome {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() != std::io::ErrorKind::UnexpectedEof)
+    {
+        ReadOutcome::IoError(error)
+    } else {
+        ReadOutcome::Corrupt(error)
     }
 }
 
@@ -769,6 +787,22 @@ mod tests {
             "EOF should retain descriptor to avoid reopen churn"
         );
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_read_failure_classifies_disk_errors_separately_from_corruption() {
+        let io_error = classify_decode_error(std::io::Error::other("disk read failed").into());
+        assert!(
+            matches!(io_error, ReadOutcome::IoError(_)),
+            "disk read failures must not be reported as record corruption"
+        );
+
+        let short_read =
+            classify_decode_error(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        assert!(matches!(short_read, ReadOutcome::Corrupt(_)));
+
+        let corrupt = classify_decode_error(anyhow::anyhow!("invalid WAL frame"));
+        assert!(matches!(corrupt, ReadOutcome::Corrupt(_)));
     }
 
     fn make_segment(dir: &Path, id: u64) {

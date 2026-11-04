@@ -24,10 +24,14 @@ use super::state::{CacheEvent, CacheState};
 use crate::infrastructure::wal::capacity::Capacity;
 use crate::model::messages::telemetry::TelemetryValue;
 
+#[derive(Clone)]
+struct ForwarderAlive(Arc<AtomicBool>);
+
 /// Builds the cache HTTP API router.
 pub fn router(
     state: CacheState,
     source_ready: Arc<AtomicBool>,
+    forwarder_alive: Arc<AtomicBool>,
     wal_capacity: Arc<Capacity>,
 ) -> Router {
     Router::new()
@@ -38,6 +42,7 @@ pub fn router(
         .route("/v1/stream", get(stream_updates))
         .with_state(state)
         .layer(Extension(source_ready))
+        .layer(Extension(ForwarderAlive(forwarder_alive)))
         .layer(Extension(wal_capacity))
 }
 
@@ -47,9 +52,13 @@ async fn healthz() -> impl IntoResponse {
 
 async fn readyz(
     Extension(source_ready): Extension<Arc<AtomicBool>>,
+    Extension(ForwarderAlive(forwarder_alive)): Extension<ForwarderAlive>,
     Extension(wal_capacity): Extension<Arc<Capacity>>,
 ) -> StatusCode {
-    if source_ready.load(Ordering::Relaxed) && wal_capacity.has_room_for_max_record() {
+    if source_ready.load(Ordering::Relaxed)
+        && forwarder_alive.load(Ordering::Relaxed)
+        && wal_capacity.has_room_for_max_record()
+    {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -192,7 +201,12 @@ mod tests {
         )?;
         let wal = Capacity::recover(dir.path(), max_bytes)?;
 
-        let response = readyz(Extension(Arc::new(AtomicBool::new(true))), Extension(wal)).await;
+        let response = readyz(
+            Extension(Arc::new(AtomicBool::new(true))),
+            Extension(ForwarderAlive(Arc::new(AtomicBool::new(true)))),
+            Extension(wal),
+        )
+        .await;
 
         assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
         Ok(())

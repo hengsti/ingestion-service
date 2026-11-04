@@ -37,6 +37,14 @@ use tracing::{error, info, warn};
 
 use crate::infrastructure::sink::build_output;
 
+struct ForwarderLivenessGuard(Arc<AtomicBool>);
+
+impl Drop for ForwarderLivenessGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 fn worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 8))
@@ -101,6 +109,7 @@ async fn main() -> Result<()> {
     // Cache / HTTP state.
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
     let source_ready = Arc::new(AtomicBool::new(false));
+    let forwarder_alive = Arc::new(AtomicBool::new(true));
 
     let quarantine_dir = cfg.quarantine_dir.clone();
     let quarantine_max_bytes = cfg.quarantine_max_bytes;
@@ -130,9 +139,15 @@ async fn main() -> Result<()> {
     let http_state = app_state.clone();
     let cache_bind = cfg.cache_bind.clone();
     let source_ready_http = source_ready.clone();
+    let forwarder_alive_http = forwarder_alive.clone();
     let wal_capacity_http = wal.capacity_handle();
     let mut _http_task = tokio::spawn(async move {
-        let app = http::router(http_state, source_ready_http, wal_capacity_http);
+        let app = http::router(
+            http_state,
+            source_ready_http,
+            forwarder_alive_http,
+            wal_capacity_http,
+        );
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
@@ -155,11 +170,11 @@ async fn main() -> Result<()> {
 
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
+    let forwarder_alive_task = forwarder_alive.clone();
 
-    let forwarder_task = tokio::spawn(async move {
-        if let Err(err) = run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await {
-            error!(error = %err, "wal forwarder failed");
-        }
+    let mut forwarder_task = tokio::spawn(async move {
+        let _liveness = ForwarderLivenessGuard(forwarder_alive_task);
+        run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await
     });
 
     // Input source.
@@ -225,8 +240,9 @@ async fn main() -> Result<()> {
     let mut source_task = tokio::spawn(source.run(dispatcher, shutdown_rx.clone()));
 
     // Wait for ctrl-c, SIGTERM, the HTTP task, or the input source, then signal shutdown.
-    let mut fatal_source_err: Option<anyhow::Error> = None;
+    let mut fatal_err: Option<anyhow::Error> = None;
     let mut source_task_handled = false;
+    let mut forwarder_task_handled = false;
 
     tokio::select! {
         res = tokio::signal::ctrl_c() => {
@@ -262,14 +278,28 @@ async fn main() -> Result<()> {
                 Ok(Err(err)) => {
                     source_ready.store(false, Ordering::Relaxed);
                     error!(error = %err, "input source failed");
-                    fatal_source_err = Some(err);
+                    fatal_err = Some(err);
                 }
                 Err(join_err) => {
                     source_ready.store(false, Ordering::Relaxed);
                     error!(error = %join_err, "input source task panicked");
-                    fatal_source_err = Some(join_err.into());
+                    fatal_err = Some(join_err.into());
                 }
             }
+        }
+
+        res = &mut forwarder_task => {
+            forwarder_task_handled = true;
+            source_ready.store(false, Ordering::Relaxed);
+            forwarder_alive.store(false, Ordering::Relaxed);
+            let err = match res {
+                Ok(Ok(())) => anyhow::anyhow!("WAL forwarder stopped unexpectedly"),
+                Ok(Err(err)) => err,
+                Err(join_err) => join_err.into(),
+            };
+            error!(error = %err, "WAL forwarder stopped unexpectedly");
+            fatal_err = Some(err);
+            let _ = shutdown_tx.send(true);
         }
     }
 
@@ -281,12 +311,12 @@ async fn main() -> Result<()> {
             Ok(Err(err)) => {
                 source_ready.store(false, Ordering::Relaxed);
                 error!(error = %err, "input source failed");
-                fatal_source_err = Some(err);
+                fatal_err = Some(err);
             }
             Err(join_err) => {
                 source_ready.store(false, Ordering::Relaxed);
                 error!(error = %join_err, "input source task panicked");
-                fatal_source_err = Some(join_err.into());
+                fatal_err = Some(join_err.into());
             }
         }
     }
@@ -306,21 +336,29 @@ async fn main() -> Result<()> {
     drop(pipeline);
     drop(wal);
 
-    let mut forwarder_task = forwarder_task;
-    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut forwarder_task).await {
-        Ok(Ok(())) => info!("wal forwarder drained cleanly"),
-        Ok(Err(err)) => error!(error = %err, "wal forwarder task panicked during drain"),
-        Err(_) => {
-            warn!("wal forwarder drain timed out after 5s; aborting and exiting");
-            forwarder_task.abort();
+    if !forwarder_task_handled {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut forwarder_task).await {
+            Ok(Ok(Ok(()))) => info!("wal forwarder drained cleanly"),
+            Ok(Ok(Err(err))) => {
+                error!(error = %err, "wal forwarder failed during drain");
+                fatal_err.get_or_insert(err);
+            }
+            Ok(Err(err)) => {
+                error!(error = %err, "wal forwarder task failed during drain");
+                fatal_err.get_or_insert(err.into());
+            }
+            Err(_) => {
+                warn!("wal forwarder drain timed out after 5s; aborting and exiting");
+                forwarder_task.abort();
+            }
         }
     }
 
     info!("ingestion service stopped");
 
-    // A fatal input-source error still exits the process non-zero, but only
-    // after workers and the WAL have drained cleanly above.
-    match fatal_source_err {
+    // A fatal source or forwarder error exits non-zero after workers and the WAL
+    // have drained.
+    match fatal_err {
         Some(err) => Err(err),
         None => Ok(()),
     }
@@ -330,6 +368,15 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn forwarder_liveness_guard_marks_task_not_alive_when_dropped() {
+        let alive = Arc::new(AtomicBool::new(true));
+
+        drop(ForwarderLivenessGuard(alive.clone()));
+
+        assert!(!alive.load(Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn recv_worker_job_after_shutdown_drains_queued_messages_before_stopping() {

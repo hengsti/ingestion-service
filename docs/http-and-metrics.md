@@ -14,10 +14,10 @@ Returns `200 OK` when the cache HTTP server is alive.
 
 ### `GET /readyz`
 
-Returns `200` when the active input source is ready (for MQTT, after a successful `SubAck`)
-and the WAL has room for one maximum-sized record. Returns `503` otherwise. A ready service
-has acquired exclusive locks on both journal directories; startup fails if either lock cannot
-be acquired.
+Returns `200` when the active input source is ready (for MQTT, after a successful `SubAck`),
+the WAL forwarder is running, and the WAL has room for one maximum-sized record. Returns
+`503` otherwise. A ready service has acquired exclusive locks on both journal directories;
+startup fails if either lock cannot be acquired.
 
 ### `GET /v1/state`
 
