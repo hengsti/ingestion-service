@@ -4,6 +4,5 @@ pub mod dlq;
 pub mod observe;
 pub mod persist;
 pub mod telemetry_mapping;
-pub mod transform;
 pub mod validate_output;
 pub mod validate_raw;

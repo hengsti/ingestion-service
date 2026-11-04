@@ -1,3 +1,4 @@
+mod calculations;
 mod config;
 mod infrastructure;
 mod model;
@@ -22,8 +23,8 @@ use pipeline::{
     runner::PipelineRunner,
     stages::{
         cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
-        observe::ObserveStage, persist::PersistStage, transform::TelemetryMappingStage,
-        validate_output::ValidateOutputStage, validate_raw::ConfiguredValidateRawStage,
+        observe::ObserveStage, persist::PersistStage, telemetry_mapping::TelemetryMappingStage,
+        validate_output::ValidateOutputStage, validate_raw::ValidateRawStage,
     },
 };
 use tokio::{
@@ -115,7 +116,7 @@ async fn main() -> Result<()> {
     });
 
     // Metrics server.
-    let _metrics_server = MetricsServer::start(&cfg.metrics_bind).await?;
+    let _metrics_server = MetricsServer::start(&cfg.metrics_bind, &routes).await?;
 
     // WAL, configured sink, and forwarder.
     let (wal, wal_sub) = Wal::open(WalOptions {
@@ -144,9 +145,9 @@ async fn main() -> Result<()> {
     let pipeline = Arc::new(
         PipelineRunner::new()
             .add_stage(DecodeStage::new())
-            .add_stage(ConfiguredValidateRawStage::new(routes.clone()))
+            .add_stage(ValidateRawStage::new(routes.clone()))
             .add_stage(TelemetryMappingStage::new())
-            .add_stage(ValidateOutputStage::new())
+            .add_stage(ValidateOutputStage::new(encoder.clone()))
             .add_stage(CacheUpdateStage::new(app_state.clone()))
             .add_stage(PersistStage::new(wal.clone(), encoder))
             .add_stage(ObserveStage::new())

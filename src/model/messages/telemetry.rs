@@ -1,6 +1,14 @@
 use std::collections::BTreeMap;
 
+use anyhow::{bail, Result};
 use serde::Serialize;
+
+pub(crate) fn validate_line_text(value: &str, label: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        bail!("{label} must not contain control characters");
+    }
+    Ok(())
+}
 
 /// A scalar value with the type required by a configured telemetry field.
 #[derive(Debug, Clone, PartialEq, Serialize)]

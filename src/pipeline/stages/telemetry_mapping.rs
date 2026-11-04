@@ -1,7 +1,8 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 use anyhow::{bail, Context, Result};
 use chrono::DateTime;
+use metrics::counter;
 use serde_json::Value;
 
 use crate::{
@@ -9,10 +10,54 @@ use crate::{
         DeviceIdSource, FieldMapping, FieldType, RouteConfig, TagValue, TimestampConfig,
         TimestampFallback, TimestampFormat, TimestampSource,
     },
+    infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES,
     model::messages::telemetry::{TelemetryRecord, TelemetryValue},
+    pipeline::{
+        context::PipelineContext,
+        stage::{PipelineStage, StageFlow, StageResult},
+    },
 };
 
 const MAX_INFLUX_TIMESTAMP_MS: i64 = 9_223_372_036_854;
+
+/// Maps the selected route into a typed record and applies its compiled calculations.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TelemetryMappingStage;
+
+impl TelemetryMappingStage {
+    /// Creates the configured telemetry mapping stage.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl PipelineStage for TelemetryMappingStage {
+    fn name(&self) -> &'static str {
+        "transform"
+    }
+
+    fn run<'a>(
+        &'a self,
+        ctx: &'a mut PipelineContext,
+    ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
+        Box::pin(async move {
+            let record = {
+                let route = ctx.route()?;
+                let mapped = map_payload(
+                    route.config(),
+                    ctx.payload_json()?,
+                    ctx.topic(),
+                    ctx.received_at_ms(),
+                    ctx.retained(),
+                )?;
+                route.calculations().apply(mapped)?
+            };
+            ctx.set_telemetry_record(record);
+            counter!("ingest_transform_success_total").increment(1);
+            Ok(StageFlow::Continue)
+        })
+    }
+}
 
 /// Maps one payload through its selected configured route into a canonical typed record.
 ///
@@ -33,6 +78,20 @@ pub fn map_payload(
 ) -> Result<TelemetryRecord> {
     let device_id = map_device_id(&route.device_id, payload, topic)?;
     let timestamp_ms = map_timestamp(&route.timestamp, payload, received_at_ms)?;
+    let mut remaining_bytes = MAX_WAL_RECORD_PAYLOAD_BYTES;
+    // Bound copied data before repeated mappings can amplify one input value.
+    reserve_mapped_bytes(&mut remaining_bytes, route.id.len())?;
+    reserve_mapped_bytes(&mut remaining_bytes, topic.len())?;
+    reserve_mapped_bytes(&mut remaining_bytes, route.measurement.len())?;
+    reserve_mapped_bytes(&mut remaining_bytes, device_id.len())?;
+    reserve_mapped_bytes(
+        &mut remaining_bytes,
+        "device_id"
+            .len()
+            .saturating_add(device_id.len())
+            .saturating_add(2),
+    )?;
+    reserve_mapped_bytes(&mut remaining_bytes, "mqtt_retained".len() + 2)?;
 
     let mut tags = BTreeMap::new();
     for (key, value) in &route.tags {
@@ -53,10 +112,14 @@ pub fn map_payload(
                 value
             }
         };
+        reserve_mapped_bytes(
+            &mut remaining_bytes,
+            key.len().saturating_add(value.len()).saturating_add(2),
+        )?;
         tags.insert(key.clone(), value.to_owned());
     }
     if tags
-        .insert("device_id".to_owned(), device_id.clone())
+        .insert("device_id".to_owned(), device_id.to_owned())
         .is_some()
     {
         bail!("device_id collides with a configured telemetry tag");
@@ -67,7 +130,7 @@ pub fn map_payload(
         if matches!(key.as_str(), "device_id" | "mqtt_retained") {
             bail!("field '{key}' collides with reserved telemetry metadata");
         }
-        if let Some(value) = map_field(mapping, payload, key)? {
+        if let Some(value) = map_field(mapping, payload, key, &mut remaining_bytes)? {
             fields.insert(key.clone(), value);
         }
     }
@@ -81,7 +144,7 @@ pub fn map_payload(
 
     Ok(TelemetryRecord {
         route_id: route.id.clone(),
-        device_id,
+        device_id: device_id.to_owned(),
         measurement: route.measurement.clone(),
         timestamp_ms,
         tags,
@@ -91,14 +154,16 @@ pub fn map_payload(
     })
 }
 
-fn map_device_id(source: &DeviceIdSource, payload: &Value, topic: &str) -> Result<String> {
+fn map_device_id<'a>(
+    source: &'a DeviceIdSource,
+    payload: &'a Value,
+    topic: &'a str,
+) -> Result<&'a str> {
     let device_id = match source {
-        DeviceIdSource::Fixed(value) => value.clone(),
-        DeviceIdSource::TopicSegment(config) => {
-            topic_segment(topic, config.topic_segment)?.to_owned()
-        }
+        DeviceIdSource::Fixed(value) => value,
+        DeviceIdSource::TopicSegment(config) => topic_segment(topic, config.topic_segment)?,
         DeviceIdSource::Pointer(config) => {
-            mapped_string(payload, &config.pointer, "device identity")?.to_owned()
+            mapped_string(payload, &config.pointer, "device identity")?
         }
         DeviceIdSource::PointerAndTopicSegment(config) => {
             let payload_id = mapped_string(payload, &config.pointer, "device identity")?;
@@ -106,7 +171,7 @@ fn map_device_id(source: &DeviceIdSource, payload: &Value, topic: &str) -> Resul
             if payload_id != topic_id {
                 bail!("payload and topic device identities do not match");
             }
-            payload_id.to_owned()
+            payload_id
         }
     };
     if device_id.is_empty() {
@@ -136,18 +201,30 @@ fn mapped_string<'a>(payload: &'a Value, pointer: &str, label: &str) -> Result<&
     Ok(value)
 }
 
-fn map_field(mapping: &FieldMapping, payload: &Value, key: &str) -> Result<Option<TelemetryValue>> {
-    match payload.pointer(&mapping.pointer) {
-        Some(value) => map_scalar(value, &mapping.field_type, key).map(Some),
+fn map_field(
+    mapping: &FieldMapping,
+    payload: &Value,
+    key: &str,
+    remaining_bytes: &mut usize,
+) -> Result<Option<TelemetryValue>> {
+    let value = match payload.pointer(&mapping.pointer) {
+        Some(value) => value,
         None => match (&mapping.default, mapping.optional) {
-            (Some(default), _) => map_scalar(default, &mapping.field_type, key).map(Some),
-            (None, true) => Ok(None),
+            (Some(default), _) => default,
+            (None, true) => return Ok(None),
             (None, false) => bail!("required field '{key}' pointer is absent"),
         },
-    }
+    };
+    reserve_mapped_bytes(remaining_bytes, key.len().saturating_add(2))?;
+    map_scalar(value, &mapping.field_type, key, remaining_bytes).map(Some)
 }
 
-fn map_scalar(value: &Value, field_type: &FieldType, key: &str) -> Result<TelemetryValue> {
+fn map_scalar(
+    value: &Value,
+    field_type: &FieldType,
+    key: &str,
+    remaining_bytes: &mut usize,
+) -> Result<TelemetryValue> {
     match field_type {
         FieldType::Float => value
             .as_f64()
@@ -166,11 +243,21 @@ fn map_scalar(value: &Value, field_type: &FieldType, key: &str) -> Result<Teleme
             .as_bool()
             .map(TelemetryValue::Boolean)
             .with_context(|| format!("field '{key}' must be a boolean")),
-        FieldType::String => value
-            .as_str()
-            .map(|value| TelemetryValue::String(value.to_owned()))
-            .with_context(|| format!("field '{key}' must be a string")),
+        FieldType::String => {
+            let value = value
+                .as_str()
+                .with_context(|| format!("field '{key}' must be a string"))?;
+            reserve_mapped_bytes(remaining_bytes, value.len())?;
+            Ok(TelemetryValue::String(value.to_owned()))
+        }
     }
+}
+
+fn reserve_mapped_bytes(remaining: &mut usize, bytes: usize) -> Result<()> {
+    *remaining = remaining
+        .checked_sub(bytes)
+        .context("mapped telemetry exceeds the WAL-compatible size limit")?;
+    Ok(())
 }
 
 fn map_timestamp(config: &TimestampConfig, payload: &Value, received_at_ms: i64) -> Result<i64> {
@@ -270,6 +357,69 @@ mod tests {
 
     fn empty_tags() -> Value {
         json!({})
+    }
+
+    #[test]
+    fn test_telemetry_mapping_rejects_repeated_pointer_amplification() -> Result<()> {
+        let payload = json!({"value": "a".repeat(60 * 1024)});
+
+        for (count, accepted) in [(17, true), (18, false)] {
+            let fields = (0..count)
+                .map(|index| {
+                    (
+                        format!("field_{index}"),
+                        json!({"pointer": "/value", "type": "string"}),
+                    )
+                })
+                .collect();
+            let route = route_config(
+                json!("device"),
+                Value::Object(fields),
+                received_timestamp(),
+                empty_tags(),
+            )?;
+
+            assert_eq!(
+                map_payload(&route, &payload, "home/device/sensor", 1, false).is_ok(),
+                accepted
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_telemetry_mapping_bounds_repeated_tags_and_defaults() -> Result<()> {
+        let large_value = "a".repeat(60 * 1024);
+        let tags = (0..18)
+            .map(|index| (format!("tag_{index}"), json!({"pointer": "/value"})))
+            .collect();
+        let route = route_config(
+            json!("device"),
+            json!({"enabled": {"pointer": "/enabled", "type": "boolean"}}),
+            received_timestamp(),
+            Value::Object(tags),
+        )?;
+        let payload = json!({"value": large_value, "enabled": true});
+
+        assert!(map_payload(&route, &payload, "home/device/sensor", 1, false).is_err());
+
+        let defaults = (0..18)
+            .map(|index| {
+                (
+                    format!("field_{index}"),
+                    json!({"pointer": "/absent", "type": "string", "default": &large_value}),
+                )
+            })
+            .collect();
+        let route = route_config(
+            json!("device"),
+            Value::Object(defaults),
+            received_timestamp(),
+            empty_tags(),
+        )?;
+
+        assert!(map_payload(&route, &json!({}), "home/device/sensor", 1, false).is_err());
+        Ok(())
     }
 
     #[test]
@@ -448,6 +598,16 @@ mod tests {
             false
         )
         .is_err());
+        for topic in ["home", "home//sensor"] {
+            assert!(map_payload(
+                &route,
+                &json!({"device_id": "lab", "value": 12.5}),
+                topic,
+                10,
+                false
+            )
+            .is_err());
+        }
         Ok(())
     }
 

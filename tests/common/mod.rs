@@ -23,8 +23,8 @@ use smarthome_ingest::{
         runner::PipelineRunner,
         stages::{
             cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
-            observe::ObserveStage, persist::PersistStage, transform::TelemetryMappingStage,
-            validate_output::ValidateOutputStage, validate_raw::ConfiguredValidateRawStage,
+            observe::ObserveStage, persist::PersistStage, telemetry_mapping::TelemetryMappingStage,
+            validate_output::ValidateOutputStage, validate_raw::ValidateRawStage,
         },
     },
 };
@@ -84,16 +84,23 @@ pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, T
 pub async fn build_pipeline_with_routes(
     routes: Arc<RouteSet>,
 ) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
+    build_pipeline_with_routes_and_encoder(routes, influx_encoder()).await
+}
+
+pub async fn build_pipeline_with_routes_and_encoder(
+    routes: Arc<RouteSet>,
+    encoder: Arc<dyn Encoder>,
+) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
     let cache = CacheState::new(60_000, 64);
     let (wal, sub, tmp) = open_temp_wal().await;
 
     let pipeline = PipelineRunner::new()
         .add_stage(DecodeStage::new())
-        .add_stage(ConfiguredValidateRawStage::new(routes))
+        .add_stage(ValidateRawStage::new(routes))
         .add_stage(TelemetryMappingStage::new())
-        .add_stage(ValidateOutputStage::new())
+        .add_stage(ValidateOutputStage::new(encoder.clone()))
         .add_stage(CacheUpdateStage::new(cache.clone()))
-        .add_stage(PersistStage::new(wal, influx_encoder()))
+        .add_stage(PersistStage::new(wal, encoder))
         .add_stage(ObserveStage::new())
         .with_failure_stage(DlqPublishStage::new(
             dlq_publisher(),
