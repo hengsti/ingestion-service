@@ -257,12 +257,7 @@ impl Config {
             bail!("WAL_QUEUE_CAPACITY must be greater than zero");
         }
 
-        let input_queue_capacity = match env_var("INPUT_QUEUE_CAPACITY") {
-            Some(v) => v
-                .parse::<usize>()
-                .context("INPUT_QUEUE_CAPACITY must be a valid usize")?,
-            None => 16_384,
-        };
+        let input_queue_capacity = parse_input_queue_capacity(env_var("INPUT_QUEUE_CAPACITY"))?;
 
         let metrics_bind = env_var("METRICS_BIND").context("METRICS_BIND must be set")?;
 
@@ -336,17 +331,30 @@ fn env_var(k: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
-fn mqtt_session(clean_session: Option<String>, mut client_id: String) -> Result<(bool, String)> {
+fn mqtt_session(clean_session: Option<String>, client_id: String) -> Result<(bool, String)> {
     let clean_session = match clean_session {
         Some(v) => v
             .parse::<bool>()
             .context("MQTT_CLEAN_SESSION must be a valid bool")?,
-        None => true,
+        None => false,
     };
     if clean_session {
-        client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
+        bail!("MQTT_CLEAN_SESSION=true is unsupported; durable MQTT intake requires a persistent session");
     }
     Ok((clean_session, client_id))
+}
+
+fn parse_input_queue_capacity(value: Option<String>) -> Result<usize> {
+    let capacity = match value {
+        Some(value) => value
+            .parse::<usize>()
+            .context("INPUT_QUEUE_CAPACITY must be a valid usize")?,
+        None => 16_384,
+    };
+    if capacity == 0 {
+        bail!("INPUT_QUEUE_CAPACITY must be greater than zero");
+    }
+    Ok(capacity)
 }
 
 #[cfg(test)]
@@ -408,14 +416,11 @@ mod tests {
     }
 
     #[test]
-    fn mqtt_session_unset_defaults_to_clean_with_suffixed_client_id() -> Result<()> {
+    fn mqtt_session_unset_defaults_to_persistent_with_stable_client_id() -> Result<()> {
         let (clean_session, client_id) = mqtt_session(None, "ingest".to_string())?;
 
-        assert!(clean_session);
-        let suffix = client_id
-            .strip_prefix("ingest-")
-            .context("client id must be suffixed")?;
-        assert!(suffix.parse::<i64>().is_ok());
+        assert!(!clean_session);
+        assert_eq!(client_id, "ingest");
         Ok(())
     }
 
@@ -430,10 +435,30 @@ mod tests {
     }
 
     #[test]
+    fn mqtt_session_true_rejects_nonpersistent_mode() {
+        let result = mqtt_session(Some("true".to_string()), "ingest".to_string());
+
+        assert!(format!("{:#}", result.unwrap_err()).contains("MQTT_CLEAN_SESSION"));
+    }
+
+    #[test]
     fn mqtt_session_invalid_value_returns_error() {
         let result = mqtt_session(Some("nope".to_string()), "ingest".to_string());
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn input_queue_capacity_rejects_zero() {
+        assert!(parse_input_queue_capacity(Some("0".to_string())).is_err());
+    }
+
+    #[test]
+    fn input_queue_capacity_defaults_to_positive_capacity() -> Result<()> {
+        let capacity = parse_input_queue_capacity(None)?;
+
+        assert!(capacity > 0);
+        Ok(())
     }
 
     #[test]
