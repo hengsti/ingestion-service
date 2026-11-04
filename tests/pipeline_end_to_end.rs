@@ -1,12 +1,20 @@
 mod common;
 
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use smarthome_ingest::{
-    config::routes::RouteBundle, infrastructure::router::RouteSet,
-    model::messages::telemetry::TelemetryValue, pipeline::context::PipelineContext,
+    config::routes::{self, RouteBundle},
+    infrastructure::{router::RouteSet, sink::Encoder},
+    model::messages::telemetry::{TelemetryRecord, TelemetryValue},
+    pipeline::context::PipelineContext,
 };
 
 const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
@@ -329,6 +337,51 @@ async fn oversized_payload_is_rejected_before_json_decoding() -> Result<()> {
 
     assert!(ctx.should_publish_dlq());
     assert!(ctx.dlq_reason().unwrap_or("").contains("too large"));
+    assert!(common::recv_event(&mut sub, 100).await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_encoded_output_is_rejected_before_cache_update() -> Result<()> {
+    struct OversizedEncoder(Arc<AtomicBool>);
+
+    impl Encoder for OversizedEncoder {
+        fn encoded_size_upper_bound(&self, _record: &TelemetryRecord) -> usize {
+            1024 * 1024
+        }
+
+        fn encode(&self, _record: &TelemetryRecord, out: &mut String) {
+            self.0.store(true, Ordering::Relaxed);
+            out.push_str(&"x".repeat(1024 * 1024));
+        }
+    }
+
+    let routes = Arc::new(RouteSet::compile(
+        routes::load("config/routes.json")?,
+        "smarthome/_dlq/ingest",
+    )?);
+    let called = Arc::new(AtomicBool::new(false));
+    let encoder = Arc::new(OversizedEncoder(called.clone()));
+    let (pipeline, mut sub, cache, _tmp) =
+        common::build_pipeline_with_routes_and_encoder(routes, encoder).await;
+    let mut ctx = PipelineContext::new_with_metadata(
+        "smarthome/esp32-1/sensor",
+        common::valid_sensor_payload("esp32-1"),
+        1_700_000_000_456,
+        false,
+    );
+
+    pipeline.run(&mut ctx).await;
+
+    assert!(
+        ctx.should_publish_dlq(),
+        "oversized output must be rejected"
+    );
+    assert!(
+        !called.load(Ordering::Relaxed),
+        "must reject before encoding"
+    );
+    assert!(cache.snapshot_device("esp32-1").is_none());
     assert!(common::recv_event(&mut sub, 100).await.is_none());
     Ok(())
 }
