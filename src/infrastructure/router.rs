@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::calculations::CalculationRegistry;
-use crate::config::routes::{FieldType, RouteBundle, RouteConfig};
+use crate::config::routes::{DeviceIdSource, FieldType, RouteBundle, RouteConfig};
 use crate::infrastructure::schema::{load_schema_resources, CompiledSchema};
 use crate::model::topic::MqttTopicFilter;
 
@@ -102,6 +102,17 @@ impl RouteSet {
             }
             let filter = MqttTopicFilter::new(&route.topic)
                 .with_context(|| format!("route '{}' has an invalid topic filter", route.id))?;
+            let device_id_segment = match &route.device_id {
+                DeviceIdSource::TopicSegment(config) => Some(config.topic_segment),
+                DeviceIdSource::PointerAndTopicSegment(config) => Some(config.topic_segment),
+                DeviceIdSource::Fixed(_) | DeviceIdSource::Pointer(_) => None,
+            };
+            if device_id_segment.is_some_and(|index| !filter.has_fixed_segment(index)) {
+                bail!(
+                    "route '{}' device identity topic_segment must reference a fixed topic level",
+                    route.id
+                );
+            }
             if filter.matches(dlq_topic) {
                 bail!("route '{}' subscribes to the DLQ destination", route.id);
             }
@@ -471,6 +482,20 @@ mod configured_route_tests {
         ])?;
 
         assert!(RouteSet::compile(routes, "home/dlq").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_route_rejects_device_identity_from_multi_level_wildcard() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+
+        let variable_suffix = bundle(vec![route("suffix", "example/#", &schema_path)])?;
+        assert!(RouteSet::compile(variable_suffix, "dlq/topic").is_err());
+
+        let fixed_segment = bundle(vec![route("fixed", "example/+/status/#", &schema_path)])?;
+        assert!(RouteSet::compile(fixed_segment, "other/dlq").is_ok());
         Ok(())
     }
 
