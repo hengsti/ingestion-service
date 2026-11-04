@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment {
@@ -11,14 +11,12 @@ enum Segment {
 ///
 /// This type preserves the configured filter exactly and implements MQTT wildcard and
 /// system-topic matching rules.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttTopicFilter {
     raw: String,
     segments: Vec<Segment>,
 }
 
-#[allow(dead_code)]
 impl MqttTopicFilter {
     /// Parses an MQTT topic filter without trimming or normalizing it.
     ///
@@ -134,26 +132,8 @@ impl MqttTopicFilter {
         }
         true
     }
-
-    /// Extracts a zero-based topic level after confirming the topic matches this filter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the topic does not match, or the requested level is absent or
-    /// empty.
-    pub fn topic_segment<'a>(&self, topic: &'a str, index: usize) -> Result<&'a str> {
-        if !self.matches(topic) {
-            bail!("topic does not match filter '{}'", self.raw);
-        }
-        topic
-            .split('/')
-            .nth(index)
-            .filter(|segment| !segment.is_empty())
-            .with_context(|| format!("topic segment {index} is missing or empty"))
-    }
 }
 
-#[allow(dead_code)]
 fn valid_topic_name(topic: &str) -> bool {
     !topic.is_empty()
         && !topic.contains('\0')
@@ -162,7 +142,6 @@ fn valid_topic_name(topic: &str) -> bool {
         && topic.split('/').all(|level| !level.is_empty())
 }
 
-#[allow(dead_code)]
 fn wildcard_cannot_match_system_level(wildcard: &Segment, other: &Segment) -> bool {
     matches!(wildcard, Segment::One | Segment::Multi)
         && matches!(other, Segment::Lit(level) if level.starts_with('$'))
@@ -218,18 +197,6 @@ mod configured_route_tests {
         assert!(!MqttTopicFilter::new("#")?.matches("$SYS/status"));
         assert!(MqttTopicFilter::new("$SYS/#")?.matches("$SYS/status"));
         assert!(MqttTopicFilter::new("+/status")?.matches("room/status"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_configured_route_topic_extracts_explicit_zero_based_segment() -> Result<()> {
-        let filter = MqttTopicFilter::new("home/+/sensor")?;
-
-        assert_eq!(filter.topic_segment("home/lab/sensor", 1)?, "lab");
-        assert_eq!(filter.topic_segment("home/lab/sensor", 0)?, "home");
-        assert!(filter.topic_segment("home/lab/sensor", 3).is_err());
-        assert!(filter.topic_segment("home//sensor", 1).is_err());
-        assert!(filter.topic_segment("other/lab/sensor", 1).is_err());
         Ok(())
     }
 
