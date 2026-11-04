@@ -2,11 +2,18 @@ use anyhow::{Context, Result};
 use axum::{extract::State, http::header, response::IntoResponse, routing::get, Router};
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::infrastructure::router::RouteSet;
+use crate::infrastructure::{router::RouteSet, wal::capacity::Capacity};
+
+#[derive(Clone)]
+struct MetricsState {
+    handle: PrometheusHandle,
+    wal: Arc<Capacity>,
+    quarantine: Arc<Capacity>,
+}
 
 /// Background Prometheus exporter for Telegraf scraping.
 ///
@@ -17,7 +24,16 @@ pub struct MetricsServer {
 }
 
 impl MetricsServer {
-    pub async fn start(bind: &str, routes: &RouteSet) -> Result<Self> {
+    /// Starts the metrics endpoint with live journal capacity snapshots.
+    ///
+    /// # Errors
+    /// Returns an error if the metrics recorder or listening socket cannot be initialized.
+    pub async fn start(
+        bind: &str,
+        routes: &RouteSet,
+        wal: Arc<Capacity>,
+        quarantine: Arc<Capacity>,
+    ) -> Result<Self> {
         let handle: PrometheusHandle = PrometheusBuilder::new()
             .install_recorder()
             .context("failed to build Prometheus recorder")?;
@@ -34,7 +50,11 @@ impl MetricsServer {
 
         let app = Router::new()
             .route("/metrics", get(metrics_handler))
-            .with_state(handle);
+            .with_state(MetricsState {
+                handle,
+                wal,
+                quarantine,
+            });
 
         let address: SocketAddr = bind
             .parse()
@@ -78,6 +98,7 @@ const COUNTERS: &[&str] = &[
     "wal_forwarder_commit_retry_total",
     "wal_subscription_corrupt_skipped_total",
     "wal_segment_rotations_total",
+    "wal_capacity_full_total",
 ];
 
 const ROUTE_COUNTERS: &[&str] = &[
@@ -107,15 +128,46 @@ fn register_metrics(routes: &RouteSet) {
     gauge!("wal_forwarder_retry_outage_active").set(0.0);
 }
 
-async fn metrics_handler(State(handle): State<PrometheusHandle>) -> impl IntoResponse {
-    let body = handle.render();
+async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse {
+    record_journal_capacity(&state.wal, &state.quarantine);
+    let body = state.handle.render();
 
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+}
+
+fn record_journal_capacity(wal: &Capacity, quarantine: &Capacity) {
+    let (wal_used, wal_max) = wal.snapshot();
+    let (quarantine_used, quarantine_max) = quarantine.snapshot();
+    gauge!("wal_accounted_bytes").set(wal_used as f64);
+    gauge!("wal_capacity_bytes").set(wal_max as f64);
+    gauge!("quarantine_accounted_bytes").set(quarantine_used as f64);
+    gauge!("quarantine_capacity_bytes").set(quarantine_max as f64);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_wal_capacity_metrics_export_live_journal_snapshots() -> Result<()> {
+        let wal_dir = tempfile::tempdir()?;
+        let quarantine_dir = tempfile::tempdir()?;
+        let wal = Capacity::recover(wal_dir.path(), 1024 * 1024)?;
+        let quarantine = Capacity::recover(quarantine_dir.path(), 2 * 1024 * 1024)?;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || record_journal_capacity(&wal, &quarantine));
+        let body = handle.render();
+        assert!(body.contains(&format!("wal_accounted_bytes {}\n", wal.snapshot().0)));
+        assert!(body.contains("wal_capacity_bytes 1048576\n"));
+        assert!(body.contains(&format!(
+            "quarantine_accounted_bytes {}\n",
+            quarantine.snapshot().0
+        )));
+        assert!(body.contains("quarantine_capacity_bytes 2097152\n"));
+        Ok(())
+    }
 
     #[test]
     fn register_metrics_exports_full_inventory_with_zero_values() -> Result<()> {
