@@ -9,6 +9,7 @@ services:
       - "8085"
     volumes:
       - wal:/data/wal # must match WAL_DIR
+      - ./config:/app/config:ro
     environment:
       RUST_LOG: ${RUST_LOG:?set RUST_LOG (e.g. info)}
 
@@ -22,10 +23,8 @@ services:
       # Optional; passed through from the host environment only when set.
       MQTT_USERNAME:
       MQTT_PASSWORD:
-      MQTT_TOPIC_SENSOR: smarthome/+/bme680
-      MQTT_TOPIC_STATUS: smarthome/+/status
       MQTT_TOPIC_DLQ: smarthome/_dlq/ingest
-      ENFORCE_TOPIC_DEVICE_MATCH: "true"
+      INGEST_ROUTES_FILE: /app/config/routes.json
       INPUT_QUEUE_CAPACITY: "1000000"
 
       # Output: InfluxDB

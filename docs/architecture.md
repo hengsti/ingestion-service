@@ -1,155 +1,106 @@
 # Architecture
 
-This document describes the runtime structure and why each boundary exists.
+`smarthome-ingest` receives telemetry from an input source, validates and maps it using a
+configured route, appends the encoded output to a local WAL, and forwards WAL batches to an
+output sink.
 
-## Responsibilities
-
-`smarthome-ingest` owns the ingestion path between an input source and an output sink (InfluxDB today):
-
-- Consume telemetry from a configurable input source (MQTT today; see [Input Source](#input-source)).
-- Decode and validate JSON payloads.
-- Normalize payloads into canonical Rust message structs.
-- Compute derived sensor fields.
-- Update an in-memory latest sensor cache.
-- Render the wire-format payload via the active output sink's `Encoder` (InfluxDB line protocol today; see [Output Sink](#output-sink)).
-- Store the rendered payload in a local WAL before forwarding.
-- Publish rejected payloads to a DLQ destination on the active input source.
-- Export HTTP state and Prometheus metrics.
-
-The service does not own the input broker lifecycle, InfluxDB lifecycle, device firmware, dashboards, or long-term query APIs.
-
-## Runtime Components
+## Runtime flow
 
 ```text
-Config
-  -> Input source selection (INPUT_SOURCE) and MQTT topic map
-  -> Router with embedded schemas
-  -> Cache state
-  -> Metrics server
-  -> WAL and WAL subscription
-  -> Output sink selection (OUTPUT_SINK) and matching encoder
-  -> Pipeline runner (with a DlqPublisher from the active source, and an Encoder from the active sink)
+Config + route bundle
+  -> compile one immutable RouteSet
+  -> MQTT subscriptions and pipeline route selection
+  -> bounded worker queues
+  -> decode -> raw schema -> map/calculations -> output validation
+  -> optional cache -> typed encoder -> durable WAL append
+  -> WAL forwarder -> sink
 ```
 
-`main.rs` wires these components together. It starts the cache API, metrics API, the input source's event loop, the WAL forwarder, and the worker pool.
+`main.rs` compiles the route bundle once. MQTT subscriptions come from that compiled set,
+and each message selects a route by its configured topic filter. The route's schemas,
+identity mapping, field mappings, calculations, measurement, output validation, and cache
+opt-in determine processing. There is no message-type inference from topic suffixes or
+publisher origins.
 
-## Input Source
+## Pipeline and record
 
-Input ingestion is decoupled behind a `Source` abstraction (`src/infrastructure/source/mod.rs`), mirroring the `Sink`/`Encoder` boundary used for output:
+Each worker carries the raw payload, frozen MQTT receive timestamp and retain flag, selected
+route, and mapped record in a `PipelineContext`. The pipeline stages are:
 
-- **`Source` trait** — owns a transport's connect/subscribe/event-loop and pushes decoded `IngestJob`s into a shared `IngestDispatcher`. `run` takes `self: Box<Self>` and a cloned shutdown `watch::Receiver<bool>`, matching the shutdown pattern already used by workers.
-- **`DlqPublisher` trait** — abstracts "publish a rejected message back out". It is coupled 1:1 with the active `Source`: `build_source()` returns both from one factory call, matched on `Config::input_source`.
-- **`IngestDispatcher`** — round-robins `IngestJob`s across the worker pool's per-worker bounded channels. It is handed to `Source::run` by value so a source never needs to know about worker count or pool internals, and there is no extra channel hop between the source and the workers.
-- **`MqttSource` / `MqttDlqPublisher`** (`src/infrastructure/source/mqtt.rs`) — the only implementation today. `MqttSource` holds the `rumqttc::EventLoop`, an `AsyncClient` handle for subscribing, the topic list, and a readiness flag; another `AsyncClient` clone goes to `MqttDlqPublisher`. On a poll error the source sets readiness to `false`, logs a warning, waits 1 s (still honouring shutdown), and polls again so `rumqttc` reconnects — it never exits on connection errors. It re-subscribes on **every** `ConnAck`, because brokers may report `session_present=true` without restoring subscriptions. All topics go out as one batched subscribe request; if the client's request channel is full, it is retried after the next poll. Readiness becomes `true` only after a successful `SubAck`.
+1. **decode** — reject inputs over 64 KiB before UTF-8/JSON decoding.
+2. **validate_raw** — select the configured route and validate its raw JSON schema.
+3. **transform** — map configured JSON pointers, apply configured defaults, and run the
+   route's resolved calculations into a typed `TelemetryRecord`. Mapping bounds copied
+   data so repeated pointers cannot amplify one input without limit.
+4. **validate_output** — enforce the selected route's tags and field types, timestamps,
+   values and control-character rules, optional output schema, and the encoder's
+   conservative WAL-size bound before caching or encoding.
+5. **cache_update** — update latest state only when the route enables caching.
+6. **persist** — synchronously encode the record, check its actual WAL size, and await
+   `Wal::append_durable`.
+7. **observe** — record success metrics labeled with configured route ID.
+8. **dlq_publish** — publish rejected input through the active source's DLQ publisher.
 
-`INPUT_SOURCE` (env var) selects which source `build_source()` constructs. Only `mqtt` is implemented; adding a future transport (e.g. Kafka) means adding an `InputSourceKind` variant plus a matching `Source`/`DlqPublisher` pair — `main.rs`'s wiring does not need to change, including topic/route configuration (see below).
+Stage errors mark the context for DLQ; an intentional `StageFlow::Stop` does not. The
+failure publisher does not recursively republish its own failures.
 
-Topic/route definitions are populated by whichever input source is active, the same way `MqttSourceConfig`/`InfluxSinkConfig` are conditionally built. Today only `mqtt` is implemented, so `Config::from_env` scans `MQTT_TOPIC_*` environment variables inside the `InputSourceKind::Mqtt` arm and stores them in `Config::topic_routes`, keyed by message-type suffix rather than the raw env var name:
+The canonical record contains a configured measurement, typed tags and fields, device ID,
+source topic, frozen timestamp in epoch milliseconds, and MQTT retained metadata. The
+reserved `device_id` tag and `mqtt_retained` boolean field are added for every route.
+Calculations are resolved during route compilation; there are no firmware-only transform
+branches. Static output names, control characters, and tag/field/calculation collisions
+are checked when routes compile.
 
-- `MQTT_TOPIC_SENSOR` is stored under key `SENSOR`, which `build_router` maps to `MessageType::Sensor`.
-- `MQTT_TOPIC_STATUS` is stored under key `STATUS`, which `build_router` maps to `MessageType::Status`.
-- `MQTT_TOPIC_DLQ` is stored under key `DLQ`, used only for DLQ publishing.
+## Route configuration
 
-`Router`/`Route`/`TopicPattern` only ever see the generic `topic_routes` map — they have no knowledge of environment variable naming or which source populated it. A future source (e.g. Kafka) would add its own conditional arm producing the same `topic_routes` shape from its own env var convention (e.g. `KAFKA_TOPIC_*`), with zero changes needed to `Router`, `build_router`, or any pipeline stage.
+`INGEST_ROUTES_FILE` is required. The versioned JSON bundle and its schema resources are
+ordinary runtime configuration under `config/`; relative schema paths are resolved from
+the bundle's directory. The shipped bundle preserves the firmware filters and the
+`bme680` / `device_status` Influx measurements while allowing additional formats and topic
+layouts through configuration.
 
-The MQTT source subscribes (on every `ConnAck`) to every configured route except the `DLQ` key. The router only creates routes for `SENSOR` and `STATUS`. Avoid unknown non-DLQ `MQTT_TOPIC_*` keys unless you intentionally want to subscribe to topics that will not match a route.
+The old `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other non-DLQ topic variables, and
+`ENFORCE_TOPIC_DEVICE_MATCH` are rejected with a migration hint. `MQTT_TOPIC_DLQ` remains
+the publish-only destination for rejected messages.
 
-Incoming messages are dispatched round-robin into per-worker bounded channels via `IngestDispatcher`. Worker count is based on available CPU parallelism and clamped to 2 through 8.
+## Input and output boundaries
 
-If a worker queue is full, the message is dropped before the pipeline and `ingest_event_queue_full_total` is incremented. The DLQ is not used for this pre-pipeline drop.
+Input transports implement `Source` and `DlqPublisher`; `build_source()` constructs the
+matching pair. The MQTT source preserves bounded dispatch, QoS 1, reconnect behavior, and
+readiness tracking while subscribing to the route set.
 
-## Pipeline
+Output destinations implement `Sink` and `Encoder`; `build_output()` constructs the matching
+pair. The synchronous encoder receives a validated `TelemetryRecord` and performs no I/O.
+Its allocation-free size bound must cover every byte it will append and saturate on
+overflow; an underestimate can cause excessive allocation or a cache update before
+persistence rejects the actual output.
+The Influx encoder uses the existing point builder for sorting and escaping, handles every
+configured scalar type, and always writes the record timestamp with `precision=ms`.
 
-Each worker creates a `PipelineContext` and runs a fixed sequential pipeline:
+The payload is encoded once before WAL append. `WalEvent` serialization and the on-disk WAL
+format are unchanged. WAL append acknowledgement means the writer flushed its buffer; it
+does not imply `fsync` or power-loss durability.
 
-| Order | Stage | Main behavior |
-|---|---|---|
-| 1 | `decode` | Enforces a 64 KiB payload limit, decodes UTF-8, parses JSON |
-| 2 | `validate_raw` | Matches topic route, validates raw JSON Schema, validates `time_iso`, optionally checks topic device id |
-| 3 | `transform` | Trims strings, computes derived sensor fields, fills status defaults, deserializes to canonical Rust structs |
-| 4 | `validate_business` | Validates canonical messages against stricter business schemas |
-| 5 | `cache_update` | Updates latest sensor cache for sensor messages only |
-| 6 | `persist` | Renders the active sink's payload format via `Encoder` and appends it to the WAL |
-| 7 | `observe` | Emits processed-message metrics |
-| Failure | `dlq_publish` | Publishes DLQ JSON when a previous stage marks the context for DLQ |
+## Cache and HTTP
 
-Stages return `Continue` or `Stop`. Stage errors are converted into a DLQ reason by `PipelineRunner`, then the failure stage is invoked.
+Routes may opt into the bounded latest-state cache. It stores typed record field maps by
+normalized device ID, uses frozen intake time for freshness, and preserves the existing
+`/v1/state`, `/v1/state/{device_id}`, and SSE envelopes. Cache state is not a delivery
+receipt. See [HTTP API and Metrics](http-and-metrics.md).
 
-## Routing Model
+## WAL forwarding and delivery
 
-Routes combine:
-
-- A message type.
-- An MQTT topic pattern.
-- A raw JSON Schema.
-
-Topic patterns support:
-
-- Literal segments, such as `smarthome`.
-- `+` for one topic segment.
-- `#` for the rest of the topic, only at the end.
-
-The first `+` segment is treated as the device id position for topic/payload matching. If there is no `+`, the pattern `smarthome/<device_id>/...` convention treats segment 2 as the device id.
-
-## Data Model
-
-The service uses two message families:
-
-- `SensorMessage` for BME680-style telemetry.
-- `StatusMessage` for device status and health information.
-
-Raw schemas accept device payloads at the boundary. Business schemas validate the post-transform canonical form. See [Messages and Routing](messages-and-routing.md).
-
-## Persistence Path
-
-The persist stage renders canonical messages into the active sink's wire format via its `Encoder` (InfluxDB line protocol today; see [Output Sink](#output-sink) for how the format is chosen):
-
-- Sensors use measurement `bme680`.
-- Status messages use measurement `device_status`.
-
-The rendered payload is stored in a `WalEvent`:
-
-```rust
-pub struct WalEvent {
-    pub topic: String,
-    pub ts_ms: i64,
-    pub payload: String,
-}
-```
-
-`ts_ms` is the ingest time of the WAL event. The InfluxDB point timestamp comes from the payload `time_ms` only when `time_valid=true` and `time_ms > 0`; otherwise InfluxDB assigns server time.
-
-## Output Sink
-
-Output persistence is decoupled behind `Sink` and `Encoder` abstractions (`src/infrastructure/sink/mod.rs`), mirroring the `Source`/`DlqPublisher` pattern used for input:
-
-- **`Sink` trait** — writes a batch of `WalEvent`s to the destination store. `write` returns a boxed `Send` future so the trait is object-safe (`Arc<dyn Sink>`); the WAL forwarder is generic over it and has no InfluxDB-specific knowledge.
-- **`Encoder` trait** — turns a canonical `HandledMessage` into the wire-format payload a `WalEvent` carries. `encode` is a plain sync method (no `Box::pin` allocation) because it never performs I/O — it runs once per message on the pipeline's hot path, before the WAL append.
-- **`build_output(cfg) -> Result<(Arc<dyn Encoder>, Arc<dyn Sink>)>`** — one factory call, matched on `Config::output_sink`, that builds a sink and its matching encoder together so they can never mismatch (same reasoning as `build_source`/`DlqPublisher`).
-- **`InfluxSink` / `InfluxEncoder`** (`src/infrastructure/sink/influx.rs`) — the only implementation today. `InfluxSink` posts batched line protocol to InfluxDB v2's write endpoint with a bounded retry loop; `InfluxEncoder` renders `SensorMessage`/`StatusMessage` into line protocol via `Point`.
-
-`OUTPUT_SINK` (env var) selects which sink `build_output()` constructs. Only `influx` is implemented; adding a future sink (e.g. Kafka) means adding an `OutputSinkKind` variant plus a matching `Sink`/`Encoder` pair — `main.rs`'s wiring does not need to change beyond the one `build_output` match arm.
-
-`PersistStage` holds the active `Arc<dyn Encoder>` and calls it to render the payload before appending to the WAL, so the pipeline stage stays sink-agnostic — it never imports InfluxDB-specific code.
-
-## Forwarding Path
-
-The WAL forwarder reads `WalEntry` values from the subscription, buffers them, and writes batches to the sink. A flush is triggered by:
-
-- `BATCH_SIZE` entries, or
-- `FLUSH_INTERVAL_MS` with a non-empty batch, or
-- WAL shutdown with a final partial batch.
-
-After a successful sink write, the forwarder commits the WAL cursor up to the last entry's `offset_after`. Permanent sink failures are dropped and committed. Retryable failures hold the batch and do not advance the cursor.
+The forwarder batches entries by `BATCH_SIZE` or `FLUSH_INTERVAL_MS`, and attempts a final
+partial batch during shutdown. It advances the commit cursor only after a successful sink
+write. Both retryable and permanent failures retain the batch without advancing the cursor.
+A crash after a successful sink write but before cursor commit can replay the write; this is
+not exactly-once delivery. InfluxDB identifies points by measurement, tag set, and
+timestamp, so same-identity writes merge fields and may overwrite matching fields. The
+route cutover does not change delivery-outcome behavior tracked separately in #32.
 
 ## Shutdown
 
-On Ctrl+C, HTTP task failure, or a fatal input source error, the service:
-
-1. Signals workers (and the input source) to stop accepting new work.
-2. Lets workers drain queued jobs.
-3. Drops the pipeline and WAL handles so the writer flushes and closes.
-4. Waits up to 5 seconds for the forwarder to drain its final batch.
-5. Aborts the forwarder if it cannot drain in time.
-
-This avoids intentionally dropping queued messages during normal shutdown, but it is still bounded by the 5 second final forwarder drain timeout. Broker connection errors are not fatal — the MQTT source reconnects instead (see [Input Source](#input-source)). Any other fatal input source error still exits the process non-zero, but only after this drain sequence runs — it flows through the same shutdown path as Ctrl+C rather than exiting immediately.
+On Ctrl+C, HTTP failure, or fatal source error, the service stops accepting work, drains
+queued worker jobs, closes the WAL writer, and gives the forwarder up to five seconds to
+flush its final partial batch. An uncommitted WAL batch remains available for replay if the
+service is restarted and the WAL files are preserved.

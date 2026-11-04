@@ -1,12 +1,4 @@
-use anyhow::{bail, Context, Result};
-
-/// Topic filter that supports `+` (single level) and `#` (multi level) wildcards.
-#[derive(Debug, Clone)]
-pub struct TopicPattern {
-    segments: Vec<Segment>,
-    /// Best-effort: treat the first `+` segment as the device_id position.
-    device_id_index: Option<usize>,
-}
+use anyhow::{bail, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment {
@@ -17,16 +9,14 @@ enum Segment {
 
 /// MQTT topic filter for configured routes.
 ///
-/// Unlike the legacy [`TopicPattern`], this type preserves the filter exactly and
-/// implements MQTT wildcard and system-topic matching rules.
-#[allow(dead_code)]
+/// This type preserves the configured filter exactly and implements MQTT wildcard and
+/// system-topic matching rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MqttTopicFilter {
     raw: String,
     segments: Vec<Segment>,
 }
 
-#[allow(dead_code)]
 impl MqttTopicFilter {
     /// Parses an MQTT topic filter without trimming or normalizing it.
     ///
@@ -72,6 +62,13 @@ impl MqttTopicFilter {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.raw
+    }
+
+    pub(crate) fn has_fixed_segment(&self, index: usize) -> bool {
+        matches!(
+            self.segments.get(index),
+            Some(Segment::Lit(_) | Segment::One)
+        )
     }
 
     /// Returns whether this filter matches the supplied MQTT topic name.
@@ -142,123 +139,15 @@ impl MqttTopicFilter {
         }
         true
     }
-
-    /// Extracts a zero-based topic level after confirming the topic matches this filter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the topic does not match, or the requested level is absent or
-    /// empty.
-    pub fn topic_segment<'a>(&self, topic: &'a str, index: usize) -> Result<&'a str> {
-        if !self.matches(topic) {
-            bail!("topic does not match filter '{}'", self.raw);
-        }
-        topic
-            .split('/')
-            .nth(index)
-            .filter(|segment| !segment.is_empty())
-            .with_context(|| format!("topic segment {index} is missing or empty"))
-    }
 }
 
-#[allow(dead_code)]
 fn valid_topic_name(topic: &str) -> bool {
-    !topic.is_empty()
-        && !topic.contains('\0')
-        && !topic.contains('+')
-        && !topic.contains('#')
-        && topic.split('/').all(|level| !level.is_empty())
+    !topic.is_empty() && !topic.contains('\0') && !topic.contains('+') && !topic.contains('#')
 }
 
-#[allow(dead_code)]
 fn wildcard_cannot_match_system_level(wildcard: &Segment, other: &Segment) -> bool {
     matches!(wildcard, Segment::One | Segment::Multi)
         && matches!(other, Segment::Lit(level) if level.starts_with('$'))
-}
-
-impl TopicPattern {
-    pub fn new(raw: &str) -> Result<Self> {
-        let raw = raw.trim().trim_matches('/').to_string();
-        if raw.is_empty() {
-            bail!("topic pattern must not be empty");
-        }
-
-        let parts: Vec<&str> = raw.split('/').collect();
-        let mut segments = Vec::with_capacity(parts.len());
-        let mut device_id_index = None;
-
-        for (i, seg) in parts.iter().enumerate() {
-            if seg.is_empty() {
-                bail!("topic pattern contains empty segment: '{}'", raw);
-            }
-
-            match *seg {
-                "+" => {
-                    if device_id_index.is_none() {
-                        device_id_index = Some(i);
-                    }
-                    segments.push(Segment::One);
-                }
-                "#" => {
-                    if i != parts.len() - 1 {
-                        bail!("'#' must be the last segment in topic pattern: '{}'", raw);
-                    }
-                    segments.push(Segment::Multi);
-                }
-                lit => segments.push(Segment::Lit(lit.to_string())),
-            }
-        }
-
-        // Convention fallback: "smarthome/<device_id>/..." even if TopicPattern uses a concrete device id.
-        if device_id_index.is_none() && parts.len() >= 2 && parts[0] == "smarthome" {
-            device_id_index = Some(1);
-        }
-
-        Ok(Self {
-            segments,
-            device_id_index,
-        })
-    }
-
-    pub fn matches(&self, topic: &str) -> bool {
-        let topic = topic.trim().trim_matches('/');
-        let t_parts: Vec<&str> = topic.split('/').collect();
-
-        let mut ti = 0usize;
-        for (pi, pseg) in self.segments.iter().enumerate() {
-            match pseg {
-                Segment::Multi => {
-                    // '#' matches the rest; allowed only at the end.
-                    return pi == self.segments.len() - 1;
-                }
-                Segment::One => {
-                    if ti >= t_parts.len() {
-                        return false;
-                    }
-                    if t_parts[ti].is_empty() {
-                        return false;
-                    }
-                    ti += 1;
-                }
-                Segment::Lit(lit) => {
-                    if ti >= t_parts.len() {
-                        return false;
-                    }
-                    if t_parts[ti] != lit {
-                        return false;
-                    }
-                    ti += 1;
-                }
-            }
-        }
-        ti == t_parts.len()
-    }
-
-    pub fn device_id_from_topic<'a>(&self, topic: &'a str) -> Option<&'a str> {
-        let idx = self.device_id_index?;
-        let topic = topic.trim().trim_matches('/');
-        topic.split('/').nth(idx)
-    }
 }
 
 #[cfg(test)]
@@ -270,7 +159,8 @@ mod configured_route_tests {
         assert!(MqttTopicFilter::new("sensor/room").is_ok_and(|f| f.matches("sensor/room")));
         assert!(!MqttTopicFilter::new("sensor/room").is_ok_and(|f| f.matches("sensor/room/")));
         assert!(MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/kitchen")));
-        assert!(!MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/")));
+        assert!(MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/")));
+        assert!(MqttTopicFilter::new("home/+/sensor").is_ok_and(|f| f.matches("home//sensor")));
         assert!(MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensor")));
         assert!(MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensor/a/b")));
         assert!(!MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensors/a")));
@@ -311,18 +201,6 @@ mod configured_route_tests {
         assert!(!MqttTopicFilter::new("#")?.matches("$SYS/status"));
         assert!(MqttTopicFilter::new("$SYS/#")?.matches("$SYS/status"));
         assert!(MqttTopicFilter::new("+/status")?.matches("room/status"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_configured_route_topic_extracts_explicit_zero_based_segment() -> Result<()> {
-        let filter = MqttTopicFilter::new("home/+/sensor")?;
-
-        assert_eq!(filter.topic_segment("home/lab/sensor", 1)?, "lab");
-        assert_eq!(filter.topic_segment("home/lab/sensor", 0)?, "home");
-        assert!(filter.topic_segment("home/lab/sensor", 3).is_err());
-        assert!(filter.topic_segment("home//sensor", 1).is_err());
-        assert!(filter.topic_segment("other/lab/sensor", 1).is_err());
         Ok(())
     }
 

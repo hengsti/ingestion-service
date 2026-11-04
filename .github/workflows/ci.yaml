@@ -51,6 +51,8 @@ jobs:
       RUST_LOG: info
       MQTT_HOST: ci
       MQTT_PORT: "1883"
+      MQTT_TOPIC_DLQ: smarthome/_dlq/ci
+      INGEST_ROUTES_FILE: /app/config/routes.json
       INFLUX_URL: http://ci:8086
       INFLUX_ORG: ci
       INFLUX_BUCKET: ci
@@ -70,14 +72,13 @@ jobs:
             | jq -r '.services.ingest.environment | keys[]' | sort -u)
           code_keys=$(grep -oE 'env_var\("[A-Z_]+"\)' src/config.rs \
             | sed -E 's/env_var\("([A-Z_]+)"\)/\1/' | sort -u)
-          # RUST_LOG is read by tracing, MQTT_TOPIC_* by prefix scan.
+          # RUST_LOG is read by tracing, not Config::from_env.
           unread=$(comm -23 <(echo "$compose_keys") <(echo "$code_keys") \
-            | grep -vE '^(RUST_LOG|MQTT_TOPIC_[A-Z_]+)$' || true)
+            | grep -vx 'RUST_LOG' || true)
           # Optional variables with code defaults may be omitted.
           missing=$(comm -13 <(echo "$compose_keys") <(echo "$code_keys") \
-            | grep -vxE 'WAL_SEGMENT_BYTES|WAL_QUEUE_CAPACITY' || true)
+            | grep -vxE 'RUST_LOG|WAL_SEGMENT_BYTES|WAL_QUEUE_CAPACITY|INPUT_QUEUE_CAPACITY|MQTT_CLEAN_SESSION' || true)
           if [[ -n "$unread$missing" ]]; then
             echo "::error file=compose.yaml::env drift. Unread by src/config.rs: [${unread//$'\n'/ }]. Missing from compose.yaml: [${missing//$'\n'/ }]"
             exit 1
           fi
-

@@ -32,11 +32,11 @@ fn test_firmware_routes_loads_and_compiles_two_routes() -> anyhow::Result<()> {
     let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
     assert_eq!(
         route_set.subscriptions(),
-        ["smarthome/+/sensor", "smarthome/+/status"]
+        ["smarthome/+/bme680", "smarthome/+/status"]
     );
 
     let sensor = route_set
-        .select("smarthome/test-sensor/sensor")
+        .select("smarthome/test-sensor/bme680")
         .context("sensor route was not selected")?;
     assert_eq!(sensor.id(), "firmware-sensor");
     assert!(sensor_has_topic_identity);
@@ -84,7 +84,7 @@ fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> any
     let bundle = routes::load("config/routes.json")?;
     let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
     let sensor = route_set
-        .select("smarthome/test-sensor/sensor")
+        .select("smarthome/test-sensor/bme680")
         .context("sensor route was not selected")?;
     let schema = sensor
         .output_schema()
@@ -113,7 +113,7 @@ fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> any
             "iaq_text": "Good",
             "mqtt_retained": false
         },
-        "source_topic": "smarthome/test-sensor/sensor",
+        "source_topic": "smarthome/test-sensor/bme680",
         "retained": false
     });
 
@@ -196,7 +196,7 @@ fn test_firmware_routes_raw_schema_rejects_malformed_rfc3339() -> anyhow::Result
     let bundle = routes::load("config/routes.json")?;
     let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
     let sensor = route_set
-        .select("smarthome/test-sensor/sensor")
+        .select("smarthome/test-sensor/bme680")
         .context("sensor route was not selected")?;
     let payload = json!({
         "device_id": "test-sensor",

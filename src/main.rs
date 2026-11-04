@@ -1,3 +1,4 @@
+mod calculations;
 mod config;
 mod infrastructure;
 mod model;
@@ -8,23 +9,22 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::prometheus::MetricsServer;
-use infrastructure::router::{Route, Router};
+use infrastructure::router::RouteSet;
 use infrastructure::source::{build_source, IngestDispatcher, IngestJob};
 use infrastructure::wal::forwarder::run_forwarder;
 use infrastructure::wal::types::WalOptions;
 use infrastructure::wal::wal::Wal;
-use model::messages::message::MessageType;
 use pipeline::{
     context::PipelineContext,
     runner::PipelineRunner,
     stages::{
         cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
-        observe::ObserveStage, persist::PersistStage, transform::TransformStage,
-        validate_business::ValidateBusinessStage, validate_raw::ValidateRawStage,
+        observe::ObserveStage, persist::PersistStage, telemetry_mapping::TelemetryMappingStage,
+        validate_output::ValidateOutputStage, validate_raw::ValidateRawStage,
     },
 };
 use tokio::{
@@ -92,6 +92,10 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     info!(?cfg, "starting ingestion service");
 
+    let route_bundle = config::routes::load(&cfg.routes_file)?;
+    let dlq_topic = cfg.dlq_topic.clone();
+    let routes = Arc::new(RouteSet::compile(route_bundle, &dlq_topic)?);
+
     // Cache / HTTP state.
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
     let source_ready = Arc::new(AtomicBool::new(false));
@@ -112,17 +116,7 @@ async fn main() -> Result<()> {
     });
 
     // Metrics server.
-    let _metrics_server = MetricsServer::start(&cfg.metrics_bind).await?;
-
-    // Router / schema routes.
-    let router = Arc::new(build_router(&cfg)?);
-
-    // DLQ topic.
-    let dlq_topic = cfg
-        .topic_routes
-        .get("DLQ")
-        .cloned()
-        .context("DLQ route not configured (e.g. MQTT_TOPIC_DLQ)")?;
+    let _metrics_server = MetricsServer::start(&cfg.metrics_bind, &routes).await?;
 
     // WAL, configured sink, and forwarder.
     let (wal, wal_sub) = Wal::open(WalOptions {
@@ -145,18 +139,15 @@ async fn main() -> Result<()> {
     });
 
     // Input source.
-    let (source, dlq_publisher) = build_source(&cfg, source_ready.clone()).await?;
+    let (source, dlq_publisher) = build_source(&cfg, source_ready.clone(), routes.as_ref()).await?;
 
     // Pipeline.
     let pipeline = Arc::new(
         PipelineRunner::new()
             .add_stage(DecodeStage::new())
-            .add_stage(ValidateRawStage::new(
-                router.clone(),
-                cfg.enforce_topic_device_match,
-            ))
-            .add_stage(TransformStage::new(router.clone()))
-            .add_stage(ValidateBusinessStage::new()?)
+            .add_stage(ValidateRawStage::new(routes.clone()))
+            .add_stage(TelemetryMappingStage::new())
+            .add_stage(ValidateOutputStage::new(encoder.clone()))
             .add_stage(CacheUpdateStage::new(app_state.clone()))
             .add_stage(PersistStage::new(wal.clone(), encoder))
             .add_stage(ObserveStage::new())
@@ -190,12 +181,14 @@ async fn main() -> Result<()> {
                     None => break,
                 };
 
-                let mut ctx = PipelineContext::new(job.topic.clone(), job.payload);
+                let mut ctx = PipelineContext::new_with_metadata(
+                    job.topic.clone(),
+                    job.payload,
+                    job.received_at_ms,
+                    job.retained,
+                );
+                ctx.set_receive_sequence(job.receive_sequence);
                 pipeline.run(&mut ctx).await;
-
-                if let Some(reason) = ctx.ignored_reason() {
-                    info!(worker_id, topic = %job.topic, reason = %reason, "message ignored by pipeline");
-                }
             }
 
             info!(worker_id, "pipeline worker stopped");
@@ -309,39 +302,6 @@ async fn main() -> Result<()> {
     }
 }
 
-fn build_router(cfg: &Config) -> Result<Router> {
-    let mut router = Router::new().strict(true);
-
-    for (message_type_name, topic) in cfg.topic_routes.iter() {
-        let message_type = match message_type_name.as_str() {
-            "SENSOR" => MessageType::Sensor,
-            "STATUS" => MessageType::Status,
-            "DLQ" => continue,
-            other => {
-                warn!(config_key = %message_type_name, message_type = %other, "unknown topic config key; skipping");
-                continue;
-            }
-        };
-
-        let schema = match message_type_name.as_str() {
-            "SENSOR" => include_str!("../config/schemas/sensor.schema.json"),
-            "STATUS" => include_str!("../config/schemas/status.schema.json"),
-            _ => unreachable!(),
-        };
-
-        router = router.add_route(Route::new(message_type, schema, topic)?);
-
-        info!(
-            config_key = %message_type_name,
-            message_type = %message_type_name,
-            topic = %topic,
-            "configured route"
-        );
-    }
-
-    Ok(router)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +314,9 @@ mod tests {
         tx.try_send(IngestJob {
             topic: "smarthome/dev-1/status".to_string(),
             payload: Bytes::from_static(b"{\"device_id\":\"dev-1\"}"),
+            received_at_ms: 1,
+            receive_sequence: 0,
+            retained: false,
         })
         .unwrap();
 
@@ -373,11 +336,17 @@ mod tests {
         tx.try_send(IngestJob {
             topic: "smarthome/dev-1/status".to_string(),
             payload: Bytes::from_static(b"{\"device_id\":\"dev-1\"}"),
+            received_at_ms: 1,
+            receive_sequence: 0,
+            retained: false,
         })
         .unwrap();
         tx.try_send(IngestJob {
             topic: "smarthome/dev-2/status".to_string(),
             payload: Bytes::from_static(b"{\"device_id\":\"dev-2\"}"),
+            received_at_ms: 2,
+            receive_sequence: 0,
+            retained: true,
         })
         .unwrap();
 

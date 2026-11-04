@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::{future::Future, pin::Pin, time::Instant};
 
+use anyhow::Context;
 use tracing::warn;
 
 use metrics::{counter, histogram};
@@ -8,10 +9,10 @@ use metrics::{counter, histogram};
 use crate::{
     infrastructure::sink::Encoder,
     infrastructure::wal::{
+        codec::wal_record_frame_size,
         types::{AppendDurableError, WalEvent},
         wal::Wal,
     },
-    model::messages::message::HandledMessage,
     pipeline::{
         context::PipelineContext,
         stage::{PipelineStage, StageFlow, StageResult},
@@ -42,13 +43,12 @@ impl PipelineStage for PersistStage {
         Box::pin(async move {
             let start = Instant::now();
 
-            let message = ctx.handled_message()?;
-            let kind = match message {
-                HandledMessage::Sensor(_) => "sensor",
-                HandledMessage::Status(_) => "status",
-            };
+            let route_id = ctx.route()?.metric_label();
+            let record = ctx.telemetry_record()?;
             let mut payload = String::new();
-            self.encoder.encode(message, &mut payload);
+            self.encoder.encode(record, &mut payload);
+            wal_record_frame_size(ctx.topic().len(), payload.len())
+                .context("encoded telemetry exceeds the WAL reader record limit")?;
 
             let event = WalEvent {
                 topic: ctx.topic().to_string(),
@@ -58,35 +58,37 @@ impl PipelineStage for PersistStage {
 
             match self.wal.append_durable(event).await {
                 Ok(()) => {
-                    counter!("ingest_messages_enqueued_total", "kind" => kind).increment(1);
-                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "success")
+                    counter!("ingest_messages_enqueued_total", "route" => route_id.clone())
+                        .increment(1);
+                    histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "success")
                         .record(start.elapsed().as_secs_f64());
 
                     Ok(StageFlow::Continue)
                 }
                 Err(AppendDurableError::Full(_)) => {
-                    counter!("ingest_queue_full_total", "kind" => kind).increment(1);
+                    counter!("ingest_queue_full_total", "route" => route_id.clone()).increment(1);
                     warn!(topic = %ctx.topic(), "wal queue full; marking for DLQ");
                     ctx.mark_dlq("wal queue full");
-                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "queue_full")
+                    histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_full")
                         .record(start.elapsed().as_secs_f64());
 
                     Ok(StageFlow::Stop)
                 }
                 Err(AppendDurableError::Closed(_)) => {
-                    counter!("ingest_queue_closed_total", "kind" => kind).increment(1);
+                    counter!("ingest_queue_closed_total", "route" => route_id.clone()).increment(1);
                     warn!(topic = %ctx.topic(), "wal queue closed; marking for DLQ");
                     ctx.mark_dlq("wal queue closed");
-                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "queue_closed")
+                    histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_closed")
                         .record(start.elapsed().as_secs_f64());
 
                     Ok(StageFlow::Stop)
                 }
                 Err(AppendDurableError::Durability(reason)) => {
-                    counter!("ingest_durability_ack_failed_total", "kind" => kind).increment(1);
+                    counter!("ingest_durability_ack_failed_total", "route" => route_id.clone())
+                        .increment(1);
                     warn!(topic = %ctx.topic(), reason = %reason, "wal durability ack failed; marking for DLQ");
                     ctx.mark_dlq("wal durability ack failed");
-                    histogram!("ingest_persist_duration_seconds", "kind" => kind, "result" => "durability_failed")
+                    histogram!("ingest_persist_duration_seconds", "route" => route_id, "result" => "durability_failed")
                         .record(start.elapsed().as_secs_f64());
                     Ok(StageFlow::Stop)
                 }
@@ -98,87 +100,64 @@ impl PipelineStage for PersistStage {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::{
-        infrastructure::sink::influx::{sensor_to_point, status_to_point},
+        config::routes,
+        infrastructure::router::{CompiledRoute, RouteSet},
         infrastructure::wal::{
             segment::segment_path,
             subscription::WalSubscription,
             types::{WalEvent, WalOptions},
         },
-        model::messages::{
-            message::HandledMessage,
-            sensor::{SensorData, SensorMessage},
-            status::StatusMessage,
-        },
+        model::messages::telemetry::{TelemetryRecord, TelemetryValue},
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    fn valid_sensor_msg() -> SensorMessage {
-        SensorMessage {
-            device_id: "esp32-1".to_string(),
-            room: "living_room".to_string(),
-            device_class: "esp32p4-bme680".to_string(),
-            fw_version: "1.0.0".to_string(),
-            time_ms: 1_700_000_000_000,
-            time_iso: "2023-11-14T22:13:20Z".to_string(),
-            time_valid: true,
-            boot_id: None,
-            seq: None,
-            warmed_up: None,
-            replayed: false,
-            data: SensorData {
-                temp_c: 22.5,
-                rel_hum_perc: 45.0,
-                pressure_hpa: 1013.25,
-                gas_ohm: 50_000.0,
-                iaq_score: 85.0,
-                iaq_text: "Air quality is Good".to_string(),
-                dew_point_c: 9.5,
-                heat_index_c: 22.0,
-                altitude_m: 500.0,
-            },
+    fn telemetry_record() -> TelemetryRecord {
+        TelemetryRecord {
+            route_id: "firmware-sensor".to_owned(),
+            device_id: "esp32-1".to_owned(),
+            measurement: "test_measurement".to_owned(),
+            timestamp_ms: 1_700_000_000_000,
+            tags: std::collections::BTreeMap::from([
+                ("device_id".to_owned(), "esp32-1".to_owned()),
+                ("room".to_owned(), "living_room".to_owned()),
+            ]),
+            fields: std::collections::BTreeMap::from([
+                ("mqtt_retained".to_owned(), TelemetryValue::Boolean(false)),
+                ("temp_c".to_owned(), TelemetryValue::Float(22.5)),
+            ]),
+            source_topic: "smarthome/esp32-1/bme680".to_owned(),
+            retained: false,
         }
     }
 
-    fn valid_status_msg() -> StatusMessage {
-        StatusMessage {
-            device_id: "esp32-1".to_string(),
-            device_class: "esp32p4-bme680".to_string(),
-            fw_version: "1.0.0".to_string(),
-            ip: "192.168.1.42".to_string(),
-            rssi: -65,
-            time_ms: 1_700_000_000_000,
-            time_iso: "2023-11-14T22:13:20Z".to_string(),
-            time_valid: true,
-            uptime: 3600,
-            free_mem: 200_000,
-            ssid: "HomeNet".to_string(),
-            queued: None,
-            dropped_total: None,
-            samples_failed_total: None,
-            mqtt_connects_total: None,
-            sensor_read_failures_total: None,
-            reset_reason: None,
-        }
-    }
-
-    fn ctx_with_message(handled: HandledMessage) -> PipelineContext {
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
-        ctx.set_handled_message(handled);
+    fn ctx_with_record() -> PipelineContext {
+        static ROUTE: OnceLock<Arc<CompiledRoute>> = OnceLock::new();
+        let route = ROUTE.get_or_init(|| {
+            let routes = RouteSet::compile(
+                routes::load("config/routes.json").expect("load routes"),
+                "smarthome/_dlq/ingest",
+            )
+            .expect("compile routes");
+            routes
+                .select("smarthome/esp32-1/bme680")
+                .expect("select sensor route")
+        });
+        let mut ctx = PipelineContext::new("smarthome/esp32-1/bme680", vec![]);
+        ctx.set_route(route.clone());
+        ctx.set_telemetry_record(telemetry_record());
         ctx
     }
 
-    fn expected_line_protocol(msg: &HandledMessage) -> String {
+    fn expected_line_protocol() -> String {
         let mut out = String::new();
-        match msg {
-            HandledMessage::Sensor(sensor) => sensor_to_point(sensor).write_line_protocol(&mut out),
-            HandledMessage::Status(status) => status_to_point(status).write_line_protocol(&mut out),
-        }
+        crate::infrastructure::sink::influx::InfluxEncoder.encode(&telemetry_record(), &mut out);
         out
     }
 
@@ -202,12 +181,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_on_sensor_message_appends_to_wal_and_returns_continue() {
+    async fn run_on_telemetry_record_appends_to_wal_and_returns_continue() {
         let dir = tempdir().unwrap();
         let (wal, mut sub) = open_wal(dir.path(), 16).await;
         let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
         let stage = PersistStage::new(wal, encoder);
-        let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+        let mut ctx = ctx_with_record();
 
         let result = stage.run(&mut ctx).await;
 
@@ -215,31 +194,33 @@ mod tests {
         assert!(!ctx.should_publish_dlq());
 
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
-        assert_eq!(event.topic, "smarthome/esp32-1/sensor");
-        assert_eq!(
-            event.payload,
-            expected_line_protocol(&HandledMessage::Sensor(valid_sensor_msg()))
-        );
+        assert_eq!(event.topic, "smarthome/esp32-1/bme680");
+        assert_eq!(event.payload, expected_line_protocol());
     }
 
     #[tokio::test]
-    async fn run_on_status_message_appends_to_wal_and_returns_continue() {
+    async fn test_persist_rejects_oversized_encoded_payload_before_wal_append() {
+        struct OversizedEncoder;
+
+        impl Encoder for OversizedEncoder {
+            fn encoded_size_upper_bound(&self, _record: &TelemetryRecord) -> usize {
+                0
+            }
+
+            fn encode(&self, _record: &TelemetryRecord, out: &mut String) {
+                out.push_str(&"x".repeat(1024 * 1024));
+            }
+        }
+
         let dir = tempdir().unwrap();
         let (wal, mut sub) = open_wal(dir.path(), 16).await;
-        let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
-        let stage = PersistStage::new(wal, encoder);
-        let mut ctx = ctx_with_message(HandledMessage::Status(valid_status_msg()));
+        let stage = PersistStage::new(wal, Arc::new(OversizedEncoder));
+        let mut ctx = ctx_with_record();
 
         let result = stage.run(&mut ctx).await;
 
-        assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
-
-        let event = recv_one(&mut sub, 500).await.expect("event should arrive");
-        assert_eq!(
-            event.payload,
-            expected_line_protocol(&HandledMessage::Status(valid_status_msg()))
-        );
+        assert!(result.is_err(), "oversized encoded record must be rejected");
+        assert!(recv_one(&mut sub, 50).await.is_none());
     }
 
     #[tokio::test]
@@ -266,7 +247,7 @@ mod tests {
 
         let mut saturated = None;
         for _ in 0..1_000 {
-            let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+            let mut ctx = ctx_with_record();
             let result = stage.run(&mut ctx).await;
             if ctx.should_publish_dlq() {
                 saturated = Some((result, ctx));
@@ -294,7 +275,7 @@ mod tests {
         let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
         let stage = PersistStage::new(wal, encoder);
 
-        let mut first = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+        let mut first = ctx_with_record();
         assert!(matches!(
             stage.run(&mut first).await,
             Ok(StageFlow::Continue)
@@ -306,13 +287,13 @@ mod tests {
 
         // Second append is accepted into the queue; writer then hits fatal open
         // error while rotating and exits, disconnecting the channel.
-        let mut second = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+        let mut second = ctx_with_record();
         let _ = stage.run(&mut second).await;
 
         // Wait until a subsequent append observes the closed sender.
         let mut closed = None;
         for _ in 0..200 {
-            let mut ctx = ctx_with_message(HandledMessage::Sensor(valid_sensor_msg()));
+            let mut ctx = ctx_with_record();
             let result = stage.run(&mut ctx).await;
             if ctx.dlq_reason() == Some("wal queue closed") {
                 closed = Some((result, ctx));
@@ -328,12 +309,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_without_handled_message_returns_error() {
+    async fn run_without_telemetry_record_returns_error() {
         let dir = tempdir().unwrap();
         let (wal, _sub) = open_wal(dir.path(), 16).await;
         let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
         let stage = PersistStage::new(wal, encoder);
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
+        let mut ctx = PipelineContext::new("smarthome/esp32-1/bme680", vec![]);
 
         let result = stage.run(&mut ctx).await;
 

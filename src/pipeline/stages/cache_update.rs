@@ -1,10 +1,10 @@
 use std::{future::Future, pin::Pin, time::Instant};
 
+use anyhow::Context;
 use metrics::{counter, histogram};
 
 use crate::{
     infrastructure::cache::state::CacheState,
-    model::messages::message::HandledMessage,
     pipeline::{
         context::PipelineContext,
         stage::{PipelineStage, StageFlow, StageResult},
@@ -33,19 +33,21 @@ impl PipelineStage for CacheUpdateStage {
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
             let start = Instant::now();
-
-            let msg = ctx.handled_message()?;
-
-            let kind = match msg {
-                HandledMessage::Sensor(msg) => {
-                    self.cache_state.update_sensor(msg);
-                    "sensor"
+            let route = ctx.route()?;
+            let route_id = route.metric_label();
+            if route.config().cache {
+                let received_at_ms = u64::try_from(ctx.received_at_ms())
+                    .context("cache receive time cannot be negative")?;
+                if self.cache_state.update_record(
+                    ctx.telemetry_record()?,
+                    received_at_ms,
+                    ctx.receive_sequence(),
+                ) {
+                    counter!("ingest_cache_updates_total", "route" => route_id.clone())
+                        .increment(1);
                 }
-                HandledMessage::Status(_) => "status",
-            };
-
-            counter!("ingest_cache_updates_total", "kind" => kind).increment(1);
-            histogram!("ingest_cache_update_duration_seconds", "kind" => kind)
+            }
+            histogram!("ingest_cache_update_duration_seconds", "route" => route_id)
                 .record(start.elapsed().as_secs_f64());
 
             Ok(StageFlow::Continue)
@@ -55,199 +57,108 @@ impl PipelineStage for CacheUpdateStage {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use anyhow::{Context, Result};
+
     use super::*;
     use crate::{
-        infrastructure::cache::state::CacheState,
-        model::messages::{
-            message::HandledMessage,
-            sensor::{SensorData, SensorMessage},
-            status::StatusMessage,
+        config::routes,
+        infrastructure::{
+            cache::state::CacheEvent,
+            router::{CompiledRoute, RouteSet},
         },
+        model::messages::telemetry::{TelemetryRecord, TelemetryValue},
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    fn cache() -> CacheState {
-        CacheState::new(60_000, 16)
+    const TOPIC: &str = "smarthome/ESP32-1/bme680";
+    const RECEIVED_AT_MS: i64 = 1_700_000_000_456;
+
+    fn route(topic: &str) -> Result<(Arc<RouteSet>, Arc<CompiledRoute>)> {
+        let routes = Arc::new(RouteSet::compile(
+            routes::load("config/routes.json")?,
+            "smarthome/_dlq/ingest",
+        )?);
+        let route = routes
+            .select(topic)
+            .context("configured route should match test topic")?;
+        Ok((routes, route))
     }
 
-    fn sensor_message(device_id: &str, temp_c: f64) -> HandledMessage {
-        HandledMessage::Sensor(SensorMessage {
-            device_id: device_id.to_string(),
-            room: "living_room".to_string(),
-            device_class: "esp32p4-bme680".to_string(),
-            fw_version: "1.0.0".to_string(),
-            time_ms: 1_700_000_000_000,
-            time_iso: "2023-11-14T22:13:20Z".to_string(),
-            time_valid: true,
-            boot_id: None,
-            seq: None,
-            warmed_up: None,
-            replayed: false,
-            data: SensorData {
-                temp_c,
-                rel_hum_perc: 45.0,
-                pressure_hpa: 1013.25,
-                gas_ohm: 50_000.0,
-                iaq_score: 85.0,
-                iaq_text: "Air quality is Good".to_string(),
-                dew_point_c: 9.5,
-                heat_index_c: 22.0,
-                altitude_m: 500.0,
-            },
-        })
+    fn record(route: &CompiledRoute, topic: &str, device_id: &str) -> TelemetryRecord {
+        TelemetryRecord {
+            route_id: route.id().to_owned(),
+            device_id: device_id.to_owned(),
+            measurement: route.config().measurement.clone(),
+            timestamp_ms: 1_700_000_000_000,
+            tags: BTreeMap::from([("device_id".to_owned(), device_id.to_owned())]),
+            fields: BTreeMap::from([
+                ("mqtt_retained".to_owned(), TelemetryValue::Boolean(false)),
+                ("temp_c".to_owned(), TelemetryValue::Float(22.5)),
+            ]),
+            source_topic: topic.to_owned(),
+            retained: false,
+        }
     }
 
-    fn status_message() -> HandledMessage {
-        HandledMessage::Status(StatusMessage {
-            device_id: "esp32-1".to_string(),
-            device_class: "esp32p4-bme680".to_string(),
-            fw_version: "1.0.0".to_string(),
-            ip: "192.168.1.42".to_string(),
-            rssi: -65,
-            time_ms: 1_700_000_000_000,
-            time_iso: "2023-11-14T22:13:20Z".to_string(),
-            time_valid: true,
-            uptime: 3600,
-            free_mem: 200_000,
-            ssid: "HomeNet".to_string(),
-            queued: None,
-            dropped_total: None,
-            samples_failed_total: None,
-            mqtt_connects_total: None,
-            sensor_read_failures_total: None,
-            reset_reason: None,
-        })
-    }
-
-    fn ctx_with_message(handled: HandledMessage) -> PipelineContext {
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
-        ctx.set_handled_message(handled);
+    fn context(route: Arc<CompiledRoute>, topic: &str, device_id: &str) -> PipelineContext {
+        let mut ctx = PipelineContext::new_with_metadata(topic, vec![], RECEIVED_AT_MS, false);
+        ctx.set_route(route.clone());
+        ctx.set_telemetry_record(record(&route, topic, device_id));
         ctx
     }
 
     #[tokio::test]
-    async fn run_on_sensor_message_returns_continue() {
-        let cache = cache();
-        let stage = CacheUpdateStage::new(cache);
-        let mut ctx = ctx_with_message(sensor_message("esp32-1", 22.5));
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
-    }
-
-    #[tokio::test]
-    async fn run_on_status_message_returns_continue() {
-        let cache = cache();
-        let stage = CacheUpdateStage::new(cache);
-        let mut ctx = ctx_with_message(status_message());
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
-    }
-
-    #[tokio::test]
-    async fn run_without_handled_message_returns_error() {
-        let cache = cache();
-        let stage = CacheUpdateStage::new(cache);
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(result.is_err());
-        assert!(!ctx.should_publish_dlq());
-    }
-
-    #[tokio::test]
-    async fn run_stores_sensor_data_in_cache_retrievable_by_device_id() {
-        let cache = cache();
+    async fn run_caches_typed_record_with_frozen_receive_time_and_broadcasts() -> Result<()> {
+        let (_routes, route) = route(TOPIC)?;
+        let cache = CacheState::new(60_000, 16);
+        let mut receiver = cache.subscribe_events();
         let stage = CacheUpdateStage::new(cache.clone());
-        let mut ctx = ctx_with_message(sensor_message("esp32-1", 22.5));
+        let mut ctx = context(route, TOPIC, "ESP32-1");
 
-        stage.run(&mut ctx).await.unwrap();
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Continue));
 
-        let (state, _stale) = cache.snapshot_sensor("esp32-1").expect("device not found");
-        assert!((state.value.temp_c - 22.5).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn run_normalizes_device_id_to_lowercase_in_cache() {
-        let cache = cache();
-        let stage = CacheUpdateStage::new(cache.clone());
-        let mut ctx = ctx_with_message(sensor_message("ESP32-1", 20.0));
-
-        stage.run(&mut ctx).await.unwrap();
-
-        assert!(
-            cache.snapshot_sensor("esp32-1").is_some(),
-            "device not found under lowercased key"
+        let (state, _) = cache
+            .snapshot_device("esp32-1")
+            .context("device state should be cached")?;
+        assert_eq!(state.last_seen_ms, RECEIVED_AT_MS as u64);
+        assert_eq!(
+            state.value.get("temp_c"),
+            Some(&TelemetryValue::Float(22.5))
         );
+        let CacheEvent::Telemetry {
+            device_id,
+            last_seen_ms,
+            ..
+        } = receiver.try_recv()?;
+        assert_eq!(device_id, "esp32-1");
+        assert_eq!(last_seen_ms, RECEIVED_AT_MS as u64);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_overwrites_previous_sensor_data_on_second_update() {
-        let cache = cache();
+    async fn run_skips_routes_without_cache_opt_in() -> Result<()> {
+        let topic = "smarthome/ESP32-1/status";
+        let (_routes, route) = route(topic)?;
+        let cache = CacheState::new(60_000, 16);
+        let mut receiver = cache.subscribe_events();
         let stage = CacheUpdateStage::new(cache.clone());
+        let mut ctx = context(route, topic, "ESP32-1");
 
-        let mut ctx1 = ctx_with_message(sensor_message("esp32-1", 20.0));
-        stage.run(&mut ctx1).await.unwrap();
-
-        let mut ctx2 = ctx_with_message(sensor_message("esp32-1", 30.0));
-        stage.run(&mut ctx2).await.unwrap();
-
-        let (state, _stale) = cache.snapshot_sensor("esp32-1").unwrap();
-        assert!(
-            (state.value.temp_c - 30.0).abs() < f64::EPSILON,
-            "expected second temp value"
-        );
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Continue));
+        assert!(cache.snapshot_all_devices().is_empty());
+        assert!(receiver.try_recv().is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_stores_multiple_devices_independently() {
-        let cache = cache();
-        let stage = CacheUpdateStage::new(cache.clone());
+    async fn run_without_selected_route_returns_error() {
+        let cache = CacheState::new(60_000, 16);
+        let stage = CacheUpdateStage::new(cache);
+        let mut ctx = PipelineContext::new(TOPIC, vec![]);
 
-        let mut ctx_a = ctx_with_message(sensor_message("esp32-a", 21.0));
-        let mut ctx_b = ctx_with_message(sensor_message("esp32-b", 25.0));
-
-        stage.run(&mut ctx_a).await.unwrap();
-        stage.run(&mut ctx_b).await.unwrap();
-
-        let all = cache.snapshot_all_sensors();
-        assert_eq!(all.len(), 2, "expected two separate cache entries");
-    }
-
-    #[tokio::test]
-    async fn run_on_status_message_does_not_insert_into_sensor_cache() {
-        let cache = cache();
-        let stage = CacheUpdateStage::new(cache.clone());
-        let mut ctx = ctx_with_message(status_message());
-
-        stage.run(&mut ctx).await.unwrap();
-
-        assert!(
-            cache.snapshot_all_sensors().is_empty(),
-            "status message must not write to sensor cache"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_broadcasts_cache_event_for_sensor_update() {
-        let cache = cache();
-        let mut rx = cache.subscribe_events();
-        let stage = CacheUpdateStage::new(cache.clone());
-        let mut ctx = ctx_with_message(sensor_message("esp32-1", 22.5));
-
-        stage.run(&mut ctx).await.unwrap();
-
-        let event = rx.try_recv().expect("expected a broadcast event");
-        match event {
-            crate::infrastructure::cache::state::CacheEvent::Sensor { device_id, .. } => {
-                assert_eq!(device_id, "esp32-1");
-            }
-        }
+        assert!(stage.run(&mut ctx).await.is_err());
+        assert!(!ctx.should_publish_dlq());
     }
 }

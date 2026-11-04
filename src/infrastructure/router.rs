@@ -1,115 +1,39 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
-use chrono::DateTime;
 use serde_json::Value;
 
-use crate::config::routes::{DeviceIdSource, RouteBundle};
-use crate::infrastructure::schema::{load_schema_resources, CompiledSchema, JsonSchema};
-use crate::model::messages::message::{HandledMessage, MessageType};
-use crate::model::messages::sensor::SensorMessage;
-use crate::model::messages::status::StatusMessage;
-use crate::model::topic::{MqttTopicFilter, TopicPattern};
-
-/// A single route combining pattern matching, schema validation, and expected message type.
-pub struct Route {
-    pub message_type: MessageType,
-    pattern: TopicPattern,
-    schema: JsonSchema,
-}
-
-impl Route {
-    pub fn new(message_type: MessageType, schema_str: &str, topic_pattern: &str) -> Result<Self> {
-        Ok(Self {
-            message_type,
-            pattern: TopicPattern::new(topic_pattern)?,
-            schema: JsonSchema::new(schema_str)?,
-        })
-    }
-
-    pub fn matches(&self, topic: &str) -> bool {
-        self.pattern.matches(topic)
-    }
-
-    pub fn validate_raw(
-        &self,
-        topic: &str,
-        payload: &Value,
-        enforce_topic_device_match: bool,
-    ) -> Result<MessageType> {
-        self.schema
-            .validate(payload)
-            .context("schema validation failed")?;
-
-        self.validate_time_iso_rfc3339(payload)?;
-
-        if enforce_topic_device_match {
-            self.enforce_topic_payload_device_match(topic, payload)?;
-        }
-
-        Ok(self.message_type)
-    }
-
-    pub fn deserialize(&self, topic: &str, payload: Value) -> Result<HandledMessage> {
-        match self.message_type {
-            MessageType::Sensor => {
-                let msg: SensorMessage = serde_json::from_value(payload)
-                    .with_context(|| format!("sensor: deserialization failed (topic={})", topic))?;
-                Ok(HandledMessage::Sensor(msg))
-            }
-            MessageType::Status => {
-                let msg: StatusMessage = serde_json::from_value(payload)
-                    .with_context(|| format!("status: deserialization failed (topic={})", topic))?;
-                Ok(HandledMessage::Status(msg))
-            }
-        }
-    }
-
-    fn validate_time_iso_rfc3339(&self, v: &Value) -> Result<()> {
-        if let Some(s) = v.get("time_iso").and_then(|x| x.as_str()) {
-            DateTime::parse_from_rfc3339(s)
-                .with_context(|| format!("time_iso not RFC3339: {}", s))?;
-        }
-        Ok(())
-    }
-
-    fn enforce_topic_payload_device_match(&self, topic: &str, payload: &Value) -> Result<()> {
-        let topic_dev = self
-            .pattern
-            .device_id_from_topic(topic)
-            .context("Failed to extract device_id from topic")?;
-
-        let payload_dev = payload
-            .get("device_id")
-            .and_then(|x| x.as_str())
-            .context("Failed to extract device_id from payload")?;
-
-        if topic_dev != payload_dev {
-            bail!(
-                "device_id mismatch: topic has '{}', payload has '{}'",
-                topic_dev,
-                payload_dev
-            );
-        }
-
-        Ok(())
-    }
-}
+use crate::calculations::CalculationRegistry;
+use crate::config::routes::{DeviceIdSource, FieldType, RouteBundle, RouteConfig};
+use crate::infrastructure::schema::{load_schema_resources, CompiledSchema};
+use crate::model::topic::MqttTopicFilter;
 
 /// An immutable route with schemas and topic filters compiled at startup.
-#[allow(dead_code)]
 pub struct CompiledRoute {
-    id: String,
+    config: RouteConfig,
+    metric_label: Arc<str>,
     topic_filter: MqttTopicFilter,
     raw_schema: CompiledSchema,
     output_schema: Option<CompiledSchema>,
-    topic_segment_index: Option<usize>,
+    calculations: CalculationRegistry,
 }
 
-#[allow(dead_code)]
 impl CompiledRoute {
     /// Returns this route's configured identifier.
     #[must_use]
     pub fn id(&self) -> &str {
-        &self.id
+        &self.config.id
+    }
+
+    pub(crate) fn metric_label(&self) -> Arc<str> {
+        Arc::clone(&self.metric_label)
+    }
+
+    /// Returns the complete validated route configuration.
+    #[must_use]
+    pub fn config(&self) -> &RouteConfig {
+        &self.config
     }
 
     /// Returns the exact configured topic filter used for subscription.
@@ -124,6 +48,12 @@ impl CompiledRoute {
         self.output_schema.as_ref()
     }
 
+    /// Returns this route's calculations resolved against its field mappings.
+    #[must_use]
+    pub fn calculations(&self) -> &CalculationRegistry {
+        &self.calculations
+    }
+
     /// Validates a raw payload against this route's compiled schema.
     ///
     /// # Errors
@@ -132,30 +62,13 @@ impl CompiledRoute {
     pub fn validate_raw(&self, payload: &Value) -> Result<()> {
         self.raw_schema.validate(payload)
     }
-
-    /// Extracts the configured device identity topic segment.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the route has no topic-segment identity or the topic does not
-    /// match this route / lacks the configured segment.
-    pub fn topic_segment_identity<'a>(&self, topic: &'a str) -> Result<&'a str> {
-        let index = self
-            .topic_segment_index
-            .with_context(|| format!("route '{}' has no topic-segment device identity", self.id))?;
-        self.topic_filter
-            .topic_segment(topic, index)
-            .with_context(|| format!("extracting device identity for route '{}'", self.id))
-    }
 }
 
 /// A compiled set of nonoverlapping routes and their exact broker subscriptions.
-#[allow(dead_code)]
 pub struct RouteSet {
-    routes: Vec<CompiledRoute>,
+    routes: Vec<Arc<CompiledRoute>>,
 }
 
-#[allow(dead_code)]
 impl RouteSet {
     /// Compiles a validated route bundle and rejects DLQ feedback subscriptions.
     ///
@@ -178,8 +91,28 @@ impl RouteSet {
 
         let mut compiled_filters = Vec::with_capacity(bundle.routes.len());
         for route in &bundle.routes {
+            route
+                .validate_static()
+                .with_context(|| format!("route '{}' is invalid", route.id))?;
+            if compiled_filters
+                .iter()
+                .any(|(id, _): &(String, MqttTopicFilter)| id == &route.id)
+            {
+                bail!("duplicate route id '{}'", route.id);
+            }
             let filter = MqttTopicFilter::new(&route.topic)
                 .with_context(|| format!("route '{}' has an invalid topic filter", route.id))?;
+            let device_id_segment = match &route.device_id {
+                DeviceIdSource::TopicSegment(config) => Some(config.topic_segment),
+                DeviceIdSource::PointerAndTopicSegment(config) => Some(config.topic_segment),
+                DeviceIdSource::Fixed(_) | DeviceIdSource::Pointer(_) => None,
+            };
+            if device_id_segment.is_some_and(|index| !filter.has_fixed_segment(index)) {
+                bail!(
+                    "route '{}' device identity topic_segment must reference a fixed topic level",
+                    route.id
+                );
+            }
             if filter.matches(dlq_topic) {
                 bail!("route '{}' subscribes to the DLQ destination", route.id);
             }
@@ -200,11 +133,30 @@ impl RouteSet {
         }
 
         let schema_resources = load_schema_resources("route bundle", &bundle.schema_resources)?;
+        let mut field_types = HashMap::new();
         let routes = bundle
             .routes
             .into_iter()
             .zip(compiled_filters)
             .map(|(route, (_, topic_filter))| {
+                let calculations = CalculationRegistry::resolve(&route.calculations, &route.fields)
+                    .with_context(|| format!("route '{}' calculations are invalid", route.id))?;
+                for (field, mapping) in &route.fields {
+                    register_field_type(&mut field_types, &route, field, mapping.field_type)?;
+                }
+                register_field_type(
+                    &mut field_types,
+                    &route,
+                    "mqtt_retained",
+                    FieldType::Boolean,
+                )?;
+                for (field, field_type) in calculations.output_field_types() {
+                    if route.tags.contains_key(field) {
+                        bail!("calculation output '{field}' collides with a telemetry tag");
+                    }
+                    register_field_type(&mut field_types, &route, field, field_type)?;
+                }
+
                 let raw_schema = CompiledSchema::compile_with_resources(
                     &route.id,
                     &route.schema,
@@ -217,18 +169,20 @@ impl RouteSet {
                         CompiledSchema::compile_with_resources(&route.id, path, &schema_resources)
                     })
                     .transpose()?;
-                let topic_segment_index = match route.device_id {
-                    DeviceIdSource::TopicSegment(source) => Some(source.topic_segment),
-                    DeviceIdSource::PointerAndTopicSegment(source) => Some(source.topic_segment),
-                    DeviceIdSource::Fixed(_) | DeviceIdSource::Pointer(_) => None,
+                // metrics-exporter-prometheus 0.18.1 treats backslash pairs as already escaped.
+                let metric_label = if route.id.contains('\\') {
+                    Arc::from(route.id.replace('\\', "\\\\"))
+                } else {
+                    Arc::from(route.id.as_str())
                 };
-                Ok(CompiledRoute {
-                    id: route.id,
+                Ok(Arc::new(CompiledRoute {
+                    config: route,
+                    metric_label,
                     topic_filter,
                     raw_schema,
                     output_schema,
-                    topic_segment_index,
-                })
+                    calculations,
+                }))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -237,10 +191,11 @@ impl RouteSet {
 
     /// Selects the compiled route matching a topic, if any.
     #[must_use]
-    pub fn select(&self, topic: &str) -> Option<&CompiledRoute> {
+    pub fn select(&self, topic: &str) -> Option<Arc<CompiledRoute>> {
         self.routes
             .iter()
             .find(|route| route.topic_filter.matches(topic))
+            .cloned()
     }
 
     /// Returns broker subscriptions in route order and exact configured spelling.
@@ -248,85 +203,42 @@ impl RouteSet {
     pub fn subscriptions(&self) -> Vec<&str> {
         self.routes
             .iter()
-            .map(CompiledRoute::topic_filter)
+            .map(|route| route.topic_filter())
             .collect()
     }
-}
 
-/// Holds configured routes and dispatches incoming messages.
-pub struct Router {
-    routes: Vec<Route>,
-    strict: bool,
-}
-
-impl Default for Router {
-    fn default() -> Self {
-        Self::new()
+    pub(crate) fn metric_labels(&self) -> impl Iterator<Item = Arc<str>> + '_ {
+        self.routes.iter().map(|route| route.metric_label())
     }
 }
 
-impl Router {
-    pub fn new() -> Self {
-        Self {
-            routes: Vec::new(),
-            strict: true,
+fn register_field_type(
+    field_types: &mut HashMap<(String, String), (FieldType, String)>,
+    route: &RouteConfig,
+    field: &str,
+    field_type: FieldType,
+) -> Result<()> {
+    let key = (route.measurement.clone(), field.to_owned());
+    if let Some((existing_type, existing_route)) = field_types.get(&key) {
+        if *existing_type != field_type {
+            bail!(
+                "routes '{}' and '{}' declare incompatible types for field '{}' in measurement '{}'",
+                existing_route,
+                route.id,
+                field,
+                route.measurement
+            );
         }
+    } else {
+        field_types.insert(key, (field_type, route.id.clone()));
     }
 
-    pub fn strict(mut self, strict: bool) -> Self {
-        self.strict = strict;
-        self
-    }
-
-    pub fn add_route(mut self, route: Route) -> Self {
-        self.routes.push(route);
-        self
-    }
-
-    fn find_route(&self, topic: &str) -> Option<&Route> {
-        self.routes.iter().find(|r| r.matches(topic))
-    }
-
-    pub fn message_type_for_topic(&self, topic: &str) -> Option<MessageType> {
-        self.find_route(topic).map(|r| r.message_type)
-    }
-
-    pub fn validate_raw(
-        &self,
-        topic: &str,
-        payload: &Value,
-        enforce_topic_device_match: bool,
-    ) -> Result<Option<MessageType>> {
-        if let Some(route) = self.find_route(topic) {
-            return Ok(Some(route.validate_raw(
-                topic,
-                payload,
-                enforce_topic_device_match,
-            )?));
-        }
-
-        if self.strict {
-            bail!("No route registered for topic: {}", topic);
-        }
-
-        Ok(None)
-    }
-
-    pub fn deserialize(&self, topic: &str, payload: Value) -> Result<Option<HandledMessage>> {
-        if let Some(route) = self.find_route(topic) {
-            return Ok(Some(route.deserialize(topic, payload)?));
-        }
-
-        if self.strict {
-            bail!("No route registered for topic: {}", topic);
-        }
-
-        Ok(None)
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod configured_route_tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use serde_json::json;
@@ -334,6 +246,7 @@ mod configured_route_tests {
 
     use super::*;
     use crate::config::routes::RouteBundle;
+    use crate::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
 
     const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
 
@@ -350,7 +263,7 @@ mod configured_route_tests {
             "device_id": {"pointer": "/device_id", "topic_segment": 1},
             "measurement": id,
             "fields": {
-                "device_id": {"pointer": "/device_id", "type": "string"}
+                "reading": {"pointer": "/reading", "type": "string"}
             },
             "timestamp": {"source": "received_at"}
         })
@@ -449,10 +362,6 @@ mod configured_route_tests {
         assert_eq!(status.id(), "status");
         assert!(routes.select("smarthome/lab/other").is_none());
         assert_eq!(routes.subscriptions(), [sensor_filter, status_filter]);
-        assert_eq!(
-            sensor.topic_segment_identity("smarthome/lab/sensor")?,
-            "lab"
-        );
         sensor.validate_raw(&json!({
             "device_id": "lab",
             "time_iso": "2026-11-01T00:00:00Z"
@@ -473,6 +382,124 @@ mod configured_route_tests {
     }
 
     #[test]
+    fn test_configured_route_retains_mapping_and_resolved_calculations() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+
+        let mut configured = route("sensor", "home/+/sensor", &schema_path);
+        configured["fields"] = json!({
+            "temp_c": {"pointer": "/temp_c", "type": "float"},
+            "rel_hum_perc": {"pointer": "/rel_hum_perc", "type": "float"}
+        });
+        configured["calculations"] = json!(["dew_point"]);
+        let routes = RouteSet::compile(bundle(vec![configured])?, "home/dlq")?;
+        let compiled = routes
+            .select("home/lab/sensor")
+            .context("configured route should match")?;
+
+        assert_eq!(compiled.config().measurement, "sensor");
+        assert_eq!(compiled.config().fields.len(), 2);
+
+        let record = TelemetryRecord {
+            route_id: "sensor".to_owned(),
+            device_id: "lab".to_owned(),
+            measurement: "sensor".to_owned(),
+            timestamp_ms: 1_700_000_000_000,
+            tags: BTreeMap::from([("device_id".to_owned(), "lab".to_owned())]),
+            fields: BTreeMap::from([
+                ("temp_c".to_owned(), TelemetryValue::Float(21.0)),
+                ("rel_hum_perc".to_owned(), TelemetryValue::Float(45.0)),
+                ("mqtt_retained".to_owned(), TelemetryValue::Boolean(false)),
+            ]),
+            source_topic: "home/lab/sensor".to_owned(),
+            retained: false,
+        };
+        let calculated = compiled.calculations().apply(record)?;
+
+        assert!(calculated.fields.contains_key("dew_point_c"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_route_set_rejects_cross_route_field_type_conflicts() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+
+        let mut calculated = route("calculated", "home/+/sensor", &schema_path);
+        calculated["measurement"] = json!("shared_measurement");
+        calculated["fields"] = json!({
+            "temp_c": {"pointer": "/temp_c", "type": "float"},
+            "rel_hum_perc": {"pointer": "/rel_hum_perc", "type": "float"}
+        });
+        calculated["calculations"] = json!(["dew_point"]);
+
+        let mut mapped = route("mapped", "home/+/status", &schema_path);
+        mapped["measurement"] = json!("shared_measurement");
+        mapped["fields"] = json!({
+            "dew_point_c": {"pointer": "/dew_point_c", "type": "integer"}
+        });
+
+        let error = match RouteSet::compile(bundle(vec![calculated, mapped])?, "home/dlq") {
+            Ok(_) => anyhow::bail!("conflicting field types must fail compilation"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+
+        assert!(message.contains("dew_point_c"));
+        assert!(message.contains("calculated"));
+        assert!(message.contains("mapped"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_route_set_rejects_tag_and_calculated_field_collision() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+
+        let mut configured = route("sensor", "home/+/sensor", &schema_path);
+        configured["tags"] = json!({"dew_point_c": "fixed"});
+        configured["fields"] = json!({
+            "temp_c": {"pointer": "/temp_c", "type": "float"},
+            "rel_hum_perc": {"pointer": "/rel_hum_perc", "type": "float"}
+        });
+        configured["calculations"] = json!(["dew_point"]);
+
+        assert!(RouteSet::compile(bundle(vec![configured])?, "home/dlq").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_route_set_rejects_duplicate_route_ids() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+        let routes = bundle(vec![
+            route("duplicate", "home/+/sensor", &schema_path),
+            route("duplicate", "home/+/status", &schema_path),
+        ])?;
+
+        assert!(RouteSet::compile(routes, "home/dlq").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_route_rejects_device_identity_from_multi_level_wildcard() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+
+        let variable_suffix = bundle(vec![route("suffix", "example/#", &schema_path)])?;
+        assert!(RouteSet::compile(variable_suffix, "dlq/topic").is_err());
+
+        let fixed_segment = bundle(vec![route("fixed", "example/+/status/#", &schema_path)])?;
+        assert!(RouteSet::compile(fixed_segment, "other/dlq").is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn test_configured_route_set_rejects_overlaps_and_dlq_feedback() -> Result<()> {
         let directory = tempdir()?;
         let schema_path = directory.path().join("route.json");
@@ -489,23 +516,6 @@ mod configured_route_tests {
 
         let wildcard_dlq = bundle(vec![route("sensor", "home/sensor", &schema_path)])?;
         assert!(RouteSet::compile(wildcard_dlq, "home/+").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn test_configured_route_set_reports_missing_identity_segment() -> Result<()> {
-        let directory = tempdir()?;
-        let schema_path = directory.path().join("route.json");
-        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
-        let mut configured_route = route("sensor", "home/+/sensor", &schema_path);
-        configured_route["device_id"]["topic_segment"] = json!(8);
-        let routes = RouteSet::compile(bundle(vec![configured_route])?, "home/dlq")?;
-        let selected = routes
-            .select("home/lab/sensor")
-            .context("sensor route should match")?;
-
-        assert!(selected.topic_segment_identity("home/lab/sensor").is_err());
-        assert!(selected.topic_segment_identity("home//sensor").is_err());
         Ok(())
     }
 }

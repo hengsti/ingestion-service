@@ -3,7 +3,24 @@ use std::io::Read;
 
 use crate::infrastructure::wal::types::WalEvent;
 
-const MAX_WAL_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_WAL_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
+const WAL_EVENT_FIXED_BYTES: usize = 24;
+const WAL_FRAME_HEADER_BYTES: usize = 4;
+
+pub(crate) fn wal_record_frame_size(topic_bytes: usize, payload_bytes: usize) -> Result<usize> {
+    let body_bytes = WAL_EVENT_FIXED_BYTES
+        .checked_add(topic_bytes)
+        .and_then(|size| size.checked_add(payload_bytes))
+        .context("WAL record size estimate overflowed")?;
+    if body_bytes > MAX_WAL_RECORD_PAYLOAD_BYTES {
+        return Err(anyhow!(
+            "WAL record body size {body_bytes} exceeds max {MAX_WAL_RECORD_PAYLOAD_BYTES} bytes"
+        ));
+    }
+    body_bytes
+        .checked_add(WAL_FRAME_HEADER_BYTES)
+        .context("WAL frame size estimate overflowed")
+}
 
 /// Outcome of attempting to decode a WAL record.
 pub enum DecodeOutcome {
@@ -149,6 +166,22 @@ fn discard_bytes<R: Read>(r: &mut R, mut remaining: usize) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::infrastructure::wal::types::WalEvent;
+
+    #[test]
+    fn wal_record_size_estimate_matches_bincode_frame() -> Result<()> {
+        let event = WalEvent {
+            topic: "topic".to_owned(),
+            ts_ms: 123,
+            payload: "line".to_owned(),
+        };
+        let expected = bincode::serialized_size(&event)? as usize + WAL_FRAME_HEADER_BYTES;
+
+        assert_eq!(
+            wal_record_frame_size(event.topic.len(), event.payload.len())?,
+            expected
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_encode() {

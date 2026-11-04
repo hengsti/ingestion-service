@@ -14,7 +14,7 @@
     "sensors": [
       {
         "device_id": "esp32-1",
-        "stale": false,
+        "stale": true,
         "last_seen_ms": 1700000000456,
         "value": {
           "temp_c": 22.5,
@@ -25,7 +25,8 @@
           "heat_index_c": 21.98055555555555,
           "iaq_score": 97.91666666666666,
           "iaq_text": "Air quality is Good",
-          "altitude_m": 500.0
+          "altitude_m": 500.0,
+          "mqtt_retained": false
         }
       }
     ]
@@ -34,7 +35,7 @@
     "ttl_ms": 60000,
     "device_id": "esp32-1",
     "sensor": {
-      "stale": false,
+      "stale": true,
       "last_seen_ms": 1700000000456,
       "value": {
         "temp_c": 22.5,
@@ -45,7 +46,8 @@
         "heat_index_c": 21.98055555555555,
         "iaq_score": 97.91666666666666,
         "iaq_text": "Air quality is Good",
-        "altitude_m": 500.0
+        "altitude_m": 500.0,
+        "mqtt_retained": false
       }
     }
   },
@@ -64,7 +66,8 @@
         "heat_index_c": 21.98055555555555,
         "iaq_score": 97.91666666666666,
         "iaq_text": "Air quality is Good",
-        "altitude_m": 500.0
+        "altitude_m": 500.0,
+        "mqtt_retained": false
       }
     }
   }

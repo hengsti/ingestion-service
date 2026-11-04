@@ -1,424 +1,387 @@
 mod common;
 
-use smarthome_ingest::{
-    infrastructure::cache::state::CacheState,
-    pipeline::{
-        context::PipelineContext,
-        runner::PipelineRunner,
-        stages::{
-            cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
-            observe::ObserveStage, persist::PersistStage, transform::TransformStage,
-            validate_business::ValidateBusinessStage, validate_raw::ValidateRawStage,
-        },
+use std::{
+    fs,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
     },
 };
 
-const SENSOR_SCHEMA: &str = include_str!("../config/schemas/sensor.schema.json");
-const STATUS_SCHEMA: &str = include_str!("../config/schemas/status.schema.json");
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+use smarthome_ingest::{
+    config::routes::{self, RouteBundle},
+    infrastructure::{router::RouteSet, sink::Encoder},
+    model::messages::telemetry::{TelemetryRecord, TelemetryValue},
+    pipeline::context::PipelineContext,
+};
 
-// ── happy-path tests ─────────────────────────────────────────────────────────
+const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
 
 #[tokio::test]
-async fn valid_sensor_message_processes_end_to_end() {
+async fn configured_firmware_sensor_persists_and_caches_frozen_metadata() -> Result<()> {
     let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;
-    let mut ctx = PipelineContext::new(
-        "smarthome/esp32-1/sensor",
+    let topic = "smarthome/esp32-1/bme680";
+    let received_at_ms = 1_700_000_000_456;
+    let mut ctx = PipelineContext::new_with_metadata(
+        topic,
         common::valid_sensor_payload("esp32-1"),
+        received_at_ms,
+        true,
     );
 
     pipeline.run(&mut ctx).await;
 
-    assert!(
-        !ctx.should_publish_dlq(),
-        "expected no DLQ, got: {:?}",
-        ctx.dlq_reason()
-    );
-    assert!(ctx.ignored_reason().is_none(), "expected not ignored");
-
+    assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
     let event = common::recv_event(&mut sub, 500)
         .await
-        .expect("expected a sensor event in the WAL");
-    assert_eq!(event.topic, "smarthome/esp32-1/sensor");
-    assert!(
-        event.payload.contains("bme680"),
-        "expected a sensor line protocol, got: {:?}",
-        event.payload
-    );
-    assert!(event.payload.contains("iaq_score="), "{}", event.payload);
-    for field in ["boot_id=", "seq=", "warmed_up=", "replayed="] {
-        assert!(
-            !event.payload.contains(field),
-            "legacy sensor line must not contain {field}: {:?}",
-            event.payload
-        );
-    }
-
-    assert!(
-        cache.snapshot_sensor("esp32-1").is_some(),
-        "sensor must be present in cache after processing"
-    );
-}
-
-#[tokio::test]
-async fn derived_sensor_fields_reach_influx_with_warmup_suppression() {
-    for warmed_up in [None, Some(true), Some(false)] {
-        let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-        let mut payload: serde_json::Value =
-            serde_json::from_slice(&common::valid_sensor_payload("esp32-1")).unwrap();
-        payload["data"]["temp_c"] = serde_json::json!(20.0);
-        payload["data"]["rel_hum_perc"] = serde_json::json!(50.0);
-        if let Some(warmed_up) = warmed_up {
-            payload["warmed_up"] = serde_json::json!(warmed_up);
-        }
-        let mut ctx = PipelineContext::new(
-            "smarthome/esp32-1/sensor",
-            serde_json::to_vec(&payload).unwrap(),
-        );
-
-        pipeline.run(&mut ctx).await;
-
-        assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
-        let event = common::recv_event(&mut sub, 500)
-            .await
-            .expect("expected a sensor event in the WAL");
-        let (measurement_and_tags, fields_and_time) = event.payload.split_once(' ').unwrap();
-        for (key, expected) in [("dew_point_c", 9.27), ("heat_index_c", 19.36)] {
-            let prefix = format!("{key}=");
-            let value: f64 = fields_and_time
-                .split(',')
-                .find_map(|field| field.strip_prefix(&prefix))
-                .unwrap_or_else(|| panic!("missing {key}: {}", event.payload))
-                .parse()
-                .unwrap();
-            assert!((value - expected).abs() < 0.05, "{key}={value}");
-        }
-        if warmed_up == Some(false) {
-            for key in ["iaq_score=", "iaq_text="] {
-                assert!(!fields_and_time.contains(key), "{}", event.payload);
-            }
-        } else {
-            // At 50 %RH and 50 kΩ: 20.83 humidity points + 75 gas points.
-            assert!(
-                fields_and_time.contains("iaq_score=95.83"),
-                "{}",
-                event.payload
-            );
-            assert!(
-                fields_and_time.contains("iaq_text=\"Air quality is Good\""),
-                "{}",
-                event.payload
-            );
-        }
-        for key in ["dew_point_c=", "heat_index_c=", "iaq_score=", "iaq_text="] {
-            assert!(!measurement_and_tags.contains(key), "{}", event.payload);
-        }
-    }
-}
-
-#[tokio::test]
-async fn sensor_reading_metadata_reaches_influx_fields() {
-    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    let mut payload: serde_json::Value =
-        serde_json::from_slice(&common::valid_sensor_payload("esp32-1")).unwrap();
-    payload["boot_id"] = serde_json::json!(u32::MAX);
-    payload["seq"] = serde_json::json!(42);
-    payload["warmed_up"] = serde_json::json!(false);
-    payload["replayed"] = serde_json::json!(true);
-    let mut ctx = PipelineContext::new(
-        "smarthome/esp32-1/sensor",
-        serde_json::to_vec(&payload).unwrap(),
-    );
-
-    pipeline.run(&mut ctx).await;
-
-    assert!(
-        !ctx.should_publish_dlq(),
-        "expected no DLQ, got: {:?}",
-        ctx.dlq_reason()
-    );
-    let event = common::recv_event(&mut sub, 500)
-        .await
-        .expect("expected a sensor event in the WAL");
+        .expect("configured route should persist to WAL");
     assert!(event.payload.starts_with("bme680,"), "{}", event.payload);
-    let (measurement_and_tags, fields_and_time) = event.payload.split_once(' ').unwrap();
-    for field in [
-        "boot_id=4294967295u",
-        "seq=42u",
-        "warmed_up=false",
-        "replayed=true",
-        "firmware_version=\"1.0.0\"",
-    ] {
-        assert!(
-            fields_and_time.contains(field),
-            "sensor line missing {field}: {:?}",
-            event.payload
-        );
-    }
-    for tag in ["boot_id=", "seq=", "warmed_up=", "replayed=", "fw_version="] {
-        assert!(!measurement_and_tags.contains(tag), "{}", event.payload);
-    }
-    for dropped in ["iaq_score=", "iaq_text=", "altitude_m="] {
-        assert!(!event.payload.contains(dropped), "{}", event.payload);
-    }
-}
-
-#[tokio::test]
-async fn valid_status_message_processes_end_to_end() {
-    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    let mut ctx = PipelineContext::new(
-        "smarthome/esp32-1/status",
-        common::valid_status_payload("esp32-1"),
-    );
-
-    pipeline.run(&mut ctx).await;
-
+    assert!(event.payload.contains("altitude_m="), "{}", event.payload);
     assert!(
-        !ctx.should_publish_dlq(),
-        "expected no DLQ, got: {:?}",
-        ctx.dlq_reason()
-    );
-
-    let event = common::recv_event(&mut sub, 500)
-        .await
-        .expect("expected a status event in the WAL");
-    assert!(
-        event.payload.contains("device_status"),
-        "expected a status line protocol, got: {:?}",
+        event.payload.contains("mqtt_retained=true"),
+        "{}",
         event.payload
     );
-    for field in [
-        "queued=",
-        "dropped_total=",
-        "samples_failed_total=",
-        "mqtt_connects_total=",
-        "sensor_read_failures_total=",
-        "reset_reason=",
-    ] {
-        assert!(
-            !event.payload.contains(field),
-            "legacy status line must not contain {field}: {:?}",
-            event.payload
-        );
-    }
+    assert!(
+        event.payload.ends_with(" 1700000000000"),
+        "{}",
+        event.payload
+    );
+    let (state, _) = cache
+        .snapshot_device("esp32-1")
+        .expect("cache-enabled route should update state");
+    assert_eq!(state.last_seen_ms, received_at_ms as u64);
+    assert_eq!(
+        state.value.get("temp_c"),
+        Some(&TelemetryValue::Float(22.5))
+    );
+    Ok(())
+}
+
+fn synthetic_zigbee_routes(
+    directory: &std::path::Path,
+    alternate_config: bool,
+) -> Result<Arc<RouteSet>> {
+    let raw_schema_path = directory.join("zigbee-raw.json");
+    let output_schema_path = directory.join("zigbee-output.json");
+    let (raw_schema, output_schema, route) = if alternate_config {
+        (
+            json!({
+                "$schema": DRAFT_7,
+                "type": "object",
+                "required": ["device_id", "temperature", "humidity", "online"],
+                "properties": {
+                    "device_id": {"type": "string"},
+                    "temperature": {"type": "number"},
+                    "humidity": {"type": "number"},
+                    "battery_pct": {"type": "number"},
+                    "online": {"type": "boolean"}
+                }
+            }),
+            json!({
+                "$schema": DRAFT_7,
+                "type": "object",
+                "properties": {
+                    "fields": {
+                        "type": "object",
+                        "required": ["battery_pct", "heat_index_c", "mqtt_retained"]
+                    }
+                }
+            }),
+            json!({
+                "id": "zigbee-room-alternate",
+                "topic": "zigbee/+/telemetry",
+                "schema": raw_schema_path,
+                "output_schema": output_schema_path,
+                "device_id": {"pointer": "/device_id", "topic_segment": 1},
+                "measurement": "zigbee_room_alternate",
+                "tags": {"source": "zigbee"},
+                "fields": {
+                    "temp_c": {"pointer": "/temperature", "type": "float"},
+                    "rel_hum_perc": {"pointer": "/humidity", "type": "float"},
+                    "battery_pct": {
+                        "pointer": "/battery_pct",
+                        "type": "float",
+                        "optional": true
+                    },
+                    "online": {"pointer": "/online", "type": "boolean"}
+                },
+                "timestamp": {"source": "received_at"},
+                "calculations": ["heat_index"],
+                "cache": false
+            }),
+        )
+    } else {
+        (
+            json!({
+            "$schema": DRAFT_7,
+            "type": "object",
+            "required": ["device_id", "temp_c", "rel_hum_perc", "online"],
+            "properties": {
+                "device_id": {"type": "string"},
+                "temp_c": {"type": "number"},
+                "rel_hum_perc": {"type": "number"},
+                "online": {"type": "boolean"}
+            }
+            }),
+            json!({
+            "$schema": DRAFT_7,
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "object",
+                    "required": ["dew_point_c", "mqtt_retained", "online"]
+                }
+            }
+            }),
+            json!({
+                "id": "zigbee-room",
+                "topic": "zigbee/+/telemetry",
+                "schema": raw_schema_path,
+                "output_schema": output_schema_path,
+                "device_id": {"pointer": "/device_id", "topic_segment": 1},
+                "measurement": "zigbee_room",
+                "tags": {"source": "zigbee"},
+                "fields": {
+                    "temp_c": {"pointer": "/temp_c", "type": "float"},
+                    "rel_hum_perc": {"pointer": "/rel_hum_perc", "type": "float"},
+                    "online": {"pointer": "/online", "type": "boolean"}
+                },
+                "timestamp": {"source": "received_at"},
+                "calculations": ["dew_point"],
+                "cache": false
+            }),
+        )
+    };
+    fs::write(&raw_schema_path, serde_json::to_vec(&raw_schema)?)?;
+    fs::write(&output_schema_path, serde_json::to_vec(&output_schema)?)?;
+    let bundle: RouteBundle = serde_json::from_value(json!({
+        "version": 1,
+        "schema_resources": {},
+        "routes": [route]
+    }))?;
+    Ok(Arc::new(RouteSet::compile(bundle, "zigbee/dlq")?))
 }
 
 #[tokio::test]
-async fn status_health_metadata_reaches_influx_fields() {
-    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    let mut payload: serde_json::Value =
-        serde_json::from_slice(&common::valid_status_payload("esp32-1")).unwrap();
-    payload["queued"] = serde_json::json!(0);
-    payload["dropped_total"] = serde_json::json!(2);
-    payload["samples_failed_total"] = serde_json::json!(3);
-    payload["mqtt_connects_total"] = serde_json::json!(4);
-    payload["sensor_read_failures_total"] = serde_json::json!(5);
-    payload["reset_reason"] = serde_json::json!("brownout");
-    let mut ctx = PipelineContext::new(
-        "smarthome/esp32-1/status",
-        serde_json::to_vec(&payload).unwrap(),
+async fn arbitrary_topic_uses_configured_mapping_calculation_and_output_schema() -> Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let routes = synthetic_zigbee_routes(config_dir.path(), false)?;
+    let (pipeline, mut sub, cache, _wal_dir) = common::build_pipeline_with_routes(routes).await;
+    let topic = "zigbee/room-1/telemetry";
+    let received_at_ms = 1_700_000_000_456;
+    let payload: Value = json!({
+        "device_id": "room-1",
+        "temp_c": 20.0,
+        "rel_hum_perc": 50.0,
+        "online": true
+    });
+    let mut ctx = PipelineContext::new_with_metadata(
+        topic,
+        serde_json::to_vec(&payload)?,
+        received_at_ms,
+        true,
     );
 
     pipeline.run(&mut ctx).await;
 
-    assert!(
-        !ctx.should_publish_dlq(),
-        "expected no DLQ, got: {:?}",
-        ctx.dlq_reason()
-    );
+    assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
     let event = common::recv_event(&mut sub, 500)
         .await
-        .expect("expected a status event in the WAL");
-    let (measurement_and_tags, fields_and_time) = event.payload.split_once(' ').unwrap();
-    assert!(measurement_and_tags.starts_with("device_status,"));
-    for field in [
-        "queued=0i",
-        "dropped_total=2i",
-        "samples_failed_total=3i",
-        "mqtt_connects_total=4i",
-        "sensor_read_failures_total=5i",
-        "reset_reason=\"brownout\"",
-        "firmware_version=",
-        "ip_address=",
-    ] {
-        assert!(
-            fields_and_time.contains(field),
-            "status line missing {field}: {:?}",
-            event.payload
-        );
-    }
-    assert!(!event.payload.contains("time_iso="), "{}", event.payload);
-    for tag in [
-        "queued=",
-        "dropped_total=",
-        "samples_failed_total=",
-        "mqtt_connects_total=",
-        "sensor_read_failures_total=",
-        "reset_reason=",
-        "fw_version=",
-        "ip=",
-    ] {
-        assert!(!measurement_and_tags.contains(tag), "{}", event.payload);
-    }
+        .expect("arbitrary-topic configured route should persist to WAL");
+    assert!(
+        event
+            .payload
+            .starts_with("zigbee_room,device_id=room-1,source=zigbee "),
+        "{}",
+        event.payload
+    );
+    assert!(
+        event.payload.contains("dew_point_c=9.254294282076941"),
+        "{}",
+        event.payload
+    );
+    assert!(
+        event.payload.contains("mqtt_retained=true"),
+        "{}",
+        event.payload
+    );
+    assert!(
+        event.payload.ends_with(" 1700000000456"),
+        "{}",
+        event.payload
+    );
+    assert!(
+        cache.snapshot_all_devices().is_empty(),
+        "cache-disabled route must not update state"
+    );
+    Ok(())
 }
 
-// ── failure paths → DLQ ──────────────────────────────────────────────────────
+#[tokio::test]
+async fn alternate_route_config_changes_schema_mapping_calculation_and_output() -> Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let routes = synthetic_zigbee_routes(config_dir.path(), true)?;
+    let (pipeline, mut sub, _cache, _wal_dir) = common::build_pipeline_with_routes(routes).await;
+    let topic = "zigbee/room-1/telemetry";
+
+    let old_payload: Value = json!({
+        "device_id": "room-1",
+        "temp_c": 20.0,
+        "rel_hum_perc": 50.0,
+        "online": true
+    });
+    let mut invalid_ctx = PipelineContext::new_with_metadata(
+        topic,
+        serde_json::to_vec(&old_payload)?,
+        1_700_000_000_456,
+        false,
+    );
+    pipeline.run(&mut invalid_ctx).await;
+    assert!(
+        invalid_ctx.should_publish_dlq(),
+        "alternate raw schema must apply"
+    );
+    assert!(common::recv_event(&mut sub, 100).await.is_none());
+
+    let missing_field_payload: Value = json!({
+        "device_id": "room-1",
+        "temperature": 20.0,
+        "humidity": 50.0,
+        "online": true
+    });
+    let mut invalid_output_ctx = PipelineContext::new_with_metadata(
+        topic,
+        serde_json::to_vec(&missing_field_payload)?,
+        1_700_000_000_456,
+        false,
+    );
+    pipeline.run(&mut invalid_output_ctx).await;
+    assert!(
+        invalid_output_ctx.should_publish_dlq(),
+        "alternate output schema must require battery_pct"
+    );
+    assert!(common::recv_event(&mut sub, 100).await.is_none());
+
+    let payload: Value = json!({
+        "device_id": "room-1",
+        "temperature": 20.0,
+        "humidity": 50.0,
+        "battery_pct": 85.0,
+        "online": true
+    });
+    let mut ctx = PipelineContext::new_with_metadata(
+        topic,
+        serde_json::to_vec(&payload)?,
+        1_700_000_000_456,
+        false,
+    );
+    pipeline.run(&mut ctx).await;
+    assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
+    let event = common::recv_event(&mut sub, 500)
+        .await
+        .context("alternate configured route should persist to WAL")?;
+    assert!(
+        event
+            .payload
+            .starts_with("zigbee_room_alternate,device_id=room-1,source=zigbee "),
+        "{}",
+        event.payload
+    );
+    assert!(
+        event.payload.contains("battery_pct=85"),
+        "{}",
+        event.payload
+    );
+    assert!(event.payload.contains("heat_index_c="), "{}", event.payload);
+    assert!(!event.payload.contains("dew_point_c="), "{}", event.payload);
+    assert!(
+        event.payload.ends_with(" 1700000000456"),
+        "{}",
+        event.payload
+    );
+    Ok(())
+}
 
 #[tokio::test]
-async fn schema_invalid_payload_goes_to_dlq() {
+async fn valid_timestamp_zero_is_rejected_before_wal_persistence() -> Result<()> {
     let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    // Valid envelope but missing required `data` field → raw schema validation fails.
-    let payload = serde_json::json!({
-        "device_id": "esp32-1",
-        "room": "living_room",
-        "device_class": "cls",
-        "fw_version": "1.0",
-        "time_ms": 0,
-        "time_iso": "2024-01-01T00:00:00Z",
-        "time_valid": true
-    })
-    .to_string()
-    .into_bytes();
-    let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", payload);
+    let mut payload: Value = serde_json::from_slice(&common::valid_sensor_payload("esp32-1"))?;
+    payload["time_ms"] = json!(0);
+    payload["time_valid"] = json!(true);
+    let mut ctx = PipelineContext::new_with_metadata(
+        "smarthome/esp32-1/bme680",
+        serde_json::to_vec(&payload)?,
+        1_700_000_000_456,
+        false,
+    );
 
     pipeline.run(&mut ctx).await;
 
+    assert!(ctx.should_publish_dlq());
     assert!(
-        ctx.should_publish_dlq(),
-        "expected DLQ for schema-invalid payload"
+        common::recv_event(&mut sub, 100).await.is_none(),
+        "invalid output must not reach the WAL"
     );
-    assert!(
-        common::recv_event(&mut sub, 150).await.is_none(),
-        "WAL must be empty when pipeline fails"
-    );
+    Ok(())
 }
 
 #[tokio::test]
-async fn transform_failure_goes_to_dlq() {
+async fn oversized_payload_is_rejected_before_json_decoding() -> Result<()> {
     let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    // rel_hum_perc: 0 violates the transform stage's (0, 100] bounds check.
-    let payload = serde_json::json!({
-        "device_id": "esp32-1",
-        "room": "living_room",
-        "device_class": "esp32p4-bme680",
-        "fw_version": "1.0.0",
-        "time_ms": 1_700_000_000_000_i64,
-        "time_iso": "2023-11-14T22:13:20Z",
-        "time_valid": true,
-        "data": {
-            "temp_c": 22.5,
-            "rel_hum_perc": 0.0,
-            "pressure_hpa": 1013.25,
-            "gas_ohm": 50_000.0,
-            "altitude_m": 500.0
+    let mut ctx = PipelineContext::new("smarthome/esp32-1/bme680", vec![b'x'; 64 * 1024 + 1]);
+
+    pipeline.run(&mut ctx).await;
+
+    assert!(ctx.should_publish_dlq());
+    assert!(ctx.dlq_reason().unwrap_or("").contains("too large"));
+    assert!(common::recv_event(&mut sub, 100).await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_encoded_output_is_rejected_before_cache_update() -> Result<()> {
+    struct OversizedEncoder(Arc<AtomicBool>);
+
+    impl Encoder for OversizedEncoder {
+        fn encoded_size_upper_bound(&self, _record: &TelemetryRecord) -> usize {
+            1024 * 1024
         }
-    })
-    .to_string()
-    .into_bytes();
-    let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", payload);
 
-    pipeline.run(&mut ctx).await;
+        fn encode(&self, _record: &TelemetryRecord, out: &mut String) {
+            self.0.store(true, Ordering::Relaxed);
+            out.push_str(&"x".repeat(1024 * 1024));
+        }
+    }
 
-    assert!(
-        ctx.should_publish_dlq(),
-        "expected DLQ when transform bounds check fails"
-    );
-    assert!(
-        common::recv_event(&mut sub, 150).await.is_none(),
-        "WAL must be empty when pipeline fails"
-    );
-}
-
-#[tokio::test]
-async fn oversized_payload_goes_to_dlq() {
-    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    let payload = vec![b'x'; 64 * 1024 + 1];
-    let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", payload);
-
-    pipeline.run(&mut ctx).await;
-
-    assert!(
-        ctx.should_publish_dlq(),
-        "expected DLQ for oversized payload"
-    );
-    assert!(
-        ctx.dlq_reason().unwrap_or("").contains("too large"),
-        "DLQ reason should mention size: {:?}",
-        ctx.dlq_reason()
-    );
-    assert!(
-        common::recv_event(&mut sub, 150).await.is_none(),
-        "WAL must be empty when pipeline fails"
-    );
-}
-
-// ── routing: strict vs. non-strict ───────────────────────────────────────────
-
-#[tokio::test]
-async fn unknown_topic_strict_mode_goes_to_dlq() {
-    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    let mut ctx = PipelineContext::new(
-        "smarthome/unknown/foo",
-        common::valid_sensor_payload("unknown"),
+    let routes = Arc::new(RouteSet::compile(
+        routes::load("config/routes.json")?,
+        "smarthome/_dlq/ingest",
+    )?);
+    let called = Arc::new(AtomicBool::new(false));
+    let encoder = Arc::new(OversizedEncoder(called.clone()));
+    let (pipeline, mut sub, cache, _tmp) =
+        common::build_pipeline_with_routes_and_encoder(routes, encoder).await;
+    let mut ctx = PipelineContext::new_with_metadata(
+        "smarthome/esp32-1/bme680",
+        common::valid_sensor_payload("esp32-1"),
+        1_700_000_000_456,
+        false,
     );
 
     pipeline.run(&mut ctx).await;
 
     assert!(
         ctx.should_publish_dlq(),
-        "expected DLQ for unknown topic in strict mode"
+        "oversized output must be rejected"
     );
     assert!(
-        common::recv_event(&mut sub, 150).await.is_none(),
-        "WAL must be empty"
+        !called.load(Ordering::Relaxed),
+        "must reject before encoding"
     );
-}
-
-#[tokio::test]
-async fn unknown_topic_non_strict_mode_is_ignored() {
-    let router = common::build_non_strict_router();
-    let cache = CacheState::new(60_000, 64);
-    let (wal, mut sub, _tmp) = common::open_temp_wal().await;
-    let non_strict_router_clone = router.clone();
-
-    let pipeline = PipelineRunner::new()
-        .add_stage(DecodeStage::new())
-        .add_stage(ValidateRawStage::new(router, false))
-        .add_stage(TransformStage::new(non_strict_router_clone))
-        .add_stage(ValidateBusinessStage::new().unwrap())
-        .add_stage(CacheUpdateStage::new(cache))
-        .add_stage(PersistStage::new(wal, common::influx_encoder()))
-        .add_stage(ObserveStage::new())
-        .with_failure_stage(DlqPublishStage::new(
-            common::dlq_publisher(),
-            "smarthome/_dlq/ingest",
-        ));
-
-    let mut ctx = PipelineContext::new(
-        "smarthome/unknown/foo",
-        common::valid_sensor_payload("unknown"),
-    );
-
-    pipeline.run(&mut ctx).await;
-
-    assert!(
-        ctx.ignored_reason().is_some(),
-        "expected ignored for unknown topic in non-strict mode"
-    );
-    assert!(
-        !ctx.should_publish_dlq(),
-        "expected no DLQ in non-strict mode"
-    );
-    assert!(
-        common::recv_event(&mut sub, 150).await.is_none(),
-        "WAL must be empty for ignored message"
-    );
-}
-
-// Helper to verify schemas are accessible from the test binary —
-// these consts are used in build_pipeline (via common), so include them to
-// confirm the path is correct at compile time.
-#[allow(dead_code)]
-fn _assert_schemas_compile() {
-    let _: &str = SENSOR_SCHEMA;
-    let _: &str = STATUS_SCHEMA;
+    assert!(cache.snapshot_device("esp32-1").is_none());
+    assert!(common::recv_event(&mut sub, 100).await.is_none());
+    Ok(())
 }

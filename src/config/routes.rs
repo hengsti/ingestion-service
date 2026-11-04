@@ -6,6 +6,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::model::messages::telemetry::validate_line_text;
+
 /// A versioned collection of configured MQTT routes.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,7 +121,7 @@ pub struct FieldMapping {
 }
 
 /// Scalar types accepted by route field mappings.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
     /// A finite floating-point number.
@@ -236,6 +238,16 @@ impl RouteBundle {
 
 impl RouteConfig {
     fn validate(&mut self, bundle_dir: &Path) -> Result<()> {
+        self.validate_static()?;
+        self.schema = resolve_bundle_path(&self.schema, bundle_dir, "schema")?;
+        if let Some(output_schema) = &mut self.output_schema {
+            *output_schema = resolve_bundle_path(output_schema, bundle_dir, "output_schema")?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_static(&self) -> Result<()> {
         if self.id.is_empty() {
             bail!("route id must not be empty");
         }
@@ -245,25 +257,29 @@ impl RouteConfig {
         if self.measurement.is_empty() {
             bail!("route measurement must not be empty");
         }
+        if self.measurement.starts_with('#') {
+            bail!("route measurement must not start with '#'");
+        }
         if self.fields.is_empty() {
             bail!("route fields must not be empty");
         }
+        validate_line_text(&self.id, "route identifier")?;
+        validate_line_text(&self.topic, "route topic filter")?;
+        validate_line_text(&self.measurement, "measurement")?;
 
         validate_device_id(&self.device_id)?;
         for (key, value) in &self.tags {
             validate_mapping_key(key)?;
             validate_tag_value(value)?;
+            if self.fields.contains_key(key) {
+                bail!("tag and field name '{key}' collides");
+            }
         }
         for (key, mapping) in &self.fields {
             validate_mapping_key(key)?;
             validate_field_mapping(key, mapping)?;
         }
         validate_timestamp(&self.timestamp)?;
-
-        self.schema = resolve_bundle_path(&self.schema, bundle_dir, "schema")?;
-        if let Some(output_schema) = &mut self.output_schema {
-            *output_schema = resolve_bundle_path(output_schema, bundle_dir, "output_schema")?;
-        }
 
         Ok(())
     }
@@ -275,6 +291,7 @@ fn validate_device_id(source: &DeviceIdSource) -> Result<()> {
             if value.is_empty() {
                 bail!("device_id fixed value must not be empty");
             }
+            validate_line_text(value, "device identity")?;
         }
         DeviceIdSource::TopicSegment(_) => {}
         DeviceIdSource::Pointer(config) => {
@@ -288,8 +305,14 @@ fn validate_device_id(source: &DeviceIdSource) -> Result<()> {
 }
 
 fn validate_tag_value(value: &TagValue) -> Result<()> {
-    if let TagValue::Pointer(config) = value {
-        validate_pointer(&config.pointer, "tag pointer")?;
+    match value {
+        TagValue::Static(value) => {
+            if value.is_empty() {
+                bail!("static tag value must not be empty");
+            }
+            validate_line_text(value, "tag value")?;
+        }
+        TagValue::Pointer(config) => validate_pointer(&config.pointer, "tag pointer")?,
     }
     Ok(())
 }
@@ -298,6 +321,7 @@ fn validate_mapping_key(key: &str) -> Result<()> {
     if key.is_empty() {
         bail!("tag and field names must not be empty");
     }
+    validate_line_text(key, "tag or field name")?;
     if matches!(
         key,
         "device_id" | "mqtt_retained" | "_field" | "_measurement" | "time"
@@ -318,6 +342,9 @@ fn validate_field_mapping(key: &str, mapping: &FieldMapping) -> Result<()> {
                 "field '{key}' default must be a scalar matching type {:?}",
                 mapping.field_type
             );
+        }
+        if let Value::String(value) = default {
+            validate_line_text(value, "field default")?;
         }
     }
     Ok(())
@@ -440,7 +467,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<RouteBundle> {
 
 /// Reports deprecated topic-routing environment variable names.
 ///
-/// `MQTT_TOPIC_*` variables ending in `_DLQ` are retained and are not reported.
+/// `MQTT_TOPIC_DLQ` is retained and is not reported.
 ///
 /// This function does not return a `Result`; it returns `None` when no deprecated
 /// variables are present, otherwise a migration message naming them.
@@ -454,7 +481,7 @@ where
         .filter_map(|name| {
             let name = name.as_ref();
             let is_removed = name == "ENFORCE_TOPIC_DEVICE_MATCH"
-                || (name.starts_with("MQTT_TOPIC_") && !name.ends_with("_DLQ"));
+                || (name.starts_with("MQTT_TOPIC_") && name != "MQTT_TOPIC_DLQ");
             is_removed.then(|| name.to_owned())
         })
         .collect();
@@ -662,6 +689,22 @@ mod tests {
         let mut fields = valid_bundle();
         fields["routes"][0]["fields"] = json!({});
         assert!(load_value(&fields).is_err());
+    }
+
+    #[test]
+    fn test_route_config_rejects_measurement_starting_with_comment_marker() {
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["measurement"] = json!("#weather");
+
+        assert!(load_value(&bundle).is_err());
+    }
+
+    #[test]
+    fn test_route_config_rejects_empty_static_tag_value() {
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["tags"] = json!({"source": ""});
+
+        assert!(load_value(&bundle).is_err());
     }
 
     #[test]
@@ -901,6 +944,45 @@ mod tests {
             let mut tag = valid_bundle();
             tag["routes"][0]["tags"][key] = json!("value");
             assert!(load_value(&tag).is_err(), "reserved tag {key}");
+        }
+    }
+
+    #[test]
+    fn test_route_config_rejects_tag_and_field_name_collisions() {
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["tags"] = json!({"temp_c": "temperature"});
+
+        assert!(load_value(&bundle).is_err());
+    }
+
+    #[test]
+    fn test_route_config_rejects_control_characters_in_static_output() {
+        let mut cases = Vec::new();
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["id"] = json!("bad\nroute");
+        cases.push(bundle);
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["measurement"] = json!("bad\nmeasurement");
+        cases.push(bundle);
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["device_id"] = json!("bad\nidentity");
+        cases.push(bundle);
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["tags"] = json!({"bad\nkey": "value"});
+        cases.push(bundle);
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["tags"] = json!({"room": "bad\nvalue"});
+        cases.push(bundle);
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["fields"]["bad\nkey"] = json!({"pointer": "/value", "type": "string"});
+        cases.push(bundle);
+        let mut bundle = valid_bundle();
+        bundle["routes"][0]["fields"]["label"] =
+            json!({"pointer": "/label", "type": "string", "default": "bad\nvalue"});
+        cases.push(bundle);
+
+        for bundle in cases {
+            assert!(load_value(&bundle).is_err(), "accepted invalid static text");
         }
     }
 

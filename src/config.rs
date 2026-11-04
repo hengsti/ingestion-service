@@ -1,11 +1,8 @@
 /// Versioned route-bundle DTOs and the pure configuration loader.
-// The runtime adopts this module only during the atomic route cutover in issue #28.
-#[allow(dead_code)]
 pub mod routes;
 
 use anyhow::{bail, Context, Result};
 use secrecy::SecretString;
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
@@ -101,10 +98,10 @@ pub struct Config {
     pub input_source: InputSourceKind,
     /// Present when `input_source` is [`InputSourceKind::Mqtt`].
     pub mqtt: Option<MqttSourceConfig>,
-    /// Route definitions (message-type suffix → topic/route string), populated
-    /// by whichever input source is active. Today only `Mqtt` populates this,
-    /// scanning `MQTT_TOPIC_*` env vars — see `InputSourceKind::Mqtt` below.
-    pub topic_routes: HashMap<String, String>,
+    /// Path to the configured route bundle.
+    pub routes_file: PathBuf,
+    /// Publish-only destination for invalid messages.
+    pub dlq_topic: String,
     pub output_sink: OutputSinkKind,
     /// Present when `output_sink` is [`OutputSinkKind::Influx`].
     pub influx: Option<InfluxSinkConfig>,
@@ -114,7 +111,6 @@ pub struct Config {
     pub wal_segment_bytes: u64,
     pub wal_queue_capacity: usize,
     pub input_queue_capacity: usize,
-    pub enforce_topic_device_match: bool,
     pub metrics_bind: String,
     pub cache_ttl_ms: u64,
     pub cache_bind: String,
@@ -126,7 +122,8 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("input_source", &self.input_source)
             .field("mqtt", &self.mqtt)
-            .field("topic_routes", &self.topic_routes)
+            .field("routes_file", &self.routes_file)
+            .field("dlq_topic", &self.dlq_topic)
             .field("output_sink", &self.output_sink)
             .field("influx", &self.influx)
             .field("batch_size", &self.batch_size)
@@ -135,10 +132,6 @@ impl fmt::Debug for Config {
             .field("wal_segment_bytes", &self.wal_segment_bytes)
             .field("wal_queue_capacity", &self.wal_queue_capacity)
             .field("input_queue_capacity", &self.input_queue_capacity)
-            .field(
-                "enforce_topic_device_match",
-                &self.enforce_topic_device_match,
-            )
             .field("metrics_bind", &self.metrics_bind)
             .field("cache_ttl_ms", &self.cache_ttl_ms)
             .field("cache_bind", &self.cache_bind)
@@ -149,10 +142,17 @@ impl fmt::Debug for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        if let Some(message) =
+            routes::removed_route_environment_variables(env::vars().map(|(name, _)| name))
+        {
+            bail!("{message}");
+        }
+        let routes_file = required_routes_file(env_var("INGEST_ROUTES_FILE"))?;
+
         let input_source =
             InputSourceKind::parse(&env_var("INPUT_SOURCE").context("INPUT_SOURCE must be set")?)?;
 
-        let (mqtt, topic_routes) = match input_source {
+        let (mqtt, dlq_topic) = match input_source {
             InputSourceKind::Mqtt => {
                 let host =
                     env_var("MQTT_HOST").context("MQTT_HOST is required when INPUT_SOURCE=mqtt")?;
@@ -169,11 +169,7 @@ impl Config {
                 let (clean_session, client_id) =
                     mqtt_session(env_var("MQTT_CLEAN_SESSION"), client_id)?;
 
-                let topic_routes = strip_prefixed(env::vars(), "MQTT_TOPIC_");
-                if topic_routes.is_empty() {
-                    bail!("At least one MQTT_TOPIC_<NAME> environment variable must be set");
-                }
-
+                let dlq_topic = required_dlq_topic(env_var("MQTT_TOPIC_DLQ"))?;
                 (
                     Some(MqttSourceConfig {
                         host,
@@ -183,7 +179,7 @@ impl Config {
                         client_id,
                         clean_session,
                     }),
-                    topic_routes,
+                    dlq_topic,
                 )
             }
         };
@@ -244,11 +240,6 @@ impl Config {
             None => 16_384,
         };
 
-        let enforce_topic_device_match = env_var("ENFORCE_TOPIC_DEVICE_MATCH")
-            .context("ENFORCE_TOPIC_DEVICE_MATCH must be set")?
-            .parse::<bool>()
-            .context("ENFORCE_TOPIC_DEVICE_MATCH must be a valid bool")?;
-
         let metrics_bind = env_var("METRICS_BIND").context("METRICS_BIND must be set")?;
 
         let cache_ttl_ms = env_var("CACHE_TTL_MS")
@@ -266,7 +257,8 @@ impl Config {
         Ok(Self {
             input_source,
             mqtt,
-            topic_routes,
+            routes_file,
+            dlq_topic,
             output_sink,
             influx,
             batch_size,
@@ -275,13 +267,29 @@ impl Config {
             wal_segment_bytes,
             wal_queue_capacity,
             input_queue_capacity,
-            enforce_topic_device_match,
             metrics_bind,
             cache_ttl_ms,
             cache_bind,
             cache_buffer,
         })
     }
+}
+
+fn required_routes_file(value: Option<String>) -> Result<PathBuf> {
+    let value = value.context("INGEST_ROUTES_FILE must be set")?;
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("INGEST_ROUTES_FILE must not be empty");
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn required_dlq_topic(value: Option<String>) -> Result<String> {
+    let value = value.context("MQTT_TOPIC_DLQ must be set")?;
+    if value.trim().is_empty() {
+        bail!("MQTT_TOPIC_DLQ must not be empty");
+    }
+    Ok(value)
 }
 
 fn env_var(k: &str) -> Option<String> {
@@ -301,14 +309,6 @@ fn mqtt_session(clean_session: Option<String>, mut client_id: String) -> Result<
         client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
     }
     Ok((clean_session, client_id))
-}
-
-fn strip_prefixed(
-    vars: impl Iterator<Item = (String, String)>,
-    prefix: &str,
-) -> HashMap<String, String> {
-    vars.filter_map(|(k, v)| k.strip_prefix(prefix).map(|suffix| (suffix.to_string(), v)))
-        .collect()
 }
 
 #[cfg(test)]
@@ -399,30 +399,34 @@ mod tests {
     }
 
     #[test]
-    fn strip_prefixed_extracts_suffix_and_ignores_other_keys() {
-        let vars = vec![
-            (
-                "MQTT_TOPIC_SENSOR".to_string(),
-                "smarthome/+/sensor".to_string(),
-            ),
-            (
-                "MQTT_TOPIC_DLQ".to_string(),
-                "smarthome/_dlq/ingest".to_string(),
-            ),
-            ("MQTT_HOST".to_string(), "mqtt.example.com".to_string()),
-        ];
+    fn test_config_rejects_removed_route_environment() {
+        for name in [
+            "MQTT_TOPIC_SENSOR",
+            "MQTT_TOPIC_STATUS",
+            "MQTT_TOPIC_ZIGBEE",
+            "MQTT_TOPIC_OTHER_DLQ",
+            "ENFORCE_TOPIC_DEVICE_MATCH",
+        ] {
+            let err = routes::removed_route_environment_variables([name])
+                .expect("removed configuration must fail");
 
-        let result = strip_prefixed(vars.into_iter(), "MQTT_TOPIC_");
+            assert!(err.contains(name));
+            assert!(err.contains("INGEST_ROUTES_FILE"));
+        }
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(
-            result.get("SENSOR").map(String::as_str),
-            Some("smarthome/+/sensor")
-        );
-        assert_eq!(
-            result.get("DLQ").map(String::as_str),
-            Some("smarthome/_dlq/ingest")
-        );
-        assert!(!result.contains_key("HOST"));
+        assert!(routes::removed_route_environment_variables(["MQTT_TOPIC_DLQ"]).is_none());
+    }
+
+    #[test]
+    fn test_config_requires_nonempty_routes_file() {
+        for value in [None, Some(String::new()), Some("  ".to_string())] {
+            assert!(required_routes_file(value).is_err());
+        }
+    }
+
+    #[test]
+    fn test_config_requires_dlq_topic() {
+        assert!(required_dlq_topic(None).is_err());
+        assert!(required_dlq_topic(Some(String::new())).is_err());
     }
 }

@@ -1,8 +1,8 @@
 # smarthome-ingest
 
-Performance-focused Rust service for ingesting smart home telemetry from a configurable input source (MQTT today), validating and transforming it, durably staging the active sink payload in a local write-ahead log (WAL), and forwarding batches to the configured output sink (InfluxDB v2 today).
+Performance-focused Rust service for ingesting smart home telemetry from a configurable input source (MQTT today), validating and mapping it through a configured route, durably staging typed sink output in a local write-ahead log (WAL), and forwarding batches to the configured output sink (InfluxDB v2 today).
 
-Invalid messages are published to a DLQ on the active input source (MQTT today). The latest sensor state is exposed through HTTP and Server-Sent Events (SSE), and Prometheus metrics are available for scraping.
+Invalid messages are published to a DLQ on the active input source (MQTT today). Cache-enabled route state is exposed through HTTP and Server-Sent Events (SSE), and Prometheus metrics are available for scraping.
 
 ![CI](https://github.com/hengsti/ingestion-service/actions/workflows/ci.yaml/badge.svg)
 ![CD](https://github.com/hengsti/ingestion-service/actions/workflows/cd.yaml/badge.svg)
@@ -10,28 +10,28 @@ Invalid messages are published to a DLQ on the active input source (MQTT today).
 
 ## What It Does
 
-- Consumes sensor and status payloads via a swappable input source (only MQTT is implemented today, selected with `INPUT_SOURCE`).
-- Validates raw JSON with embedded schemas.
-- Normalizes messages into canonical Rust structs.
-- Computes sensor values such as dew point, heat index, and IAQ.
+- Consumes configured telemetry routes via a swappable input source (only MQTT is implemented today, selected with `INPUT_SOURCE`).
+- Validates raw JSON and normalized records with schemas loaded from the route bundle.
+- Maps publisher payloads into typed telemetry records and applies configured calculations.
 - Writes a pre-rendered wire-format payload to a local WAL via a swappable output sink (only InfluxDB is implemented today, selected with `OUTPUT_SINK`).
 - Retries transient InfluxDB failures without advancing the WAL cursor.
 - Publishes rejected payloads to a DLQ destination on the active input source (an MQTT topic today).
-- Serves latest sensor state over HTTP and SSE.
+- Serves latest state for cache-enabled routes over HTTP and SSE.
 - Exposes Prometheus metrics and structured JSON logs.
 
 ## Architecture
 
 ```mermaid
 graph LR
-    MQTT[Input source: MQTT] --> Q[Bounded worker queues]
+    CFG[Configured route bundle] --> MQTT[Subscriptions + route selection]
+    MQTT --> Q[Bounded worker queues]
     Q --> W[Worker pool]
     W --> P[Pipeline stages]
     P -->|valid| WAL[Write-ahead log]
     P -->|invalid| DLQ[DLQ via input source]
     WAL --> F[WAL forwarder]
     F -->|batched writes| IDB[(InfluxDB v2)]
-    P --> CACHE[Latest sensor cache]
+    P --> CACHE[Latest-state cache]
     CACHE --> HTTP[HTTP + SSE API]
     P --> METRICS[Prometheus metrics]
 ```
@@ -49,9 +49,8 @@ INPUT_SOURCE=mqtt
 MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_CLIENT_ID=smarthome-ingest
-MQTT_TOPIC_SENSOR=smarthome/+/sensor
-MQTT_TOPIC_STATUS=smarthome/+/status
 MQTT_TOPIC_DLQ=smarthome/_dlq/ingest
+INGEST_ROUTES_FILE=./config/routes.json
 OUTPUT_SINK=influx
 INFLUX_URL=http://localhost:8086
 INFLUX_ORG=smarthome
@@ -60,7 +59,6 @@ INFLUX_TOKEN=change-me
 BATCH_SIZE=500
 FLUSH_INTERVAL_MS=1000
 WAL_DIR=./data/wal
-ENFORCE_TOPIC_DEVICE_MATCH=true
 METRICS_BIND=0.0.0.0:9090
 CACHE_BIND=0.0.0.0:8085
 CACHE_TTL_MS=60000
@@ -89,6 +87,7 @@ A complete walkthrough is available in [docs/tutorial.md](docs/tutorial.md).
 For Docker Compose (standalone or in the Server stack), use [`compose.yaml`](compose.yaml). See [docs/operations.md](docs/operations.md#run-with-docker-compose).
 
 The Docker image healthcheck probes `http://localhost:8085/healthz`, so set `CACHE_BIND=0.0.0.0:8085` when running the container.
+The image includes the default route bundle and schemas under `/app/config`.
 
 ```bash
 docker build -t smarthome-ingest .
@@ -102,9 +101,8 @@ docker run --rm \
   -e MQTT_HOST=host.docker.internal \
   -e MQTT_PORT=1883 \
   -e MQTT_CLIENT_ID=smarthome-ingest \
-  -e MQTT_TOPIC_SENSOR=smarthome/+/sensor \
-  -e MQTT_TOPIC_STATUS=smarthome/+/status \
   -e MQTT_TOPIC_DLQ=smarthome/_dlq/ingest \
+  -e INGEST_ROUTES_FILE=/app/config/routes.json \
   -e OUTPUT_SINK=influx \
   -e INFLUX_URL=http://host.docker.internal:8086 \
   -e INFLUX_ORG=smarthome \
@@ -112,13 +110,12 @@ docker run --rm \
   -e INFLUX_TOKEN=change-me \
   -e BATCH_SIZE=500 \
   -e FLUSH_INTERVAL_MS=1000 \
-  -e WAL_DIR=/app/wal \
-  -e ENFORCE_TOPIC_DEVICE_MATCH=true \
+  -e WAL_DIR=/data/wal \
   -e METRICS_BIND=0.0.0.0:9090 \
   -e CACHE_BIND=0.0.0.0:8085 \
   -e CACHE_TTL_MS=60000 \
   -e CACHE_BUFFER=1024 \
-  -v smarthome-ingest-wal:/app/wal \
+  -v smarthome-ingest-wal:/data/wal \
   smarthome-ingest
 ```
 

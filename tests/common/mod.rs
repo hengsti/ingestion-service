@@ -7,9 +7,10 @@ use rumqttc::{AsyncClient, MqttOptions};
 use tempfile::TempDir;
 
 use smarthome_ingest::{
+    config::routes,
     infrastructure::{
         cache::state::CacheState,
-        router::{Route, Router},
+        router::RouteSet,
         sink::{influx::InfluxEncoder, Encoder},
         source::{mqtt::MqttDlqPublisher, DlqPublisher},
         wal::{
@@ -18,36 +19,15 @@ use smarthome_ingest::{
             wal::Wal,
         },
     },
-    model::messages::message::MessageType,
     pipeline::{
         runner::PipelineRunner,
         stages::{
             cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
-            observe::ObserveStage, persist::PersistStage, transform::TransformStage,
-            validate_business::ValidateBusinessStage, validate_raw::ValidateRawStage,
+            observe::ObserveStage, persist::PersistStage, telemetry_mapping::TelemetryMappingStage,
+            validate_output::ValidateOutputStage, validate_raw::ValidateRawStage,
         },
     },
 };
-
-const SENSOR_SCHEMA: &str = include_str!("../../config/schemas/sensor.schema.json");
-const STATUS_SCHEMA: &str = include_str!("../../config/schemas/status.schema.json");
-
-pub fn build_router() -> Arc<Router> {
-    let sensor = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
-    let status = Route::new(MessageType::Status, STATUS_SCHEMA, "smarthome/+/status").unwrap();
-    Arc::new(Router::new().add_route(sensor).add_route(status))
-}
-
-pub fn build_non_strict_router() -> Arc<Router> {
-    let sensor = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
-    let status = Route::new(MessageType::Status, STATUS_SCHEMA, "smarthome/+/status").unwrap();
-    Arc::new(
-        Router::new()
-            .strict(false)
-            .add_route(sensor)
-            .add_route(status),
-    )
-}
 
 /// A client whose internal eventloop is dropped so that publish fails gracefully.
 /// The DLQ stage handles the send error with a warning log and returns Ok(Stop).
@@ -90,17 +70,37 @@ pub fn influx_encoder() -> Arc<dyn Encoder> {
 /// Returns the runner, the WAL subscription (to assert on persisted events),
 /// the cache state, and the backing `TempDir` (keep alive for the test).
 pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
-    let router = build_router();
+    let routes_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/routes.json");
+    let routes = Arc::new(
+        RouteSet::compile(
+            routes::load(routes_path).expect("load configured routes"),
+            "smarthome/_dlq/ingest",
+        )
+        .expect("compile configured routes"),
+    );
+    build_pipeline_with_routes(routes).await
+}
+
+pub async fn build_pipeline_with_routes(
+    routes: Arc<RouteSet>,
+) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
+    build_pipeline_with_routes_and_encoder(routes, influx_encoder()).await
+}
+
+pub async fn build_pipeline_with_routes_and_encoder(
+    routes: Arc<RouteSet>,
+    encoder: Arc<dyn Encoder>,
+) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
     let cache = CacheState::new(60_000, 64);
     let (wal, sub, tmp) = open_temp_wal().await;
 
     let pipeline = PipelineRunner::new()
         .add_stage(DecodeStage::new())
-        .add_stage(ValidateRawStage::new(router.clone(), false))
-        .add_stage(TransformStage::new(router.clone()))
-        .add_stage(ValidateBusinessStage::new().unwrap())
+        .add_stage(ValidateRawStage::new(routes))
+        .add_stage(TelemetryMappingStage::new())
+        .add_stage(ValidateOutputStage::new(encoder.clone()))
         .add_stage(CacheUpdateStage::new(cache.clone()))
-        .add_stage(PersistStage::new(wal, influx_encoder()))
+        .add_stage(PersistStage::new(wal, encoder))
         .add_stage(ObserveStage::new())
         .with_failure_stage(DlqPublishStage::new(
             dlq_publisher(),

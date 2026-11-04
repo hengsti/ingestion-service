@@ -134,7 +134,11 @@ With the current `InfluxSink`, cases to understand are:
 - If InfluxDB is temporarily unavailable, the forwarder holds the batch and does not advance the cursor.
 - If the process crashes before committing a successfully written batch, the batch can be replayed after restart.
 - If InfluxDB returns a permanent 4xx error, except `408` or `429`, the batch remains pending and blocks later writes until the destination or pending output is repaired.
-- If payload timestamps are valid, replayed writes use the same line protocol timestamp. If timestamps are invalid and omitted, replayed writes can create separate points with InfluxDB server time.
+- Every encoded point carries a validated epoch-millisecond timestamp before WAL append.
+  Replayed writes use the same measurement, tag set, fields, and timestamp; InfluxDB merges
+  same-identity writes and may overwrite matching fields. A crash before cursor commit can
+  replay a successful write, so this is not exactly-once delivery and InfluxDB server time
+  is never substituted.
 
 The WAL is not a general event archive. Committed older segments are deleted.
 
