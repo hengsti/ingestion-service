@@ -9,6 +9,7 @@ services:
       - "8085"
     volumes:
       - wal:/data/wal # must match WAL_DIR
+      - quarantine:/data/quarantine # must match QUARANTINE_DIR
       - ./config:/app/config:ro
     environment:
       RUST_LOG: ${RUST_LOG:?set RUST_LOG (e.g. info)}
@@ -38,6 +39,9 @@ services:
 
       # Write-ahead log
       WAL_DIR: /data/wal
+      WAL_MAX_BYTES: ${WAL_MAX_BYTES:?set WAL_MAX_BYTES}
+      QUARANTINE_DIR: /data/quarantine
+      QUARANTINE_MAX_BYTES: ${QUARANTINE_MAX_BYTES:?set QUARANTINE_MAX_BYTES}
 
       # HTTP: cache API (/healthz, /readyz) and Prometheus metrics
       CACHE_BIND: 0.0.0.0:8085
@@ -47,3 +51,4 @@ services:
 
 volumes:
   wal:
+  quarantine:

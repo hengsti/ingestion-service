@@ -57,6 +57,8 @@ jobs:
       INFLUX_ORG: ci
       INFLUX_BUCKET: ci
       INFLUX_TOKEN: ci
+      WAL_MAX_BYTES: "268435456"
+      QUARANTINE_MAX_BYTES: "268435456"
 
     steps:
       - name: Checkout
