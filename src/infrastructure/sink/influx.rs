@@ -9,7 +9,10 @@ use reqwest::{Client, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::infrastructure::{
-    sink::{point::Point, Encoder, Sink, SinkError},
+    sink::{
+        point::{line_protocol_size_upper_bound, Point},
+        Encoder, Sink, SinkError,
+    },
     wal::types::WalEvent,
 };
 use crate::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
@@ -19,6 +22,10 @@ use crate::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
 pub struct InfluxEncoder;
 
 impl Encoder for InfluxEncoder {
+    fn encoded_size_upper_bound(&self, record: &TelemetryRecord) -> usize {
+        line_protocol_size_upper_bound(record)
+    }
+
     fn encode(&self, record: &TelemetryRecord, out: &mut String) {
         telemetry_to_point(record).write_line_protocol(out);
     }
@@ -266,5 +273,72 @@ mod tests {
             r#"weather\,\ station,device_id=dev-1,room\ key=lab\,west bool=false,float=1.5,int=-2i,string="a\\b\"c",uint=3u 1700000000000"#
         );
         assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_telemetry_encoding_appends_unicode_and_escapes_all_delimiters() {
+        let record = TelemetryRecord {
+            route_id: "typed-test".to_owned(),
+            device_id: "dev-1".to_owned(),
+            measurement: r"μ\, =p".to_owned(),
+            timestamp_ms: -12,
+            tags: BTreeMap::from([(r"tag\, =k".to_owned(), r"été\, =v".to_owned())]),
+            fields: BTreeMap::from([(
+                r"f\, =x".to_owned(),
+                TelemetryValue::String(r#"σ\"line"#.to_owned()),
+            )]),
+            source_topic: "home/dev-1/weather".to_owned(),
+            retained: false,
+        };
+        let mut line = "prefix|".to_owned();
+
+        InfluxEncoder.encode(&record, &mut line);
+
+        assert_eq!(
+            line,
+            r#"prefix|μ\\\,\ =p,tag\\\,\ \=k=été\\\,\ \=v f\\\,\ \=x="σ\\\"line" -12"#
+        );
+    }
+
+    #[test]
+    fn test_telemetry_encoding_size_bound_covers_escapes_and_numeric_extremes() {
+        let mut record = TelemetryRecord {
+            route_id: "typed-test".to_owned(),
+            device_id: "dev-1".to_owned(),
+            measurement: "weather, \\station".to_owned(),
+            timestamp_ms: i64::MIN,
+            tags: BTreeMap::from([("tag, =\\".to_owned(), "value, =\\".to_owned())]),
+            fields: BTreeMap::from([("field, =\\".to_owned(), TelemetryValue::Boolean(false))]),
+            source_topic: "home/dev-1/weather".to_owned(),
+            retained: false,
+        };
+
+        for timestamp in [i64::MIN, i64::MAX, -9_223_372_036_854, 0, 9_223_372_036_854] {
+            record.timestamp_ms = timestamp;
+            let mut out = "prefix".to_owned();
+            InfluxEncoder.encode(&record, &mut out);
+            assert!(
+                out.len() - "prefix".len() <= InfluxEncoder.encoded_size_upper_bound(&record),
+                "encoded size exceeded its bound for timestamp {timestamp}"
+            );
+        }
+
+        record.fields.extend([
+            ("float_min".to_owned(), TelemetryValue::Float(f64::MIN)),
+            ("float_max".to_owned(), TelemetryValue::Float(f64::MAX)),
+            (
+                "float_small".to_owned(),
+                TelemetryValue::Float(f64::from_bits(1)),
+            ),
+            ("int_min".to_owned(), TelemetryValue::Integer(i64::MIN)),
+            ("uint_max".to_owned(), TelemetryValue::Unsigned(u64::MAX)),
+            (
+                "string".to_owned(),
+                TelemetryValue::String("\\quoted\"".to_owned()),
+            ),
+        ]);
+        let mut out = String::new();
+        InfluxEncoder.encode(&record, &mut out);
+        assert!(out.len() <= InfluxEncoder.encoded_size_upper_bound(&record));
     }
 }

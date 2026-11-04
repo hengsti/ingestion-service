@@ -4,7 +4,7 @@ use std::fmt::Write;
 use crate::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
 
 const FLOAT_DISPLAY_UPPER_BOUND_BYTES: usize = 400;
-const MAX_INFLUX_TIMESTAMP_TEXT_BYTES: usize = 14;
+const MAX_INFLUX_TIMESTAMP_TEXT_BYTES: usize = 20;
 const MEASUREMENT_ESCAPES: &[u8] = b"\\, ";
 const KEY_VALUE_ESCAPES: &[u8] = b"\\,= ";
 const STRING_ESCAPES: &[u8] = b"\\\"";
@@ -51,7 +51,6 @@ fn field_value_size_upper_bound(value: &TelemetryValue) -> usize {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum FieldValue {
     Float(f64),
@@ -79,17 +78,15 @@ impl Point {
         }
     }
 
-    /// Appends this point's InfluxDB line protocol to `out` without allocating
-    /// an intermediate per-point `String`. Used by the sink to build one batch
-    /// body buffer across many points.
+    /// Appends this point's InfluxDB line protocol to `out` without temporary strings.
     pub fn write_line_protocol(&self, out: &mut String) {
-        out.push_str(&esc_measurement(&self.measurement));
+        write_escaped(out, &self.measurement, MEASUREMENT_ESCAPES);
 
         for (k, v) in &self.tags {
             out.push(',');
-            out.push_str(&esc_tag_key(k));
+            write_escaped(out, k, KEY_VALUE_ESCAPES);
             out.push('=');
-            out.push_str(&esc_tag_value(v));
+            write_escaped(out, v, KEY_VALUE_ESCAPES);
         }
 
         out.push(' ');
@@ -97,9 +94,27 @@ impl Point {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(&esc_field_key(k));
+            write_escaped(out, k, KEY_VALUE_ESCAPES);
             out.push('=');
-            out.push_str(&format_field_value(v));
+            match v {
+                FieldValue::Float(value) => {
+                    let _ = write!(out, "{value}");
+                }
+                FieldValue::Int(value) => {
+                    let _ = write!(out, "{value}i");
+                }
+                FieldValue::UInt(value) => {
+                    let _ = write!(out, "{value}u");
+                }
+                FieldValue::Bool(value) => {
+                    out.push_str(if *value { "true" } else { "false" });
+                }
+                FieldValue::Str(value) => {
+                    out.push('"');
+                    write_escaped(out, value, STRING_ESCAPES);
+                    out.push('"');
+                }
+            }
         }
 
         if let Some(ts) = self.timestamp_ms {
@@ -144,7 +159,6 @@ impl PointBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn field_u64(mut self, key: &str, value: u64) -> Self {
         self.fields.push((key.to_string(), FieldValue::UInt(value)));
         self
@@ -183,48 +197,15 @@ impl PointBuilder {
     }
 }
 
-// Escaping helpers for Influx line protocol.
-
-fn esc_measurement(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace(',', "\\,")
-        .replace(' ', "\\ ")
-}
-
-fn esc_tag_key(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace(',', "\\,")
-        .replace('=', "\\=")
-        .replace(' ', "\\ ")
-}
-
-fn esc_tag_value(s: &str) -> String {
-    esc_tag_key(s)
-}
-
-fn esc_field_key(s: &str) -> String {
-    esc_tag_key(s)
-}
-
-fn esc_string_field(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn format_field_value(v: &FieldValue) -> String {
-    match v {
-        FieldValue::Float(x) => {
-            // Rust's default float formatting is valid Influx line protocol.
-            format!("{}", x)
+fn write_escaped(out: &mut String, value: &str, escaped: &[u8]) {
+    // Escapable bytes are ASCII, so their indices are UTF-8 boundaries.
+    let mut start = 0;
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped.contains(&byte) {
+            out.push_str(&value[start..index]);
+            out.push('\\');
+            start = index;
         }
-        FieldValue::Int(x) => format!("{}i", x),
-        FieldValue::UInt(x) => format!("{}u", x),
-        FieldValue::Bool(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        FieldValue::Str(s) => format!("\"{}\"", esc_string_field(s)),
     }
+    out.push_str(&value[start..]);
 }

@@ -62,9 +62,15 @@ pub trait Sink: Send + Sync {
 /// Implementations must not block or perform I/O — this runs on the pipeline's
 /// hot path, once per message, before the WAL append.
 pub trait Encoder: Send + Sync {
-    /// Appends the encoded payload for `message` to `out`. `out` is reused
-    /// across calls by `PersistStage` to avoid a per-message allocation
-    /// (mirrors `Point::write_line_protocol`'s existing convention).
+    /// Returns an allocation-free upper bound for the encoded payload size.
+    ///
+    /// The bound must cover every byte that `encode` appends for this record,
+    /// including escaping. Saturate to `usize::MAX` if its size would overflow.
+    /// Validation uses this bound before caching or encoding; persistence also
+    /// checks the actual encoded size before the WAL append.
+    fn encoded_size_upper_bound(&self, record: &TelemetryRecord) -> usize;
+
+    /// Appends the encoded payload for `record` to `out`.
     fn encode(&self, record: &TelemetryRecord, out: &mut String);
 }
 
