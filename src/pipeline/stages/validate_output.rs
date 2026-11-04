@@ -1,18 +1,15 @@
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde_json::to_value;
 
 use crate::{
-    config::routes::{CalculationName, FieldType},
-    infrastructure::{
-        router::CompiledRoute,
-        sink::point::line_protocol_size_upper_bound,
-        wal::codec::{wal_record_frame_size, MAX_WAL_RECORD_PAYLOAD_BYTES},
-    },
-    model::messages::telemetry::{TelemetryRecord, TelemetryValue},
+    calculations::output_can_be_omitted,
+    config::routes::FieldType,
+    infrastructure::{router::CompiledRoute, sink::Encoder, wal::codec::wal_record_frame_size},
+    model::messages::telemetry::{validate_line_text, TelemetryRecord, TelemetryValue},
     pipeline::{
         context::PipelineContext,
         stage::{PipelineStage, StageFlow, StageResult},
@@ -21,13 +18,14 @@ use crate::{
 };
 
 /// Validates the normalized configured record before it reaches persistence.
-#[derive(Default)]
-pub struct ValidateOutputStage;
+pub struct ValidateOutputStage {
+    encoder: Arc<dyn Encoder>,
+}
 
 impl ValidateOutputStage {
     /// Creates the normalized output validator.
-    pub fn new() -> Self {
-        Self
+    pub fn new(encoder: Arc<dyn Encoder>) -> Self {
+        Self { encoder }
     }
 }
 
@@ -46,6 +44,7 @@ impl PipelineStage for ValidateOutputStage {
                 ctx.telemetry_record()?,
                 ctx.topic(),
                 ctx.retained(),
+                self.encoder.as_ref(),
             )?;
             Ok(StageFlow::Continue)
         })
@@ -57,6 +56,7 @@ fn validate_record(
     record: &TelemetryRecord,
     topic: &str,
     retained: bool,
+    encoder: &dyn Encoder,
 ) -> Result<()> {
     let route_config = route.config();
     if record.route_id != route.id() || record.measurement != route_config.measurement {
@@ -95,70 +95,45 @@ fn validate_record(
         bail!("telemetry record tag and field keys must not collide");
     }
 
-    let allowed_tags: BTreeSet<&str> = route_config
-        .tags
-        .keys()
-        .map(String::as_str)
-        .chain(std::iter::once("device_id"))
-        .collect();
-    if record.tags.len() != allowed_tags.len()
+    if record.tags.len() != route_config.tags.len() + 1
         || record
             .tags
             .keys()
-            .any(|key| !allowed_tags.contains(key.as_str()))
+            .any(|key| key != "device_id" && !route_config.tags.contains_key(key.as_str()))
     {
         bail!("telemetry record tags do not match the selected route");
     }
-    let mut allowed_fields = BTreeSet::from(["mqtt_retained"]);
     for (key, mapping) in &route_config.fields {
-        allowed_fields.insert(key.as_str());
         match record.fields.get(key) {
-            Some(value) if field_type_matches(value, &mapping.field_type) => {}
+            Some(value) if field_type_matches(value, mapping.field_type) => {}
             Some(_) => bail!("field '{key}' does not match its configured scalar type"),
             None if !mapping.optional => bail!("required configured field '{key}' is missing"),
             None => {}
         }
     }
     for (key, field_type) in route.calculations().output_field_types() {
-        allowed_fields.insert(key);
-        let is_optional_iaq_field = matches!(key, "iaq_score" | "iaq_text")
-            && route
-                .config()
-                .calculations
-                .iter()
-                .any(|calculation| matches!(calculation, CalculationName::Iaq));
         match record.fields.get(key) {
-            Some(value) if field_type_matches(value, &field_type) => {}
+            Some(value) if field_type_matches(value, field_type) => {}
             Some(_) => bail!("calculated field '{key}' does not match its configured type"),
-            None if !is_optional_iaq_field => bail!("calculated field '{key}' is missing"),
-            None => {}
+            None if output_can_be_omitted(key, record) => {}
+            None => bail!("calculated field '{key}' is missing"),
         }
     }
-    if record
-        .fields
-        .keys()
-        .any(|key| !allowed_fields.contains(key.as_str()))
-    {
+    if record.fields.keys().any(|key| {
+        key != "mqtt_retained"
+            && !route_config.fields.contains_key(key.as_str())
+            && !route
+                .calculations()
+                .output_field_types()
+                .any(|(field, _)| field == key)
+    }) {
         bail!("telemetry record contains a field not configured by its route");
     }
-    for (key, value) in &record.tags {
-        if matches!(
-            key.as_str(),
-            "_field" | "_measurement" | "time" | "mqtt_retained"
-        ) {
-            bail!("reserved key '{key}' cannot be used as a telemetry tag");
-        }
-        validate_line_text(key, "tag key")?;
+
+    for value in record.tags.values() {
         validate_line_text(value, "tag value")?;
     }
-    for (key, value) in &record.fields {
-        if matches!(
-            key.as_str(),
-            "_field" | "_measurement" | "time" | "device_id"
-        ) {
-            bail!("reserved key '{key}' cannot be used as a telemetry field");
-        }
-        validate_line_text(key, "field key")?;
+    for value in record.fields.values() {
         if let TelemetryValue::String(value) = value {
             validate_line_text(value, "string field")?;
         }
@@ -168,23 +143,11 @@ fn validate_record(
             }
         }
     }
-    validate_line_text(&record.measurement, "measurement")?;
-    validate_line_text(&record.device_id, "device identity")?;
-    validate_line_text(&record.route_id, "route identifier")?;
     validate_line_text(&record.source_topic, "source topic")?;
 
-    let line_bytes = line_protocol_size_upper_bound(record);
+    let line_bytes = encoder.encoded_size_upper_bound(record);
     wal_record_frame_size(topic.len(), line_bytes)
         .context("rendered telemetry exceeds the WAL reader record limit")?;
-    let schema_size = line_bytes
-        .saturating_add(record.route_id.len())
-        .saturating_add(record.device_id.len())
-        .saturating_add(record.source_topic.len())
-        .saturating_add(256)
-        .saturating_add(4usize.saturating_mul(record.tags.len() + record.fields.len()));
-    if schema_size > MAX_WAL_RECORD_PAYLOAD_BYTES {
-        bail!("normalized telemetry exceeds the WAL-compatible validation size limit");
-    }
 
     if let Some(schema) = route.output_schema() {
         schema.validate(&to_value(record).context("serializing normalized telemetry")?)?;
@@ -193,7 +156,7 @@ fn validate_record(
     Ok(())
 }
 
-fn field_type_matches(value: &TelemetryValue, field_type: &FieldType) -> bool {
+fn field_type_matches(value: &TelemetryValue, field_type: FieldType) -> bool {
     matches!(
         (value, field_type),
         (TelemetryValue::Float(_), FieldType::Float)
@@ -204,13 +167,6 @@ fn field_type_matches(value: &TelemetryValue, field_type: &FieldType) -> bool {
     )
 }
 
-fn validate_line_text(value: &str, label: &str) -> Result<()> {
-    if value.chars().any(char::is_control) {
-        bail!("{label} must not contain control characters");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, fs, sync::Arc};
@@ -219,18 +175,28 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::*;
     use crate::{
         config::routes::RouteBundle,
         infrastructure::{
             router::{CompiledRoute, RouteSet},
+            sink::influx::InfluxEncoder,
             wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES,
         },
         model::messages::telemetry::{TelemetryRecord, TelemetryValue},
+        pipeline::{context::PipelineContext, stage::PipelineStage},
     };
 
     const TOPIC: &str = "home/device-1/sensor";
     const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
+
+    fn validate_record(
+        route: &CompiledRoute,
+        record: &TelemetryRecord,
+        topic: &str,
+        retained: bool,
+    ) -> Result<()> {
+        super::validate_record(route, record, topic, retained, &InfluxEncoder)
+    }
 
     fn test_case() -> Result<(TempDir, Arc<RouteSet>, Arc<CompiledRoute>, TelemetryRecord)> {
         test_case_with_reading_key("reading")
@@ -348,6 +314,116 @@ mod tests {
     }
 
     #[test]
+    fn test_telemetry_output_validation_rejects_tags_not_configured_by_route() -> Result<()> {
+        let (_directory, _routes, route, mut record) = test_case()?;
+
+        record
+            .tags
+            .insert("unexpected".to_owned(), "value".to_owned());
+        assert!(validate_record(&route, &record, TOPIC, false).is_err());
+
+        record.tags.remove("unexpected");
+        record.tags.remove("room");
+        assert!(validate_record(&route, &record, TOPIC, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_telemetry_output_validation_enforces_configured_fields_and_types() -> Result<()> {
+        let (_directory, _routes, route, mut record) = test_case()?;
+
+        record
+            .fields
+            .insert("unexpected".to_owned(), TelemetryValue::Boolean(true));
+        assert!(validate_record(&route, &record, TOPIC, false).is_err());
+
+        record.fields.remove("unexpected");
+        record.fields.insert(
+            "reading".to_owned(),
+            TelemetryValue::String("wrong".to_owned()),
+        );
+        assert!(validate_record(&route, &record, TOPIC, false).is_err());
+
+        record.fields.remove("reading");
+        assert!(validate_record(&route, &record, TOPIC, false).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_output_validation_requires_complete_calculated_iaq() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let schema_path = directory.path().join("raw.json");
+        fs::write(
+            &schema_path,
+            serde_json::to_vec(&json!({"$schema": DRAFT_7, "type": "object"}))?,
+        )?;
+        let bundle: RouteBundle = serde_json::from_value(json!({
+            "version": 1,
+            "routes": [{
+                "id": "iaq-route",
+                "topic": "home/+/sensor",
+                "schema": schema_path,
+                "device_id": "device-1",
+                "measurement": "air",
+                "fields": {
+                    "gas_ohm": {"pointer": "/gas", "type": "float"},
+                    "rel_hum_perc": {"pointer": "/humidity", "type": "float"},
+                    "warmed_up": {"pointer": "/warmed_up", "type": "boolean", "optional": true}
+                },
+                "timestamp": {"source": "received_at"},
+                "calculations": ["iaq"]
+            }]
+        }))?;
+        let routes = RouteSet::compile(bundle, "home/dlq")?;
+        let route = routes.select(TOPIC).context("IAQ route should match")?;
+        let mut record = TelemetryRecord {
+            route_id: "iaq-route".to_owned(),
+            device_id: "device-1".to_owned(),
+            measurement: "air".to_owned(),
+            timestamp_ms: 1_700_000_000_000,
+            tags: BTreeMap::from([("device_id".to_owned(), "device-1".to_owned())]),
+            fields: BTreeMap::from([
+                ("gas_ohm".to_owned(), TelemetryValue::Float(100.0)),
+                ("rel_hum_perc".to_owned(), TelemetryValue::Float(40.0)),
+                ("warmed_up".to_owned(), TelemetryValue::Boolean(true)),
+                ("iaq_score".to_owned(), TelemetryValue::Float(50.0)),
+                (
+                    "iaq_text".to_owned(),
+                    TelemetryValue::String("Air quality is Good".to_owned()),
+                ),
+                ("mqtt_retained".to_owned(), TelemetryValue::Boolean(false)),
+            ]),
+            source_topic: TOPIC.to_owned(),
+            retained: false,
+        };
+        let stage = super::ValidateOutputStage::new(Arc::new(InfluxEncoder));
+        let mut ctx = PipelineContext::new_with_metadata(TOPIC, Vec::<u8>::new(), 1, false);
+        ctx.set_route(route);
+
+        ctx.set_telemetry_record(record.clone());
+        assert!(stage.run(&mut ctx).await.is_ok());
+
+        record.fields.remove("iaq_text");
+        ctx.set_telemetry_record(record.clone());
+        assert!(stage.run(&mut ctx).await.is_err());
+
+        record
+            .fields
+            .insert("warmed_up".to_owned(), TelemetryValue::Boolean(false));
+        ctx.set_telemetry_record(record.clone());
+        assert!(stage.run(&mut ctx).await.is_err());
+
+        record.fields.remove("iaq_score");
+        ctx.set_telemetry_record(record.clone());
+        assert!(stage.run(&mut ctx).await.is_ok());
+
+        record.fields.remove("warmed_up");
+        ctx.set_telemetry_record(record);
+        assert!(stage.run(&mut ctx).await.is_err());
+        Ok(())
+    }
+
+    #[test]
     fn test_telemetry_output_validation_rejects_control_characters() -> Result<()> {
         let (_directory, _routes, route, mut record) = test_case()?;
 
@@ -367,10 +443,7 @@ mod tests {
         );
         assert!(validate_record(&route, &record, TOPIC, false).is_err());
 
-        let (_directory, _routes, route, record) = test_case_with_reading_key("bad\u{7f}key")?;
-        let error = validate_record(&route, &record, TOPIC, false)
-            .expect_err("control characters in field keys must fail");
-        assert!(error.to_string().contains("field key"));
+        assert!(test_case_with_reading_key("bad\u{7f}key").is_err());
         Ok(())
     }
 

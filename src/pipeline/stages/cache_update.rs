@@ -34,7 +34,7 @@ impl PipelineStage for CacheUpdateStage {
         Box::pin(async move {
             let start = Instant::now();
             let route = ctx.route()?;
-            let route_id = route.id().to_owned();
+            let route_id = route.metric_label();
             if route.config().cache {
                 let received_at_ms = u64::try_from(ctx.received_at_ms())
                     .context("cache receive time cannot be negative")?;

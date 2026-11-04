@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::{future::Future, pin::Pin, time::Instant};
 
+use anyhow::Context;
 use tracing::warn;
 
 use metrics::{counter, histogram};
@@ -8,6 +9,7 @@ use metrics::{counter, histogram};
 use crate::{
     infrastructure::sink::Encoder,
     infrastructure::wal::{
+        codec::wal_record_frame_size,
         types::{AppendDurableError, WalEvent},
         wal::Wal,
     },
@@ -41,10 +43,12 @@ impl PipelineStage for PersistStage {
         Box::pin(async move {
             let start = Instant::now();
 
+            let route_id = ctx.route()?.metric_label();
             let record = ctx.telemetry_record()?;
-            let route_id = record.route_id.clone();
             let mut payload = String::new();
             self.encoder.encode(record, &mut payload);
+            wal_record_frame_size(ctx.topic().len(), payload.len())
+                .context("encoded telemetry exceeds the WAL reader record limit")?;
 
             let event = WalEvent {
                 topic: ctx.topic().to_string(),
@@ -96,12 +100,15 @@ impl PipelineStage for PersistStage {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::{
+        config::routes,
+        infrastructure::router::{CompiledRoute, RouteSet},
         infrastructure::wal::{
             segment::segment_path,
             subscription::WalSubscription,
@@ -113,7 +120,7 @@ mod tests {
 
     fn telemetry_record() -> TelemetryRecord {
         TelemetryRecord {
-            route_id: "test-route".to_owned(),
+            route_id: "firmware-sensor".to_owned(),
             device_id: "esp32-1".to_owned(),
             measurement: "test_measurement".to_owned(),
             timestamp_ms: 1_700_000_000_000,
@@ -131,7 +138,19 @@ mod tests {
     }
 
     fn ctx_with_record() -> PipelineContext {
+        static ROUTE: OnceLock<Arc<CompiledRoute>> = OnceLock::new();
+        let route = ROUTE.get_or_init(|| {
+            let routes = RouteSet::compile(
+                routes::load("config/routes.json").expect("load routes"),
+                "smarthome/_dlq/ingest",
+            )
+            .expect("compile routes");
+            routes
+                .select("smarthome/esp32-1/sensor")
+                .expect("select sensor route")
+        });
         let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
+        ctx.set_route(route.clone());
         ctx.set_telemetry_record(telemetry_record());
         ctx
     }
@@ -177,6 +196,31 @@ mod tests {
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
         assert_eq!(event.topic, "smarthome/esp32-1/sensor");
         assert_eq!(event.payload, expected_line_protocol());
+    }
+
+    #[tokio::test]
+    async fn test_persist_rejects_oversized_encoded_payload_before_wal_append() {
+        struct OversizedEncoder;
+
+        impl Encoder for OversizedEncoder {
+            fn encoded_size_upper_bound(&self, _record: &TelemetryRecord) -> usize {
+                0
+            }
+
+            fn encode(&self, _record: &TelemetryRecord, out: &mut String) {
+                out.push_str(&"x".repeat(1024 * 1024));
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let (wal, mut sub) = open_wal(dir.path(), 16).await;
+        let stage = PersistStage::new(wal, Arc::new(OversizedEncoder));
+        let mut ctx = ctx_with_record();
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(result.is_err(), "oversized encoded record must be rejected");
+        assert!(recv_one(&mut sub, 50).await.is_none());
     }
 
     #[tokio::test]

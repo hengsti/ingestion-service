@@ -4,28 +4,30 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-use crate::config::routes::{DeviceIdSource, FieldType, RouteBundle, RouteConfig};
+use crate::calculations::CalculationRegistry;
+use crate::config::routes::{FieldType, RouteBundle, RouteConfig};
 use crate::infrastructure::schema::{load_schema_resources, CompiledSchema};
 use crate::model::topic::MqttTopicFilter;
-use crate::pipeline::calculations::CalculationRegistry;
 
 /// An immutable route with schemas and topic filters compiled at startup.
-#[allow(dead_code)]
 pub struct CompiledRoute {
     config: RouteConfig,
+    metric_label: Arc<str>,
     topic_filter: MqttTopicFilter,
     raw_schema: CompiledSchema,
     output_schema: Option<CompiledSchema>,
     calculations: CalculationRegistry,
-    topic_segment_index: Option<usize>,
 }
 
-#[allow(dead_code)]
 impl CompiledRoute {
     /// Returns this route's configured identifier.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.config.id
+    }
+
+    pub(crate) fn metric_label(&self) -> Arc<str> {
+        Arc::clone(&self.metric_label)
     }
 
     /// Returns the complete validated route configuration.
@@ -60,33 +62,13 @@ impl CompiledRoute {
     pub fn validate_raw(&self, payload: &Value) -> Result<()> {
         self.raw_schema.validate(payload)
     }
-
-    /// Extracts the configured device identity topic segment.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the route has no topic-segment identity or the topic does not
-    /// match this route / lacks the configured segment.
-    pub fn topic_segment_identity<'a>(&self, topic: &'a str) -> Result<&'a str> {
-        let index = self.topic_segment_index.with_context(|| {
-            format!(
-                "route '{}' has no topic-segment device identity",
-                self.config.id
-            )
-        })?;
-        self.topic_filter
-            .topic_segment(topic, index)
-            .with_context(|| format!("extracting device identity for route '{}'", self.config.id))
-    }
 }
 
 /// A compiled set of nonoverlapping routes and their exact broker subscriptions.
-#[allow(dead_code)]
 pub struct RouteSet {
     routes: Vec<Arc<CompiledRoute>>,
 }
 
-#[allow(dead_code)]
 impl RouteSet {
     /// Compiles a validated route bundle and rejects DLQ feedback subscriptions.
     ///
@@ -109,6 +91,15 @@ impl RouteSet {
 
         let mut compiled_filters = Vec::with_capacity(bundle.routes.len());
         for route in &bundle.routes {
+            route
+                .validate_static()
+                .with_context(|| format!("route '{}' is invalid", route.id))?;
+            if compiled_filters
+                .iter()
+                .any(|(id, _): &(String, MqttTopicFilter)| id == &route.id)
+            {
+                bail!("duplicate route id '{}'", route.id);
+            }
             let filter = MqttTopicFilter::new(&route.topic)
                 .with_context(|| format!("route '{}' has an invalid topic filter", route.id))?;
             if filter.matches(dlq_topic) {
@@ -149,6 +140,9 @@ impl RouteSet {
                     FieldType::Boolean,
                 )?;
                 for (field, field_type) in calculations.output_field_types() {
+                    if route.tags.contains_key(field) {
+                        bail!("calculation output '{field}' collides with a telemetry tag");
+                    }
                     register_field_type(&mut field_types, &route, field, field_type)?;
                 }
 
@@ -164,18 +158,19 @@ impl RouteSet {
                         CompiledSchema::compile_with_resources(&route.id, path, &schema_resources)
                     })
                     .transpose()?;
-                let topic_segment_index = match &route.device_id {
-                    DeviceIdSource::TopicSegment(source) => Some(source.topic_segment),
-                    DeviceIdSource::PointerAndTopicSegment(source) => Some(source.topic_segment),
-                    DeviceIdSource::Fixed(_) | DeviceIdSource::Pointer(_) => None,
+                // metrics-exporter-prometheus 0.18.1 treats backslash pairs as already escaped.
+                let metric_label = if route.id.contains('\\') {
+                    Arc::from(route.id.replace('\\', "\\\\"))
+                } else {
+                    Arc::from(route.id.as_str())
                 };
                 Ok(Arc::new(CompiledRoute {
                     config: route,
+                    metric_label,
                     topic_filter,
                     raw_schema,
                     output_schema,
                     calculations,
-                    topic_segment_index,
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -199,6 +194,10 @@ impl RouteSet {
             .iter()
             .map(|route| route.topic_filter())
             .collect()
+    }
+
+    pub(crate) fn metric_labels(&self) -> impl Iterator<Item = Arc<str>> + '_ {
+        self.routes.iter().map(|route| route.metric_label())
     }
 }
 
@@ -352,10 +351,6 @@ mod configured_route_tests {
         assert_eq!(status.id(), "status");
         assert!(routes.select("smarthome/lab/other").is_none());
         assert_eq!(routes.subscriptions(), [sensor_filter, status_filter]);
-        assert_eq!(
-            sensor.topic_segment_identity("smarthome/lab/sensor")?,
-            "lab"
-        );
         sensor.validate_raw(&json!({
             "device_id": "lab",
             "time_iso": "2026-11-01T00:00:00Z"
@@ -448,6 +443,38 @@ mod configured_route_tests {
     }
 
     #[test]
+    fn test_configured_route_set_rejects_tag_and_calculated_field_collision() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+
+        let mut configured = route("sensor", "home/+/sensor", &schema_path);
+        configured["tags"] = json!({"dew_point_c": "fixed"});
+        configured["fields"] = json!({
+            "temp_c": {"pointer": "/temp_c", "type": "float"},
+            "rel_hum_perc": {"pointer": "/rel_hum_perc", "type": "float"}
+        });
+        configured["calculations"] = json!(["dew_point"]);
+
+        assert!(RouteSet::compile(bundle(vec![configured])?, "home/dlq").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_route_set_rejects_duplicate_route_ids() -> Result<()> {
+        let directory = tempdir()?;
+        let schema_path = directory.path().join("route.json");
+        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
+        let routes = bundle(vec![
+            route("duplicate", "home/+/sensor", &schema_path),
+            route("duplicate", "home/+/status", &schema_path),
+        ])?;
+
+        assert!(RouteSet::compile(routes, "home/dlq").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn test_configured_route_set_rejects_overlaps_and_dlq_feedback() -> Result<()> {
         let directory = tempdir()?;
         let schema_path = directory.path().join("route.json");
@@ -464,23 +491,6 @@ mod configured_route_tests {
 
         let wildcard_dlq = bundle(vec![route("sensor", "home/sensor", &schema_path)])?;
         assert!(RouteSet::compile(wildcard_dlq, "home/+").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn test_configured_route_set_reports_missing_identity_segment() -> Result<()> {
-        let directory = tempdir()?;
-        let schema_path = directory.path().join("route.json");
-        write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
-        let mut configured_route = route("sensor", "home/+/sensor", &schema_path);
-        configured_route["device_id"]["topic_segment"] = json!(8);
-        let routes = RouteSet::compile(bundle(vec![configured_route])?, "home/dlq")?;
-        let selected = routes
-            .select("home/lab/sensor")
-            .context("sensor route should match")?;
-
-        assert!(selected.topic_segment_identity("home/lab/sensor").is_err());
-        assert!(selected.topic_segment_identity("home//sensor").is_err());
         Ok(())
     }
 }

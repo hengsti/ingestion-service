@@ -12,18 +12,18 @@ use crate::{
 };
 
 /// Selects and validates the configured route for each raw payload.
-pub struct ConfiguredValidateRawStage {
+pub struct ValidateRawStage {
     routes: Arc<RouteSet>,
 }
 
-impl ConfiguredValidateRawStage {
+impl ValidateRawStage {
     /// Creates a stage using the compiled route set.
     pub fn new(routes: Arc<RouteSet>) -> Self {
         Self { routes }
     }
 }
 
-impl PipelineStage for ConfiguredValidateRawStage {
+impl PipelineStage for ValidateRawStage {
     fn name(&self) -> &'static str {
         "validate_raw"
     }
@@ -80,7 +80,7 @@ mod tests {
         config::routes,
         infrastructure::router::RouteSet,
         model::messages::telemetry::TelemetryValue,
-        pipeline::{stage::StageFlow, stages::transform::TelemetryMappingStage},
+        pipeline::{stage::StageFlow, stages::telemetry_mapping::TelemetryMappingStage},
     };
 
     fn configured_route_set() -> Result<Arc<RouteSet>> {
@@ -124,7 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_configured_raw_and_mapping_preserve_intake_metadata() -> Result<()> {
-        let raw_stage = ConfiguredValidateRawStage::new(configured_route_set()?);
+        let raw_stage = ValidateRawStage::new(configured_route_set()?);
         let mapping_stage = TelemetryMappingStage::new();
         let mut payload = valid_sensor_payload();
         payload["time_valid"] = json!(false);
@@ -153,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_configured_raw_rejects_unmatched_topic() -> Result<()> {
-        let stage = ConfiguredValidateRawStage::new(configured_route_set()?);
+        let stage = ValidateRawStage::new(configured_route_set()?);
         let mut ctx = ctx_with_json(
             "smarthome/esp32-1/unknown",
             valid_sensor_payload(),
@@ -171,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_configured_raw_rejects_schema_invalid_payload() -> Result<()> {
-        let stage = ConfiguredValidateRawStage::new(configured_route_set()?);
+        let stage = ValidateRawStage::new(configured_route_set()?);
         let mut ctx = ctx_with_json(
             "smarthome/esp32-1/sensor",
             json!({"device_id": "esp32-1"}),

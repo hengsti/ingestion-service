@@ -26,7 +26,7 @@ impl PipelineStage for ObserveStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            let route_id = ctx.route()?.id().to_owned();
+            let route_id = ctx.route()?.metric_label();
             ctx.telemetry_record()?;
             counter!("ingest_messages_processed_total", "route" => route_id).increment(1);
 
