@@ -30,11 +30,14 @@ route, and mapped record in a `PipelineContext`. The pipeline stages are:
 1. **decode** — reject inputs over 64 KiB before UTF-8/JSON decoding.
 2. **validate_raw** — select the configured route and validate its raw JSON schema.
 3. **transform** — map configured JSON pointers, apply configured defaults, and run the
-   route's resolved calculations into a typed `TelemetryRecord`.
-4. **validate_output** — validate the normalized record against its optional output schema
-   and enforce timestamp, key, value, control-character, and WAL-size constraints.
+   route's resolved calculations into a typed `TelemetryRecord`. Mapping bounds copied
+   data so repeated pointers cannot amplify one input without limit.
+4. **validate_output** — enforce the selected route's tags and field types, timestamps,
+   values and control-character rules, optional output schema, and the encoder's
+   conservative WAL-size bound before caching or encoding.
 5. **cache_update** — update latest state only when the route enables caching.
-6. **persist** — synchronously encode the record and await `Wal::append_durable`.
+6. **persist** — synchronously encode the record, check its actual WAL size, and await
+   `Wal::append_durable`.
 7. **observe** — record success metrics labeled with configured route ID.
 8. **dlq_publish** — publish rejected input through the active source's DLQ publisher.
 
@@ -45,7 +48,8 @@ The canonical record contains a configured measurement, typed tags and fields, d
 source topic, frozen timestamp in epoch milliseconds, and MQTT retained metadata. The
 reserved `device_id` tag and `mqtt_retained` boolean field are added for every route.
 Calculations are resolved during route compilation; there are no firmware-only transform
-branches.
+branches. Static output names, control characters, and tag/field/calculation collisions
+are checked when routes compile.
 
 ## Route configuration
 
@@ -67,6 +71,9 @@ readiness tracking while subscribing to the route set.
 
 Output destinations implement `Sink` and `Encoder`; `build_output()` constructs the matching
 pair. The synchronous encoder receives a validated `TelemetryRecord` and performs no I/O.
+Its allocation-free size bound must cover every byte it will append and saturate on
+overflow; an underestimate can cause excessive allocation or a cache update before
+persistence rejects the actual output.
 The Influx encoder uses the existing point builder for sorting and escaping, handles every
 configured scalar type, and always writes the record timestamp with `precision=ms`.
 

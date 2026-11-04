@@ -18,6 +18,11 @@ For each subscribed message, the service:
    normalized record against its output schema and runtime constraints, then encodes it.
 5. Appends the resulting line protocol to the WAL before forwarding it to InfluxDB.
 
+At startup, routes with duplicate IDs, reserved or colliding tag/field names, collisions
+with calculated fields, or control characters in static output names or values are
+rejected. Mapping also limits copied data, including repeated uses of the same JSON
+pointer, to prevent a small input from expanding without bound.
+
 `device_id` may also be checked against an explicitly configured topic segment. This
 behavior is part of the selected route, not a global MQTT setting. The service captures
 the MQTT receive timestamp and retain flag once at intake; a configured timestamp mapping
@@ -36,7 +41,8 @@ Both routes use raw and output schemas from `config/schemas/`. Sensor fields map
 `data.*`; status fields map from the root payload. The status route's configured defaults
 remain `0` for missing `uptime`/`free_mem` and `""` for missing `ssid`. Optional fields
 remain absent if the publisher omits them. The firmware sensor route calculates dew point,
-heat index, and IAQ; its schema and `warmed_up` flag determine which IAQ fields are emitted.
+heat index, and IAQ. It emits `iaq_score` and `iaq_text` together unless `warmed_up` is
+explicitly false.
 
 The same pipeline accepts routes for other device formats and topic layouts. A Zigbee or
 other JSON payload needs only a route entry with a filter, raw schema, identity, mappings,
@@ -52,11 +58,13 @@ unsigned integers (`u`), booleans, and quoted strings. Optional unmapped values 
 fabricated. Existing Influx series and field names are preserved by the shipped route
 bundle; the `device_id` tag and `mqtt_retained` field are emitted for every route.
 
-Output validation rejects empty fields, invalid timestamps, non-finite numbers, reserved
-or colliding keys, unsupported control characters, and payloads that exceed the WAL
-reader's record limit before the encoder or WAL append. Since each point has a frozen
-timestamp, re-encoding a record or replaying its saved WAL payload does not depend on
-InfluxDB server time.
+Output validation rejects fields or tags that do not match the route, invalid timestamps,
+non-finite numbers, unsupported control characters, and an encoder size bound that exceeds
+the WAL reader's record limit. The bound is conservative and is checked before caching
+or encoding, so an output near the limit can be rejected even if its actual bytes would
+fit. Persistence checks the actual encoded size again before WAL append. Since each point
+has a frozen timestamp, re-encoding a record or replaying its saved WAL payload does not
+depend on InfluxDB server time.
 
 InfluxDB merges writes that have the same measurement, tag set, and timestamp; fields in
 subsequent writes at that point can overwrite matching field keys. WAL replay can cause

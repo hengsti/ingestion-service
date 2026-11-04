@@ -31,7 +31,7 @@ Broker/database administration, device firmware, and dashboards are outside this
 | Environment parsing and source/sink selection | `src\config.rs` |
 | Input transport, dispatch, DLQ publishing | `src\infrastructure\source\mod.rs`, `src\infrastructure\source\mqtt.rs` |
 | Stage interface, context, runner, implementations | `src\pipeline\stage.rs`, `src\pipeline\context.rs`, `src\pipeline\runner.rs`, `src\pipeline\stages` |
-| Telemetry types, topic matching, routing, schemas | `src\model`, `src\infrastructure\router.rs`, `src\infrastructure\schema.rs`, `config` |
+| Telemetry types, topic matching, calculations, routing, schemas | `src\model`, `src\calculations.rs`, `src\infrastructure\router.rs`, `src\infrastructure\schema.rs`, `config` |
 | Encoding, sink errors, InfluxDB line protocol | `src\infrastructure\sink\mod.rs`, `src\infrastructure\sink\influx.rs`, `src\infrastructure\sink\point.rs` |
 | WAL append, writer thread, recovery, cursor, forwarding | `src\infrastructure\wal` |
 | Latest-state cache, HTTP/SSE, metrics | `src\infrastructure\cache`, `src\infrastructure\prometheus.rs` |
@@ -54,6 +54,10 @@ dispatch does not guarantee per-device processing order across workers.
 - **Validate before parsing:** enforce the 64 KiB input limit before UTF-8/JSON decoding.
   The selected route's raw schema validates publisher input; its optional output schema
   validates the normalized typed record. Schema paths are loaded from `INGEST_ROUTES_FILE`.
+- **Keep output bounded:** reject invalid static output names and collisions at route
+  compilation, and bound copied mapping data before repeated pointers amplify it. Every
+  encoder's allocation-free size bound must cover its encoded bytes and saturate on
+  overflow. Validate it before cache/encoding and check actual size before WAL append.
 - **Stop is not rejection:** `Err` from a stage makes `PipelineRunner` mark the context
   for DLQ. `StageFlow::Stop` only stops execution; it does not automatically mark DLQ.
   Use `ctx.mark_dlq(reason)` for explicit rejection; an intentional non-DLQ stop returns
@@ -155,6 +159,8 @@ Release build: `cargo build --release --locked`. Container build:
   its compiled filters. `MQTT_TOPIC_DLQ` is required and publish-only. Removed
   sensor/status subscription variables and `ENFORCE_TOPIC_DEVICE_MATCH` must fail
   startup with a migration hint.
+- Register each configured route's six route-labeled counters at zero before workers run;
+  use `CompiledRoute::metric_label()` for updates so IDs remain shared and exporter-safe.
 - Change `src\config.rs`, `compose.yaml`, and `docs\configuration.md` together when
   changing the environment contract. CI renders Compose and checks its environment
   keys against the code; update that check when the contract requires it.

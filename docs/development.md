@@ -37,8 +37,9 @@ cargo doc --all-features --no-deps
 | Runtime wiring | `src/main.rs` | Owns task startup, source/sink wiring, worker dispatch, shutdown |
 | Config | `src/config.rs` | Environment parsing and defaults |
 | Telemetry | `src/model/messages/` | Typed records and scalar values |
-| Topic matching | `src/model/topic.rs` | Strict MQTT filter matching and configured identity segments |
+| Topic matching | `src/model/topic.rs` | Strict MQTT filter matching |
 | Pipeline | `src/pipeline/` | Stage trait, runner, context, and stage implementations |
+| Calculations | `src/calculations.rs` | Route-compiled calculation registry and implementations |
 | Routing/schema | `src/infrastructure/router.rs`, `src/infrastructure/schema.rs` | Topic route and JSON Schema validation |
 | Input source | `src/infrastructure/source/` | `Source`/`DlqPublisher`, MQTT implementation, and ingest dispatch |
 | Cache API | `src/infrastructure/cache/` | Configured latest-state cache and HTTP/SSE API |
@@ -73,7 +74,8 @@ Many modules also contain unit tests next to implementation code.
 2. Add a route to `config/routes.json` with its topic filter, identity source,
    measurement, mappings, timestamp, and optional calculations/cache setting.
 3. Use schema paths relative to the route bundle. The bundle is compiled at startup;
-   invalid schemas, overlapping filters, and incompatible field types fail startup.
+   invalid schemas, duplicate route IDs, overlapping filters, conflicting names,
+   control characters in static output text, and incompatible field types fail startup.
 4. Add a focused route test and a pipeline integration case for the new payload.
 5. Update the cache/API or line-protocol goldens if the configured route changes them.
 6. Document the route contract in `docs/messages-and-routing.md`.
@@ -114,6 +116,9 @@ Rules:
 - Unsigned integers are suffixed with `u`.
 - Every validated record timestamp is written in milliseconds because the sink uses
   `precision=ms`; records never fall back to InfluxDB server time.
+- `Encoder::encoded_size_upper_bound` must bound all bytes appended by `encode`,
+  including escaping, and saturate on overflow. Output validation checks this before
+  caching or encoding; persistence also checks the actual encoded size.
 
 If you add or remove tags or fields, update:
 

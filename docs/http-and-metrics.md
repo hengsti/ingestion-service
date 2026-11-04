@@ -66,6 +66,8 @@ Returns Prometheus text exposition with content type
 
 Configured route metrics use a `route` label from the finite route IDs in
 `INGEST_ROUTES_FILE`; message/device IDs and topics are not metric labels.
+The six route-labeled counters below are registered at zero for every configured route at
+startup. Route-labeled histograms appear when first recorded.
 
 ## Useful metrics
 
