@@ -60,7 +60,19 @@ impl Wal {
         }
 
         for &id in segments.iter().take(segments.len().saturating_sub(1)) {
+            if committed.is_some_and(|offset| id < offset.segment_id) {
+                continue;
+            }
             let path = segment_path(&options.dir, id);
+            let file_len = fs::metadata(&path)
+                .with_context(|| format!("stat sealed WAL segment {id}"))?
+                .len();
+            let valid_len = last_valid_offset(&path)?;
+            if valid_len != file_len {
+                anyhow::bail!(
+                    "sealed WAL segment {id} has an incomplete record at offset {valid_len}"
+                );
+            }
             let file = fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
@@ -271,10 +283,11 @@ mod tests {
     }
 
     async fn recv_one(sub: &mut WalSubscription, ms: u64) -> Option<WalEntry> {
-        tokio::time::timeout(Duration::from_millis(ms), sub.next())
-            .await
-            .ok()
-            .flatten()
+        match tokio::time::timeout(Duration::from_millis(ms), sub.next()).await {
+            Ok(Ok(entry)) => entry,
+            Ok(Err(error)) => panic!("WAL subscription failed: {error:#}"),
+            Err(_) => None,
+        }
     }
 
     fn maximum_event() -> WalEvent {
@@ -842,6 +855,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wal_sync_corrupt_sealed_segment_is_preserved_and_rejected() -> Result<()> {
+        let dir = tempdir()?;
+        let path = segment_path(dir.path(), 1);
+        let mut bytes = Vec::new();
+        crate::infrastructure::wal::codec::encode_into(&mut bytes, &sample_event(1))?;
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xFF; 8]);
+        fs::write(&path, &bytes)?;
+        fs::File::create(segment_path(dir.path(), 2))?;
+
+        let result = Wal::open(opts(dir.path(), 1024 * 1024, 16)).await;
+
+        assert!(
+            result.is_err(),
+            "a sealed corrupt segment must fail startup"
+        );
+        assert_eq!(fs::read(path)?, bytes, "recovery must preserve the segment");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_sync_torn_sealed_segment_is_preserved_and_rejected() -> Result<()> {
+        let dir = tempdir()?;
+        let path = segment_path(dir.path(), 1);
+        let mut bytes = Vec::new();
+        crate::infrastructure::wal::codec::encode_into(&mut bytes, &sample_event(1))?;
+        bytes.extend_from_slice(&512u32.to_le_bytes());
+        bytes.extend_from_slice(b"partial");
+        fs::write(&path, &bytes)?;
+        fs::File::create(segment_path(dir.path(), 2))?;
+
+        assert!(Wal::open(opts(dir.path(), 1024 * 1024, 16)).await.is_err());
+        assert_eq!(fs::read(path)?, bytes, "sealed tails must not be truncated");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_wal_sync_rotation_reopens_and_replays_legacy_frames() -> Result<()> {
         const LEGACY_FRAME: &[u8] = &[
             26, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, b't', 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
@@ -898,9 +948,11 @@ mod tests {
             wal.append_durable(sample_event(4)).await,
             Err(AppendDurableError::Closed(_))
         ));
-        assert!(tokio::time::timeout(Duration::from_secs(2), &mut waiting)
-            .await?
-            .is_none());
+        let outcome = tokio::time::timeout(Duration::from_secs(2), &mut waiting).await?;
+        assert!(
+            outcome.is_err(),
+            "writer failure must not look like clean EOF"
+        );
         Ok(())
     }
 
