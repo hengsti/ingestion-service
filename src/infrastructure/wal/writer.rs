@@ -19,7 +19,9 @@ use tracing::{error, warn};
 #[cfg(test)]
 use crate::infrastructure::wal::test_support::{run_test_io_hook, TestIoHookSlot, TestIoStep};
 use crate::infrastructure::wal::{
+    capacity::{Capacity, Reservation, SEGMENT_ALLOWANCE_BYTES},
     codec,
+    journal::Journal,
     segment::{segment_path, sync_directory},
     types::{WalEvent, WalOffset},
 };
@@ -85,6 +87,7 @@ pub(super) type DurableAck = tokio::sync::oneshot::Sender<Result<(), String>>;
 pub(super) struct WriteRequest {
     pub event: WalEvent,
     pub durable_ack: Option<DurableAck>,
+    pub reservation: Option<Reservation>,
 }
 
 #[derive(Default)]
@@ -110,6 +113,7 @@ impl WriterState {
 struct WriterCompletion {
     state: Arc<WriterState>,
     notify: Arc<Notify>,
+    capacity: Arc<Capacity>,
 }
 
 impl Drop for WriterCompletion {
@@ -119,6 +123,7 @@ impl Drop for WriterCompletion {
         }
         self.state.stopped.store(true, Ordering::Release);
         self.notify.notify_waiters();
+        self.capacity.wake_waiters();
     }
 }
 
@@ -128,7 +133,7 @@ pub(super) struct WriterHandle {
     pub head: Arc<AtomicWalOffset>,
     pub state: Arc<WriterState>,
     #[cfg(test)]
-    test_io_hook: TestIoHookSlot,
+    pub(super) test_io_hook: TestIoHookSlot,
 }
 
 #[derive(Clone, Copy)]
@@ -161,12 +166,14 @@ fn record_segment_rotation() {
 }
 
 pub(super) fn spawn_writer(
-    dir: PathBuf,
+    journal: Arc<Journal>,
+    capacity: Arc<Capacity>,
     start_segment_id: u64,
     start_byte_offset: u64,
     segment_bytes: u64,
     queue_capacity: usize,
 ) -> Result<WriterHandle> {
+    let dir = journal.dir().to_path_buf();
     let file = open_segment(
         &dir,
         start_segment_id,
@@ -199,9 +206,11 @@ pub(super) fn spawn_writer(
     thread::Builder::new()
         .name("wal-writer".to_string())
         .spawn(move || {
+            let _journal = journal;
             let _completion = WriterCompletion {
                 state: task_state.clone(),
                 notify: task_notify.clone(),
+                capacity,
             };
             writer_loop(
                 dir,
@@ -345,6 +354,7 @@ fn writer_loop(
         let exceeds_segment = current_byte_offset
             .checked_add(record_len)
             .is_none_or(|length| length > segment_bytes);
+        let mut rotated = false;
         if current_byte_offset > 0 && exceeds_segment {
             if dirty {
                 if let Err(e) = flush_and_sync(
@@ -394,6 +404,9 @@ fn writer_loop(
             current_byte_offset = 0;
 
             let path = segment_path(&dir, current_segment_id);
+            if let Some(reservation) = req.reservation.as_mut() {
+                reservation.mark_io_started();
+            }
             let file = match open_segment(
                 &dir,
                 current_segment_id,
@@ -403,6 +416,9 @@ fn writer_loop(
             ) {
                 Ok(f) => f,
                 Err(e) => {
+                    if let Some(reservation) = req.reservation.take() {
+                        reservation.retain_all();
+                    }
                     error!(error = %e, path = %path.display(), "WAL writer: failed to open next segment; exiting");
                     record_writer_fatal(WriterFatalReason::OpenNextSegment);
                     fail_writer_requests(
@@ -417,15 +433,22 @@ fn writer_loop(
                 }
             };
             writer = BufWriter::with_capacity(64 * 1024, file);
+            rotated = true;
             record_segment_rotation();
         }
 
+        if let Some(reservation) = req.reservation.as_mut() {
+            reservation.mark_io_started();
+        }
         if let Err(e) = write_record(
             &mut writer,
             &encode_buf,
             #[cfg(test)]
             &test_io_hook,
         ) {
+            if let Some(reservation) = req.reservation.take() {
+                reservation.retain_all();
+            }
             error!(error = %e, segment_id = current_segment_id, "WAL writer: write_all failed; exiting");
             record_writer_fatal(WriterFatalReason::WriteAll);
             fail_writer_requests(
@@ -437,6 +460,9 @@ fn writer_loop(
                 &format!("WAL writer write_all failed: {e}"),
             );
             return;
+        }
+        if let Some(reservation) = req.reservation.take() {
+            reservation.retain(record_len + if rotated { SEGMENT_ALLOWANCE_BYTES } else { 0 });
         }
         current_byte_offset += record_len;
         if let Some(ack) = req.durable_ack.take() {
@@ -543,11 +569,155 @@ mod tests {
     use std::thread;
     use tempfile::tempdir;
 
+    fn spawn_writer(
+        dir: PathBuf,
+        start_segment_id: u64,
+        start_byte_offset: u64,
+        segment_bytes: u64,
+        queue_capacity: usize,
+    ) -> Result<WriterHandle> {
+        let journal = Arc::new(Journal::open(dir)?);
+        let capacity = Capacity::recover(journal.dir(), u64::MAX)?;
+        super::spawn_writer(
+            journal,
+            capacity,
+            start_segment_id,
+            start_byte_offset,
+            segment_bytes,
+            queue_capacity,
+        )
+    }
+
     fn req(event: WalEvent) -> WriteRequest {
         WriteRequest {
             event,
             durable_ack: None,
+            reservation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_cancelled_queued_receipt_stays_reserved_until_written() -> Result<()>
+    {
+        let dir = tempdir()?;
+        let journal = Arc::new(Journal::open(dir.path().to_path_buf())?);
+        let capacity = Capacity::recover(dir.path(), 8 * 1024 * 1024)?;
+        let handle = super::spawn_writer(journal, Arc::clone(&capacity), 1, 0, 1024 * 1024, 8)?;
+        let initial = capacity.snapshot().0;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *handle.test_io_hook.lock().unwrap() = Some(Arc::new(move |step| {
+            if step == TestIoStep::Write {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            }
+            Ok(())
+        }));
+        let request = |event: WalEvent, ack| {
+            let bytes = codec::wal_record_frame_size(event.topic.len(), event.payload.len())
+                .expect("frame size") as u64;
+            let reservation = capacity
+                .reserve(bytes + SEGMENT_ALLOWANCE_BYTES)
+                .expect("capacity");
+            (
+                WriteRequest {
+                    event,
+                    durable_ack: Some(ack),
+                    reservation: Some(reservation),
+                },
+                bytes,
+            )
+        };
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (first, first_bytes) = request(sample_event(1), first_tx);
+        handle.tx.send(first)?;
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await??;
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let (second, second_bytes) = request(sample_event(2), second_tx);
+        handle.tx.send(second)?;
+        drop(second_rx);
+        let pending = capacity.snapshot().0;
+
+        release_tx.send(())?;
+        tokio::time::timeout(Duration::from_secs(2), first_rx)
+            .await??
+            .map_err(anyhow::Error::msg)?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.head.load().byte_offset < first_bytes + second_bytes {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            pending,
+            initial + first_bytes + second_bytes + 2 * SEGMENT_ALLOWANCE_BYTES
+        );
+        assert_eq!(capacity.snapshot().0, initial + first_bytes + second_bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_write_failure_keeps_touched_bytes_and_releases_queue() -> Result<()>
+    {
+        let dir = tempdir()?;
+        let journal = Arc::new(Journal::open(dir.path().to_path_buf())?);
+        let capacity = Capacity::recover(dir.path(), 8 * 1024 * 1024)?;
+        let handle = super::spawn_writer(journal, Arc::clone(&capacity), 1, 0, 1024 * 1024, 8)?;
+        let initial = capacity.snapshot().0;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *handle.test_io_hook.lock().unwrap() = Some(Arc::new(move |step| {
+            if step == TestIoStep::Write {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                return Err(std::io::Error::other("injected partial write failure"));
+            }
+            Ok(())
+        }));
+        let request = |event: WalEvent, ack| {
+            let bytes = codec::wal_record_frame_size(event.topic.len(), event.payload.len())
+                .expect("frame size") as u64
+                + SEGMENT_ALLOWANCE_BYTES;
+            (
+                WriteRequest {
+                    event,
+                    durable_ack: Some(ack),
+                    reservation: Some(capacity.reserve(bytes).expect("capacity")),
+                },
+                bytes,
+            )
+        };
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (first, first_reserved) = request(sample_event(1), first_tx);
+        handle.tx.send(first)?;
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await??;
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let (second, _) = request(sample_event(2), second_tx);
+        handle.tx.send(second)?;
+
+        release_tx.send(())?;
+        assert!(tokio::time::timeout(Duration::from_secs(2), first_rx)
+            .await??
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(2), second_rx)
+            .await??
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handle.state.stopped() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert_eq!(capacity.snapshot().0, initial + first_reserved);
+        Ok(())
     }
 
     #[tokio::test]
@@ -592,6 +762,7 @@ mod tests {
             .send(WriteRequest {
                 event: sample_event(1),
                 durable_ack: Some(ack_tx),
+                reservation: None,
             })
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), write_entered_rx)
@@ -604,6 +775,7 @@ mod tests {
             .send(WriteRequest {
                 event: sample_event(2),
                 durable_ack: Some(second_tx),
+                reservation: None,
             })
             .unwrap();
         write_release_tx.send(()).unwrap();
@@ -661,6 +833,7 @@ mod tests {
                 .send(WriteRequest {
                     event: sample_event(1),
                     durable_ack: Some(ack_tx),
+                    reservation: None,
                 })
                 .unwrap();
 
@@ -703,6 +876,7 @@ mod tests {
             .send(WriteRequest {
                 event: sample_event(1),
                 durable_ack: Some(first_tx),
+                reservation: None,
             })
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), entered_rx)
@@ -718,6 +892,7 @@ mod tests {
                 .send(WriteRequest {
                     event: sample_event(sequence),
                     durable_ack: Some(ack_tx),
+                    reservation: None,
                 })
                 .unwrap();
             receipts.push(ack_rx);
@@ -755,6 +930,7 @@ mod tests {
                 .send(WriteRequest {
                     event: sample_event(1),
                     durable_ack: Some(first_tx),
+                    reservation: None,
                 })
                 .unwrap();
             assert!(tokio::time::timeout(Duration::from_secs(2), first_rx)
@@ -778,6 +954,7 @@ mod tests {
                 .send(WriteRequest {
                     event: sample_event(2),
                     durable_ack: Some(second_tx),
+                    reservation: None,
                 })
                 .unwrap();
 
@@ -803,6 +980,7 @@ mod tests {
                 .send(WriteRequest {
                     event: sample_event(sequence),
                     durable_ack: Some(ack_tx),
+                    reservation: None,
                 })
                 .unwrap();
             receipts.push(ack_rx);
@@ -835,6 +1013,7 @@ mod tests {
             .send(WriteRequest {
                 event: sample_event(1),
                 durable_ack: Some(ack_tx),
+                reservation: None,
             })
             .unwrap();
 
@@ -868,6 +1047,7 @@ mod tests {
             .send(WriteRequest {
                 event: sample_event(1),
                 durable_ack: Some(ack_tx),
+                reservation: None,
             })
             .unwrap();
 
