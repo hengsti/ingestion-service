@@ -801,7 +801,17 @@ mod tests {
         let lines: Vec<_> = export.lines().collect();
         let first: ExportLine = serde_json::from_str(lines[1])?;
         let target = match first {
-            ExportLine::Record { offset_after, .. } => parse_offset(&offset_after)?,
+            ExportLine::Record {
+                offset_after,
+                event,
+                ..
+            } => {
+                assert_eq!(
+                    event.rejection["raw_payload"],
+                    serde_json::json!([0, 128, 255])
+                );
+                parse_offset(&offset_after)?
+            }
             _ => anyhow::bail!("expected an exported record"),
         };
         assert!(matches!(
