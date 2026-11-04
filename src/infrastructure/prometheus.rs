@@ -96,7 +96,6 @@ const COUNTERS: &[&str] = &[
     "wal_forwarder_committed_total",
     "wal_forwarder_retry_total",
     "wal_forwarder_commit_retry_total",
-    "wal_subscription_corrupt_skipped_total",
     "wal_segment_rotations_total",
     "wal_capacity_full_total",
 ];
