@@ -21,7 +21,7 @@ cargo build --release
 
 ## 2. Prepare Runtime Configuration
 
-`config/routes.json` subscribes to `smarthome/+/sensor` and `smarthome/+/status`.
+`config/routes.json` subscribes to `smarthome/+/bme680` and `smarthome/+/status`.
 `INGEST_ROUTES_FILE` is required; schema paths in that bundle are relative to its directory.
 
 PowerShell example:
@@ -86,7 +86,7 @@ The service starts:
 
 ## 4. Publish a Sensor Payload
 
-Publish this JSON to `smarthome/esp32-1/sensor`:
+Publish this JSON to `smarthome/esp32-1/bme680`:
 
 ```json
 {

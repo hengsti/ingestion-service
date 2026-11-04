@@ -192,7 +192,7 @@ mod tests {
 
             metrics::with_local_recorder(&recorder, || register_metrics(&routes));
             let sensor = routes
-                .select("smarthome/device/sensor")
+                .select("smarthome/device/bme680")
                 .context("sensor route is missing")?;
             metrics::with_local_recorder(&recorder, || {
                 counter!("ingest_messages_processed_total", "route" => sensor.metric_label())

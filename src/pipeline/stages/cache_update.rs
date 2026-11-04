@@ -72,7 +72,7 @@ mod tests {
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
-    const TOPIC: &str = "smarthome/ESP32-1/sensor";
+    const TOPIC: &str = "smarthome/ESP32-1/bme680";
     const RECEIVED_AT_MS: i64 = 1_700_000_000_456;
 
     fn route(topic: &str) -> Result<(Arc<RouteSet>, Arc<CompiledRoute>)> {

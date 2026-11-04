@@ -54,7 +54,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_on_configured_record_returns_continue() -> Result<()> {
-        let topic = "smarthome/ESP32-1/sensor";
+        let topic = "smarthome/ESP32-1/bme680";
         let routes = Arc::new(RouteSet::compile(
             routes::load("config/routes.json")?,
             "smarthome/_dlq/ingest",
@@ -84,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_without_selected_route_returns_error() {
-        let mut ctx = PipelineContext::new("smarthome/ESP32-1/sensor", vec![]);
+        let mut ctx = PipelineContext::new("smarthome/ESP32-1/bme680", vec![]);
 
         assert!(ObserveStage::new().run(&mut ctx).await.is_err());
         assert!(!ctx.should_publish_dlq());

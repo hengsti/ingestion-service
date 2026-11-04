@@ -129,7 +129,7 @@ mod tests {
         let mut payload = valid_sensor_payload();
         payload["time_valid"] = json!(false);
         let received_at_ms = 1_700_000_123_456;
-        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", payload, received_at_ms, true);
+        let mut ctx = ctx_with_json("smarthome/esp32-1/bme680", payload, received_at_ms, true);
 
         assert!(matches!(
             raw_stage.run(&mut ctx).await?,
@@ -173,7 +173,7 @@ mod tests {
     async fn test_configured_raw_rejects_schema_invalid_payload() -> Result<()> {
         let stage = ValidateRawStage::new(configured_route_set()?);
         let mut ctx = ctx_with_json(
-            "smarthome/esp32-1/sensor",
+            "smarthome/esp32-1/bme680",
             json!({"device_id": "esp32-1"}),
             1_700_000_000_000,
             false,

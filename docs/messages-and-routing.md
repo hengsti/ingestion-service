@@ -34,7 +34,7 @@ The default bundle keeps the existing firmware subscriptions and Influx measurem
 
 | Route | MQTT filter | Measurement | Cache |
 |---|---|---|---:|
-| `firmware-sensor` | `smarthome/+/sensor` | `bme680` | Yes |
+| `firmware-sensor` | `smarthome/+/bme680` | `bme680` | Yes |
 | `firmware-status` | `smarthome/+/status` | `device_status` | No |
 
 Both routes use raw and output schemas from `config/schemas/`. Sensor fields map from
@@ -88,7 +88,7 @@ Rejected messages are published to the configured `MQTT_TOPIC_DLQ` with QoS
 ```json
 {
   "received_at": "2026-06-20T12:00:00+00:00",
-  "src_topic": "smarthome/esp32-1/sensor",
+  "src_topic": "smarthome/esp32-1/bme680",
   "error": "raw validation failed: ...",
   "payload_raw": "{\"device_id\":\"esp32-1\"}"
 }

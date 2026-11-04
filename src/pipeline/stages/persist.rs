@@ -132,7 +132,7 @@ mod tests {
                 ("mqtt_retained".to_owned(), TelemetryValue::Boolean(false)),
                 ("temp_c".to_owned(), TelemetryValue::Float(22.5)),
             ]),
-            source_topic: "smarthome/esp32-1/sensor".to_owned(),
+            source_topic: "smarthome/esp32-1/bme680".to_owned(),
             retained: false,
         }
     }
@@ -146,10 +146,10 @@ mod tests {
             )
             .expect("compile routes");
             routes
-                .select("smarthome/esp32-1/sensor")
+                .select("smarthome/esp32-1/bme680")
                 .expect("select sensor route")
         });
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
+        let mut ctx = PipelineContext::new("smarthome/esp32-1/bme680", vec![]);
         ctx.set_route(route.clone());
         ctx.set_telemetry_record(telemetry_record());
         ctx
@@ -194,7 +194,7 @@ mod tests {
         assert!(!ctx.should_publish_dlq());
 
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
-        assert_eq!(event.topic, "smarthome/esp32-1/sensor");
+        assert_eq!(event.topic, "smarthome/esp32-1/bme680");
         assert_eq!(event.payload, expected_line_protocol());
     }
 
@@ -314,7 +314,7 @@ mod tests {
         let (wal, _sub) = open_wal(dir.path(), 16).await;
         let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
         let stage = PersistStage::new(wal, encoder);
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
+        let mut ctx = PipelineContext::new("smarthome/esp32-1/bme680", vec![]);
 
         let result = stage.run(&mut ctx).await;
 

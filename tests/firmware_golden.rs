@@ -120,7 +120,7 @@ fn cache_record() -> TelemetryRecord {
             ("altitude_m".to_owned(), TelemetryValue::Float(500.0)),
             ("mqtt_retained".to_owned(), TelemetryValue::Boolean(false)),
         ]),
-        source_topic: "smarthome/esp32-1/sensor".to_owned(),
+        source_topic: "smarthome/esp32-1/bme680".to_owned(),
         retained: false,
     }
 }

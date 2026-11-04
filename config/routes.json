@@ -6,7 +6,7 @@
   "routes": [
     {
       "id": "firmware-sensor",
-      "topic": "smarthome/+/sensor",
+      "topic": "smarthome/+/bme680",
       "schema": "schemas/sensor.schema.json",
       "output_schema": "schemas/sensor.output.schema.json",
       "device_id": {

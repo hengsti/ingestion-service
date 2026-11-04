@@ -1,7 +1,7 @@
 [
   {
     "id": "default",
-    "topic": "smarthome/esp32-1/sensor",
+    "topic": "smarthome/esp32-1/bme680",
     "retained": false,
     "received_at_ms": 1700000000456,
     "payload": {
@@ -25,7 +25,7 @@
   },
   {
     "id": "warm-replayed-with-sequence",
-    "topic": "smarthome/esp32-1/sensor",
+    "topic": "smarthome/esp32-1/bme680",
     "retained": true,
     "received_at_ms": 1700000000456,
     "payload": {
@@ -53,7 +53,7 @@
   },
   {
     "id": "not-warmed-replayed-false",
-    "topic": "smarthome/esp32-1/sensor",
+    "topic": "smarthome/esp32-1/bme680",
     "retained": false,
     "received_at_ms": 1700000000456,
     "payload": {
@@ -79,7 +79,7 @@
   },
   {
     "id": "invalid-time",
-    "topic": "smarthome/esp32-1/sensor",
+    "topic": "smarthome/esp32-1/bme680",
     "retained": false,
     "received_at_ms": 1700000000456,
     "payload": {
@@ -103,7 +103,7 @@
   },
   {
     "id": "valid-time-zero",
-    "topic": "smarthome/esp32-1/sensor",
+    "topic": "smarthome/esp32-1/bme680",
     "retained": false,
     "received_at_ms": 1700000000456,
     "payload": {
@@ -128,7 +128,7 @@
   },
   {
     "id": "escaped-tags",
-    "topic": "smarthome/esp32-1/sensor",
+    "topic": "smarthome/esp32-1/bme680",
     "retained": false,
     "received_at_ms": 1700000000456,
     "payload": {

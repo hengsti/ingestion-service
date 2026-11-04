@@ -22,7 +22,7 @@ const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
 #[tokio::test]
 async fn configured_firmware_sensor_persists_and_caches_frozen_metadata() -> Result<()> {
     let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;
-    let topic = "smarthome/esp32-1/sensor";
+    let topic = "smarthome/esp32-1/bme680";
     let received_at_ms = 1_700_000_000_456;
     let mut ctx = PipelineContext::new_with_metadata(
         topic,
@@ -312,7 +312,7 @@ async fn valid_timestamp_zero_is_rejected_before_wal_persistence() -> Result<()>
     payload["time_ms"] = json!(0);
     payload["time_valid"] = json!(true);
     let mut ctx = PipelineContext::new_with_metadata(
-        "smarthome/esp32-1/sensor",
+        "smarthome/esp32-1/bme680",
         serde_json::to_vec(&payload)?,
         1_700_000_000_456,
         false,
@@ -331,7 +331,7 @@ async fn valid_timestamp_zero_is_rejected_before_wal_persistence() -> Result<()>
 #[tokio::test]
 async fn oversized_payload_is_rejected_before_json_decoding() -> Result<()> {
     let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
-    let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![b'x'; 64 * 1024 + 1]);
+    let mut ctx = PipelineContext::new("smarthome/esp32-1/bme680", vec![b'x'; 64 * 1024 + 1]);
 
     pipeline.run(&mut ctx).await;
 
@@ -365,7 +365,7 @@ async fn oversized_encoded_output_is_rejected_before_cache_update() -> Result<()
     let (pipeline, mut sub, cache, _tmp) =
         common::build_pipeline_with_routes_and_encoder(routes, encoder).await;
     let mut ctx = PipelineContext::new_with_metadata(
-        "smarthome/esp32-1/sensor",
+        "smarthome/esp32-1/bme680",
         common::valid_sensor_payload("esp32-1"),
         1_700_000_000_456,
         false,
