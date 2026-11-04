@@ -201,6 +201,10 @@ impl WalSubscription {
         }
     }
 
+    pub(crate) fn durable_head(&self) -> WalOffset {
+        self.head.load()
+    }
+
     /// Marks `up_to` as durably processed by the downstream sink.
     ///
     /// Syncs the cursor and garbage-collects segments strictly older than

@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-pub(super) fn sync_directory(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         fs::File::open(dir)?.sync_all()

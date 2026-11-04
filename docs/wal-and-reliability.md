@@ -144,9 +144,9 @@ the directory sync succeeds. Startup also reclaims older segments left behind af
 
 `WAL_MAX_BYTES` and `QUARANTINE_MAX_BYTES` are independent logical budgets. Each counts segment
 lengths, recovered journal metadata, pending reservations, a per-segment allowance, and fixed
-metadata headroom. The separate quarantine directory is currently reserved and locked; local
-rejection storage is not implemented yet. See [Configuration](configuration.md#wal) for the
-exact limits and minimum.
+metadata headroom. Rejections are stored in the separate quarantine journal and are not sent to
+the valid-output forwarder. See [Configuration](configuration.md#wal) for the exact limits and
+minimum.
 
 ## Forwarder Guarantees
 

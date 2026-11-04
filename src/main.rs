@@ -9,15 +9,14 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::prometheus::MetricsServer;
+use infrastructure::quarantine::Quarantine;
 use infrastructure::router::RouteSet;
 use infrastructure::source::{build_source, IngestDispatcher, IngestJob};
-use infrastructure::wal::capacity::Capacity;
 use infrastructure::wal::forwarder::run_forwarder;
-use infrastructure::wal::journal::Journal;
 use infrastructure::wal::types::WalOptions;
 use infrastructure::wal::wal::Wal;
 use pipeline::{
@@ -94,6 +93,10 @@ async fn recv_worker_job(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if infrastructure::quarantine::run_maintenance_command().await? {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .json()
@@ -111,15 +114,16 @@ async fn main() -> Result<()> {
     let source_ready = Arc::new(AtomicBool::new(false));
     let forwarder_alive = Arc::new(AtomicBool::new(true));
 
-    let quarantine_dir = cfg.quarantine_dir.clone();
-    let quarantine_max_bytes = cfg.quarantine_max_bytes;
-    let (_quarantine_journal, quarantine_capacity) = tokio::task::spawn_blocking(move || {
-        let journal = Journal::open(quarantine_dir)?;
-        let capacity = Capacity::recover(journal.dir(), quarantine_max_bytes)?;
-        Ok::<_, anyhow::Error>((journal, capacity))
+    let (quarantine, quarantine_subscription) = Quarantine::open(WalOptions {
+        dir: cfg.quarantine_dir.clone(),
+        max_bytes: cfg.quarantine_max_bytes,
+        segment_bytes: cfg.wal_segment_bytes,
+        queue_capacity: cfg.wal_queue_capacity,
     })
-    .await
-    .context("quarantine journal initialization task failed")??;
+    .await?;
+    drop(quarantine_subscription);
+    let quarantine = Arc::new(quarantine);
+    let quarantine_capacity = quarantine.capacity_handle();
 
     // WAL, configured sink, and forwarder.
     let (wal, wal_sub) = Wal::open(WalOptions {
@@ -190,7 +194,11 @@ async fn main() -> Result<()> {
             .add_stage(CacheUpdateStage::new(app_state.clone()))
             .add_stage(PersistStage::new(wal.clone(), encoder))
             .add_stage(ObserveStage::new())
-            .with_failure_stage(DlqPublishStage::new(dlq_publisher, dlq_topic.clone())),
+            .with_failure_stage(DlqPublishStage::new(
+                dlq_publisher,
+                dlq_topic.clone(),
+                quarantine.clone(),
+            )),
     );
 
     info!("pipeline initialized");
@@ -227,6 +235,7 @@ async fn main() -> Result<()> {
                     job.retained,
                 );
                 ctx.set_receive_sequence(job.receive_sequence);
+                ctx.set_qos(job.qos);
                 pipeline.run(&mut ctx).await;
             }
 
@@ -334,6 +343,7 @@ async fn main() -> Result<()> {
     // Drop both `Arc<Wal>` handles (pipeline's and main's) so the writer
     // closes its channel, flushes, and lets the forwarder drain.
     drop(pipeline);
+    drop(quarantine);
     drop(wal);
 
     if !forwarder_task_handled {
@@ -388,6 +398,7 @@ mod tests {
             received_at_ms: 1,
             receive_sequence: 0,
             retained: false,
+            qos: 1,
         })
         .unwrap();
 
@@ -410,6 +421,7 @@ mod tests {
             received_at_ms: 1,
             receive_sequence: 0,
             retained: false,
+            qos: 1,
         })
         .unwrap();
         tx.try_send(IngestJob {
@@ -418,6 +430,7 @@ mod tests {
             received_at_ms: 2,
             receive_sequence: 0,
             retained: true,
+            qos: 1,
         })
         .unwrap();
 

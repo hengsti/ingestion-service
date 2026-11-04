@@ -10,6 +10,7 @@ use smarthome_ingest::{
     config::routes,
     infrastructure::{
         cache::state::CacheState,
+        quarantine::Quarantine,
         router::RouteSet,
         sink::{influx::InfluxEncoder, Encoder},
         source::{mqtt::MqttDlqPublisher, DlqPublisher},
@@ -94,6 +95,15 @@ pub async fn build_pipeline_with_routes_and_encoder(
 ) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
     let cache = CacheState::new(60_000, 64);
     let (wal, sub, tmp) = open_temp_wal().await;
+    let (quarantine, quarantine_subscription) = Quarantine::open(WalOptions {
+        dir: tmp.path().join("quarantine"),
+        max_bytes: 16 * 1024 * 1024,
+        segment_bytes: 1024 * 1024,
+        queue_capacity: 1_000,
+    })
+    .await
+    .expect("open quarantine journal");
+    drop(quarantine_subscription);
 
     let pipeline = PipelineRunner::new()
         .add_stage(DecodeStage::new())
@@ -106,6 +116,7 @@ pub async fn build_pipeline_with_routes_and_encoder(
         .with_failure_stage(DlqPublishStage::new(
             dlq_publisher(),
             "smarthome/_dlq/ingest",
+            Arc::new(quarantine),
         ));
 
     (pipeline, sub, cache, tmp)

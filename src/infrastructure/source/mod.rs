@@ -25,6 +25,8 @@ pub struct IngestJob {
     pub receive_sequence: u64,
     /// Whether the broker marked the message as retained.
     pub retained: bool,
+    /// Transport QoS level of the received MQTT publication.
+    pub qos: u8,
 }
 
 /// Round-robins [`IngestJob`]s across a fixed set of per-worker bounded channels.
@@ -135,6 +137,7 @@ mod tests {
                 received_at_ms: i,
                 receive_sequence: 0,
                 retained: i % 2 == 0,
+                qos: 1,
             });
         }
 
@@ -184,6 +187,7 @@ mod tests {
             received_at_ms: 10,
             receive_sequence: 0,
             retained: false,
+            qos: 1,
         });
         dispatcher.dispatch(IngestJob {
             topic: "topic/second".to_string(),
@@ -191,6 +195,7 @@ mod tests {
             received_at_ms: 11,
             receive_sequence: 0,
             retained: true,
+            qos: 1,
         });
 
         let first = tokio::time::timeout(Duration::from_millis(50), rx.recv())

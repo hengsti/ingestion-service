@@ -13,11 +13,13 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use super::{DlqPublisher, IngestDispatcher, IngestJob, Source};
-use crate::config::Config;
+use crate::config::{Config, MqttSourceConfig};
 use crate::infrastructure::router::RouteSet;
 
 /// Delay between reconnect attempts after an event-loop poll error.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// MQTT wire-packet limit, including fixed header, topic, and payload.
+const MAX_MQTT_PACKET_BYTES: usize = 128 * 1024;
 
 /// MQTT-backed [`Source`]. Never exits on connection errors: it keeps polling
 /// so `rumqttc` reconnects, and re-subscribes to `filters` on every `ConnAck`.
@@ -112,6 +114,11 @@ impl Source for MqttSource {
                                 received_at_ms: chrono::Utc::now().timestamp_millis(),
                                 receive_sequence: 0,
                                 retained: publish.retain,
+                                qos: match publish.qos {
+                                    QoS::AtMostOnce => 0,
+                                    QoS::AtLeastOnce => 1,
+                                    QoS::ExactlyOnce => 2,
+                                },
                             });
                         }
                     }
@@ -151,7 +158,7 @@ impl DlqPublisher for MqttDlqPublisher {
                 "payload_raw": payload,
             });
 
-            info!(src_topic = %src_topic, error = %err, "publishing message to DLQ topic");
+            info!(src_topic = %src_topic, "publishing message to DLQ topic");
 
             let bytes = serde_json::to_vec(&dlq)?;
             self.client
@@ -180,13 +187,8 @@ pub async fn build(
         .as_ref()
         .context("INPUT_SOURCE=mqtt requires MQTT_* connection variables")?;
 
-    let mut mqttoptions = MqttOptions::new(&mqtt_cfg.client_id, &mqtt_cfg.host, mqtt_cfg.port);
+    let mut mqttoptions = mqtt_options(mqtt_cfg);
     mqttoptions.set_keep_alive(Duration::from_secs(30));
-    mqttoptions.set_clean_session(mqtt_cfg.clean_session);
-
-    if let (Some(username), Some(password)) = (&mqtt_cfg.username, &mqtt_cfg.password) {
-        mqttoptions.set_credentials(username, password);
-    }
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
@@ -208,11 +210,36 @@ pub async fn build(
     Ok((source, publisher))
 }
 
+fn mqtt_options(mqtt_cfg: &MqttSourceConfig) -> MqttOptions {
+    let mut options = MqttOptions::new(&mqtt_cfg.client_id, &mqtt_cfg.host, mqtt_cfg.port);
+    options.set_clean_session(mqtt_cfg.clean_session);
+    options.set_max_packet_size(MAX_MQTT_PACKET_BYTES, MAX_MQTT_PACKET_BYTES);
+    if let (Some(username), Some(password)) = (&mqtt_cfg.username, &mqtt_cfg.password) {
+        options.set_credentials(username, password);
+    }
+    options
+}
+
 #[cfg(test)]
 mod tests {
     use rumqttc::MqttOptions as TestMqttOptions;
 
     use super::*;
+    use crate::config::MqttSourceConfig;
+
+    #[test]
+    fn mqtt_options_apply_the_documented_packet_limit() {
+        let options = mqtt_options(&MqttSourceConfig {
+            host: "localhost".to_owned(),
+            port: 1883,
+            username: None,
+            password: None,
+            client_id: "test".to_owned(),
+            clean_session: true,
+        });
+
+        assert_eq!(options.max_packet_size(), MAX_MQTT_PACKET_BYTES);
+    }
 
     /// Returns a client whose eventloop receiver is alive so that `publish` queues successfully.
     fn client_with_live_eventloop() -> (AsyncClient, rumqttc::EventLoop) {

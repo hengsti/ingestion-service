@@ -46,6 +46,11 @@ the publish destination for rejected messages; it is not a subscription.
 | `MQTT_PASSWORD` | No | None | Optional MQTT password |
 | `MQTT_TOPIC_DLQ` | Yes at runtime | None | DLQ publish topic |
 
+The MQTT client enforces a fixed 128 KiB maximum wire-packet size, including packet headers,
+topic, and payload. The application rejects payloads larger than 64 KiB before JSON decoding;
+messages between these limits can be received and durably quarantined as oversized. Packets
+above the MQTT wire limit are outside the local quarantine guarantee.
+
 With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
 
 The source subscribes to the route bundle's filters on each connection. A persistent broker
@@ -96,15 +101,15 @@ Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a sma
 | `WAL_MAX_BYTES` | Yes | None | Maximum accounted WAL bytes, including pending appends and metadata reserves |
 | `WAL_SEGMENT_BYTES` | No | `67108864` | Segment rotation threshold in bytes |
 | `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer; must be greater than zero |
-| `QUARANTINE_DIR` | Yes | None | Separate directory reserved and exclusively owned for the quarantine journal |
+| `QUARANTINE_DIR` | Yes | None | Separate, exclusively owned journal for rejected input |
 | `QUARANTINE_MAX_BYTES` | Yes | None | Maximum accounted bytes for the quarantine journal |
 
 Use separate writable, persistent local directories for `WAL_DIR` and `QUARANTINE_DIR`.
 The service acquires an OS-backed exclusive lock and checks file creation, writing, syncing,
-renaming, and reading in each directory before starting MQTT. Quarantine storage is reserved
-for future rejection persistence; rejections are still published through the MQTT DLQ today.
-Locks are advisory and require a filesystem that supports them; all journal users must honor the
-same lock file. Do not remove `.journal.lock` while a process may still own the directory.
+renaming, and reading in each directory before starting MQTT. Rejected messages are synced to
+the quarantine journal before the supplementary MQTT DLQ publish. Locks are advisory and require
+a filesystem that supports them; all journal users must honor the same lock file. Do not remove
+`.journal.lock` while a process may still own the directory.
 
 Both byte limits must be positive and at least:
 

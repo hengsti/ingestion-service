@@ -41,10 +41,10 @@ impl PipelineStage for ValidateRawStage {
                     .record(start.elapsed().as_secs_f64());
                 return Ok(StageFlow::Stop);
             };
+            ctx.set_route(route.clone());
 
             match route.validate_raw(ctx.payload_json()?) {
                 Ok(()) => {
-                    ctx.set_route(route);
                     counter!("ingest_validate_raw_success_total").increment(1);
                     histogram!("ingest_validate_raw_duration_seconds", "result" => "success")
                         .record(start.elapsed().as_secs_f64());
@@ -55,7 +55,6 @@ impl PipelineStage for ValidateRawStage {
                     warn!(
                         topic = %ctx.topic(),
                         route = %route.id(),
-                        error = %err,
                         "raw validation failed; marking for DLQ"
                     );
                     ctx.mark_dlq(format!("raw validation failed: {err}"));

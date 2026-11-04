@@ -148,6 +148,9 @@ Useful signals:
 | WAL is saturated or failing | `wal_accounted_bytes`, `wal_capacity_bytes`, `wal_capacity_full_total`, `ingest_queue_full_total`, `ingest_queue_closed_total`, `ingest_durability_ack_failed_total`, `wal_writer_fatal_total` |
 | InfluxDB writes are failing | `influx_write_errors_total`, `wal_forwarder_retry_total`, `wal_forwarder_retry_outage_active` |
 | Forwarder is blocked by a permanent sink error | `wal_forwarder_retry_outage_active`; inspect the logged HTTP status and repair the destination or pending output |
+| Quarantine storage usage | `quarantine_accounted_bytes`, `quarantine_capacity_bytes` |
+
+The quarantine export command reports the unresolved record count without logging payloads.
 
 ## Handle Sink Outage (InfluxDB today)
 
@@ -167,9 +170,13 @@ until the sink recovers. The current MQTT acknowledgement path can still lose me
 input queues fill or the process is forcibly terminated; journal capacity limits alone do not
 guarantee broker-to-sink delivery.
 
-## Handle DLQ Growth
+## Handle Rejected Input
 
-DLQ messages contain:
+Each rejection is synced to the local quarantine journal before the best-effort MQTT DLQ
+publication. The journal is authoritative if publishing the supplementary copy fails. Its
+accounted bytes and capacity are available from the metrics above.
+
+MQTT DLQ messages contain:
 
 - `received_at`
 - `src_topic`
@@ -186,7 +193,44 @@ Common causes:
 | `raw validation failed` | Compare payload with the raw schema configured for its route in `config/routes.json` |
 | `transform failed` | Check the route's mappings, defaults, and configured calculations |
 | `output validation failed` | Compare the mapped record with its configured output schema and output constraints |
+| `quarantine journal is full` | Export and explicitly resolve an inspected prefix, or increase `QUARANTINE_MAX_BYTES` |
+| `quarantine append was not durable` | Check quarantine storage and filesystem health; the rejection was not accepted |
 | `wal queue full` | Increase `WAL_QUEUE_CAPACITY`, lower ingest rate, or fix disk/WAL writer pressure |
+
+## Export and Resolve Quarantine
+
+Stop ingestion before maintenance. Both commands take the journal's exclusive lock, run without
+starting MQTT or HTTP, and require the configured quarantine volume to be mounted.
+
+Export the complete unresolved journal to a new file outside the journal directory:
+
+```bash
+docker compose stop ingest
+mkdir -p ./quarantine-export
+docker compose run --rm --no-deps \
+  -v "$PWD/quarantine-export:/export" \
+  ingest /app/smarthome-ingest --quarantine-export /export/rejections.jsonl
+```
+
+The command reports the unresolved record count. The JSONL archive includes a journal identity,
+the exact WAL offsets and a completion footer. Preserve and inspect the archive before resolving
+anything. Choose an exported record's `offset_after` as the end of the prefix to resolve; do not
+select an offset inside a record.
+
+After confirming the export and selected prefix, resolve only through that boundary:
+
+```bash
+docker compose run --rm --no-deps \
+  -v "$PWD/quarantine-export:/export" \
+  ingest /app/smarthome-ingest --quarantine-resolve 1:12345 \
+  --export /export/rejections.jsonl
+```
+
+Replace `1:12345` with the selected `offset_after`. Resolution verifies the full archive against
+the current journal and refuses an incomplete, altered, wrong-journal, live-owned, or
+non-boundary export. The cursor advances only after verification, leaving all later records
+unresolved. Restart the service after maintenance. This is archival and explicit prefix
+resolution, not replay or repair of invalid output.
 
 ## Tune Throughput
 
