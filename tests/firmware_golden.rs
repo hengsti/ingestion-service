@@ -182,7 +182,8 @@ async fn test_golden_cache_state_device_and_sse_envelopes() -> Result<()> {
     let cache = CacheState::new(60_000, 64);
     cache.update_record(&cache_record(), received_at_ms, 1);
     let ready = Arc::new(AtomicBool::new(false));
-    let app = cache_http::router(cache.clone(), ready);
+    let (wal, _subscription, _wal_dir) = common::open_temp_wal().await;
+    let app = cache_http::router(cache.clone(), ready, wal.capacity_handle());
 
     let mut state_list = request_json(app.clone(), "/v1/state").await?;
     normalize_cache_timestamp(&mut state_list, received_at_ms);

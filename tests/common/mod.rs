@@ -51,6 +51,7 @@ pub async fn open_temp_wal() -> (Arc<Wal>, WalSubscription, TempDir) {
     let tmp = tempfile::tempdir().expect("create temp WAL dir");
     let (wal, sub) = Wal::open(WalOptions {
         dir: tmp.path().to_path_buf(),
+        max_bytes: 128 * 1024 * 1024,
         segment_bytes: 1024 * 1024,
         queue_capacity: 1_000,
     })
