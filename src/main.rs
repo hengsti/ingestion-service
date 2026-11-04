@@ -9,13 +9,15 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::prometheus::MetricsServer;
 use infrastructure::router::RouteSet;
 use infrastructure::source::{build_source, IngestDispatcher, IngestJob};
+use infrastructure::wal::capacity::Capacity;
 use infrastructure::wal::forwarder::run_forwarder;
+use infrastructure::wal::journal::Journal;
 use infrastructure::wal::types::WalOptions;
 use infrastructure::wal::wal::Wal;
 use pipeline::{
@@ -100,12 +102,37 @@ async fn main() -> Result<()> {
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
     let source_ready = Arc::new(AtomicBool::new(false));
 
+    let quarantine_dir = cfg.quarantine_dir.clone();
+    let quarantine_max_bytes = cfg.quarantine_max_bytes;
+    let (_quarantine_journal, quarantine_capacity) = tokio::task::spawn_blocking(move || {
+        let journal = Journal::open(quarantine_dir)?;
+        let capacity = Capacity::recover(journal.dir(), quarantine_max_bytes)?;
+        Ok::<_, anyhow::Error>((journal, capacity))
+    })
+    .await
+    .context("quarantine journal initialization task failed")??;
+
+    // WAL, configured sink, and forwarder.
+    let (wal, wal_sub) = Wal::open(WalOptions {
+        dir: cfg.wal_dir.clone(),
+        max_bytes: cfg.wal_max_bytes,
+        segment_bytes: cfg.wal_segment_bytes,
+        queue_capacity: cfg.wal_queue_capacity,
+    })
+    .await?;
+    let wal = Arc::new(wal);
+    let (wal_used_bytes, wal_max_bytes) = wal.capacity_bytes();
+    info!(
+        wal_used_bytes,
+        wal_max_bytes, "journal capacity initialized"
+    );
+
     let http_state = app_state.clone();
     let cache_bind = cfg.cache_bind.clone();
     let source_ready_http = source_ready.clone();
-
+    let wal_capacity_http = wal.capacity_handle();
     let mut _http_task = tokio::spawn(async move {
-        let app = http::router(http_state, source_ready_http);
+        let app = http::router(http_state, source_ready_http, wal_capacity_http);
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
@@ -116,16 +143,13 @@ async fn main() -> Result<()> {
     });
 
     // Metrics server.
-    let _metrics_server = MetricsServer::start(&cfg.metrics_bind, &routes).await?;
-
-    // WAL, configured sink, and forwarder.
-    let (wal, wal_sub) = Wal::open(WalOptions {
-        dir: cfg.wal_dir.clone(),
-        segment_bytes: cfg.wal_segment_bytes,
-        queue_capacity: cfg.wal_queue_capacity,
-    })
+    let _metrics_server = MetricsServer::start(
+        &cfg.metrics_bind,
+        &routes,
+        wal.capacity_handle(),
+        quarantine_capacity,
+    )
     .await?;
-    let wal = Arc::new(wal);
 
     let (encoder, sink) = build_output(&cfg)?;
 
