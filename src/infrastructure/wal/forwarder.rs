@@ -180,6 +180,7 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use std::collections::VecDeque;
     use std::fs;
     use std::future::Future;
@@ -260,6 +261,7 @@ mod tests {
     fn opts(dir: &std::path::Path) -> WalOptions {
         WalOptions {
             dir: dir.to_path_buf(),
+            max_bytes: 128 * 1024 * 1024,
             segment_bytes: 1024 * 1024,
             queue_capacity: 32,
         }
@@ -275,6 +277,60 @@ mod tests {
             out.push(entry);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_outage_recovery_reclaims_and_readmits() -> Result<()> {
+        let dir = tempdir()?;
+        let mut options = opts(dir.path());
+        options.max_bytes = 3 * 1024 * 1024;
+        let (wal, sub) = Wal::open(options).await?;
+        let event = WalEvent {
+            topic: "t".to_string(),
+            ts_ms: 1,
+            payload: "x"
+                .repeat(crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES - 25),
+        };
+        assert!(wal.append_durable(event.clone()).await.is_ok());
+        assert!(wal.append_durable(event.clone()).await.is_ok());
+        let mut rejected = match wal.append_durable(event).await {
+            Err(crate::infrastructure::wal::types::AppendDurableError::Capacity(event)) => event,
+            _ => panic!("a full journal must return the rejected event"),
+        };
+        let mock = Arc::new(MockSink::new((0..100).map(|_| Resp::Retry).collect()));
+        let sink: Arc<dyn Sink> = mock.clone();
+        let forwarder = tokio::spawn(run_forwarder(sub, sink, 1, 10));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.call_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert!(read_cursor(dir.path())?.is_none());
+        mock.responses.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match wal.append_durable(rejected).await {
+                    Ok(()) => break,
+                    Err(crate::infrastructure::wal::types::AppendDurableError::Capacity(event)) => {
+                        rejected = event;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(_) => panic!("reclaimed capacity should admit the event"),
+                }
+            }
+        })
+        .await?;
+        drop(wal);
+        tokio::time::timeout(Duration::from_secs(5), forwarder).await???;
+        assert_eq!(
+            read_cursor(dir.path())?
+                .context("committed cursor")?
+                .segment_id,
+            3
+        );
+        Ok(())
     }
 
     #[tokio::test]
