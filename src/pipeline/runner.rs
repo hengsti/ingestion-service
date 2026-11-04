@@ -38,27 +38,29 @@ impl PipelineRunner {
 
     /// Runs the pipeline and returns its single terminal storage outcome.
     pub async fn run(&self, ctx: &mut PipelineContext) -> PipelineOutcome {
-        let mut stopped = false;
-        for stage in &self.stages {
-            debug!(stage=%stage.name(), topic=%ctx.topic(), "running pipeline stage");
+        let mut stopped = ctx.should_quarantine();
+        if !stopped {
+            for stage in &self.stages {
+                debug!(stage=%stage.name(), topic=%ctx.topic(), "running pipeline stage");
 
-            let flow = match stage.run(ctx).await {
-                Ok(flow) => flow,
-                Err(_) => {
-                    warn!(
-                        stage = stage.name(),
-                        topic = %ctx.topic(),
-                        "pipeline stage failed; deferring outcome"
-                    );
-                    return Self::record_outcome(PipelineOutcome::Deferred(
-                        DeferredReason::StageFailure,
-                    ));
+                let flow = match stage.run(ctx).await {
+                    Ok(flow) => flow,
+                    Err(_) => {
+                        warn!(
+                            stage = stage.name(),
+                            topic = %ctx.topic(),
+                            "pipeline stage failed; deferring outcome"
+                        );
+                        return Self::record_outcome(PipelineOutcome::Deferred(
+                            DeferredReason::StageFailure,
+                        ));
+                    }
+                };
+
+                if matches!(flow, StageFlow::Stop) {
+                    stopped = true;
+                    break;
                 }
-            };
-
-            if matches!(flow, StageFlow::Stop) {
-                stopped = true;
-                break;
             }
         }
 
@@ -278,6 +280,17 @@ mod tests {
             PipelineOutcome::Deferred(DeferredReason::PersistenceFailure)
         );
         assert!(!ctx.should_quarantine());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_premarked_rejection_skips_normal_stages() {
+        let runner = PipelineRunner::new()
+            .add_stage(FailingStage)
+            .with_failure_stage(RejectStage);
+        let mut ctx = PipelineContext::new("topic", b"policy violation".to_vec());
+        ctx.mark_rejection("QoS 0 is not recoverable");
+
+        assert_eq!(runner.run(&mut ctx).await, PipelineOutcome::RejectionStored);
     }
 
     #[test]
