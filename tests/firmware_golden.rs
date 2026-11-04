@@ -46,10 +46,10 @@ async fn assert_configured_cases(path: &str) -> Result<()> {
         match case.unified_line_protocol {
             Some(expected) => {
                 assert!(
-                    !context.should_publish_dlq(),
+                    !context.should_quarantine(),
                     "{} unexpectedly rejected: {:?}",
                     case.id,
-                    context.dlq_reason()
+                    context.rejection_reason()
                 );
                 let event = common::recv_event(&mut subscription, 500)
                     .await
@@ -62,7 +62,7 @@ async fn assert_configured_cases(path: &str) -> Result<()> {
             }
             None => {
                 assert!(
-                    context.should_publish_dlq(),
+                    context.should_quarantine(),
                     "{} should be rejected: {:?}",
                     case.id,
                     case.unified_rejection

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde_json::to_value;
+use tracing::warn;
 
 use crate::{
     calculations::output_can_be_omitted,
@@ -39,13 +40,21 @@ impl PipelineStage for ValidateOutputStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            validate_record(
+            let validation = validate_record(
                 ctx.route()?,
                 ctx.telemetry_record()?,
                 ctx.topic(),
                 ctx.retained(),
                 self.encoder.as_ref(),
-            )?;
+            );
+            if validation.is_err() {
+                warn!(
+                    topic = %ctx.topic(),
+                    "normalized output validation failed; marking for quarantine"
+                );
+                ctx.mark_rejection("normalized output validation failed");
+                return Ok(StageFlow::Stop);
+            }
             Ok(StageFlow::Continue)
         })
     }
@@ -183,7 +192,10 @@ mod tests {
             wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES,
         },
         model::messages::telemetry::{TelemetryRecord, TelemetryValue},
-        pipeline::{context::PipelineContext, stage::PipelineStage},
+        pipeline::{
+            context::PipelineContext,
+            stage::{PipelineStage, StageFlow},
+        },
     };
 
     const TOPIC: &str = "home/device-1/sensor";
@@ -196,6 +208,24 @@ mod tests {
         retained: bool,
     ) -> Result<()> {
         super::validate_record(route, record, topic, retained, &InfluxEncoder)
+    }
+
+    #[tokio::test]
+    async fn test_output_validation_rejects_invalid_normalized_record() -> Result<()> {
+        let (_directory, _routes, route, mut record) = test_case()?;
+        record
+            .fields
+            .insert("label".to_owned(), TelemetryValue::String("x".to_owned()));
+        let mut ctx = PipelineContext::new_with_metadata(TOPIC, Vec::<u8>::new(), 1, false);
+        ctx.set_route(route);
+        ctx.set_telemetry_record(record);
+        let stage = super::ValidateOutputStage::new(Arc::new(InfluxEncoder));
+
+        let result = stage.run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+        assert!(ctx.should_quarantine());
+        Ok(())
     }
 
     fn test_case() -> Result<(TempDir, Arc<RouteSet>, Arc<CompiledRoute>, TelemetryRecord)> {
@@ -401,25 +431,25 @@ mod tests {
         ctx.set_route(route);
 
         ctx.set_telemetry_record(record.clone());
-        assert!(stage.run(&mut ctx).await.is_ok());
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Continue));
 
         record.fields.remove("iaq_text");
         ctx.set_telemetry_record(record.clone());
-        assert!(stage.run(&mut ctx).await.is_err());
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
 
         record
             .fields
             .insert("warmed_up".to_owned(), TelemetryValue::Boolean(false));
         ctx.set_telemetry_record(record.clone());
-        assert!(stage.run(&mut ctx).await.is_err());
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
 
         record.fields.remove("iaq_score");
         ctx.set_telemetry_record(record.clone());
-        assert!(stage.run(&mut ctx).await.is_ok());
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Continue));
 
         record.fields.remove("warmed_up");
         ctx.set_telemetry_record(record);
-        assert!(stage.run(&mut ctx).await.is_err());
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
         Ok(())
     }
 

@@ -236,9 +236,9 @@ async fn main() -> Result<()> {
                 );
                 ctx.set_receive_sequence(job.receive_sequence);
                 ctx.set_qos(job.qos);
-                let durable = pipeline.run(&mut ctx).await;
+                let outcome = pipeline.run(&mut ctx).await;
                 if let Some(acknowledgement) = job.acknowledgement {
-                    if !acknowledgement.complete(durable).await {
+                    if !acknowledgement.complete(outcome).await {
                         warn!(topic = %ctx.topic(), "MQTT acknowledgement result could not be returned to source");
                     }
                 }

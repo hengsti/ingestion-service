@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use crate::config::{Config, InputSourceKind};
+use crate::pipeline::outcome::PipelineOutcome;
 
 /// A single unit of work dispatched from a [`Source`] into the worker pool.
 #[derive(Debug)]
@@ -40,7 +41,7 @@ pub(crate) struct AckKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AckReceipt {
     pub key: AckKey,
-    pub durable: bool,
+    pub outcome: PipelineOutcome,
 }
 
 /// Reports a pipeline's durable completion back to its input source.
@@ -58,11 +59,11 @@ impl AckHandle {
     /// Sends the pipeline's completion status to the source.
     ///
     /// Returns `false` if the source is no longer receiving completion reports.
-    pub async fn complete(self, durable: bool) -> bool {
+    pub async fn complete(self, outcome: PipelineOutcome) -> bool {
         self.tx
             .send(AckReceipt {
                 key: self.key,
-                durable,
+                outcome,
             })
             .await
             .is_ok()
@@ -165,6 +166,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::pipeline::outcome::{DeferredReason, PipelineOutcome};
 
     #[tokio::test]
     async fn ack_handle_reports_deferred_completion() {
@@ -174,14 +176,9 @@ mod tests {
             packet_id: 42,
         };
 
-        assert!(AckHandle::new(key, tx).complete(false).await);
-        assert_eq!(
-            rx.recv().await,
-            Some(AckReceipt {
-                key,
-                durable: false,
-            })
-        );
+        let outcome = PipelineOutcome::Deferred(DeferredReason::PersistenceFailure);
+        assert!(AckHandle::new(key, tx).complete(outcome).await);
+        assert_eq!(rx.recv().await, Some(AckReceipt { key, outcome }));
     }
 
     #[tokio::test]

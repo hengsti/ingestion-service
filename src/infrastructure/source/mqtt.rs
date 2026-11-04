@@ -87,7 +87,7 @@ impl MqttSource {
         if receipt.key.generation != self.generation {
             return;
         }
-        if receipt.durable {
+        if receipt.outcome.is_ack_eligible() {
             self.ready_acks.push_back(receipt.key);
         } else {
             self.pending_acks.remove(&receipt.key);
@@ -309,6 +309,7 @@ mod tests {
 
     use super::*;
     use crate::config::MqttSourceConfig;
+    use crate::pipeline::outcome::{DeferredReason, PipelineOutcome};
 
     #[test]
     fn mqtt_options_apply_the_documented_packet_limit() {
@@ -376,7 +377,7 @@ mod tests {
 
         source.handle_ack_receipt(AckReceipt {
             key,
-            durable: false,
+            outcome: PipelineOutcome::Deferred(DeferredReason::PersistenceFailure),
         });
 
         assert!(source.ready_acks.is_empty());

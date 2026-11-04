@@ -41,7 +41,7 @@ impl PipelineStage for DlqPublishStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            let Some(reason) = ctx.dlq_reason() else {
+            let Some(reason) = ctx.rejection_reason() else {
                 return Ok(StageFlow::Stop);
             };
 
@@ -123,7 +123,7 @@ mod tests {
 
     fn ctx_with_dlq_reason(reason: &str) -> PipelineContext {
         let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", b"raw payload".to_vec());
-        ctx.mark_dlq(reason.to_string());
+        ctx.mark_rejection(reason.to_string());
         ctx
     }
 

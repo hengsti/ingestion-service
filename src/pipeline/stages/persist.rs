@@ -15,6 +15,7 @@ use crate::{
     },
     pipeline::{
         context::PipelineContext,
+        outcome::DeferredReason,
         stage::{PipelineStage, StageFlow, StageResult},
     },
 };
@@ -68,6 +69,7 @@ impl PipelineStage for PersistStage {
                 }
                 match self.wal.append_durable(event).await {
                     Ok(()) => {
+                        ctx.mark_output_stored();
                         counter!("ingest_messages_enqueued_total", "route" => route_id.clone())
                             .increment(1);
                         histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "success")
@@ -92,8 +94,8 @@ impl PipelineStage for PersistStage {
                     Err(AppendDurableError::Full(_)) => {
                         counter!("ingest_queue_full_total", "route" => route_id.clone())
                             .increment(1);
-                        warn!(topic = %ctx.topic(), "wal queue full; marking for DLQ");
-                        ctx.mark_dlq("wal queue full");
+                        warn!(topic = %ctx.topic(), "wal queue full; deferring message");
+                        ctx.mark_deferred(DeferredReason::PersistenceFailure);
                         histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_full")
                         .record(start.elapsed().as_secs_f64());
 
@@ -102,8 +104,8 @@ impl PipelineStage for PersistStage {
                     Err(AppendDurableError::Closed(_)) => {
                         counter!("ingest_queue_closed_total", "route" => route_id.clone())
                             .increment(1);
-                        warn!(topic = %ctx.topic(), "wal queue closed; marking for DLQ");
-                        ctx.mark_dlq("wal queue closed");
+                        warn!(topic = %ctx.topic(), "wal queue closed; deferring message");
+                        ctx.mark_deferred(DeferredReason::PersistenceFailure);
                         histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_closed")
                         .record(start.elapsed().as_secs_f64());
 
@@ -112,11 +114,11 @@ impl PipelineStage for PersistStage {
                     Err(AppendDurableError::TooLarge(_)) => {
                         anyhow::bail!("encoded telemetry exceeds the WAL reader record limit")
                     }
-                    Err(AppendDurableError::Durability(reason)) => {
+                    Err(AppendDurableError::Durability(_)) => {
                         counter!("ingest_durability_ack_failed_total", "route" => route_id.clone())
                             .increment(1);
-                        warn!(topic = %ctx.topic(), reason = %reason, "wal durability ack failed; marking for DLQ");
-                        ctx.mark_dlq("wal durability ack failed");
+                        warn!(topic = %ctx.topic(), "wal durability ack failed; deferring message");
+                        ctx.mark_deferred(DeferredReason::PersistenceFailure);
                         histogram!("ingest_persist_duration_seconds", "route" => route_id, "result" => "durability_failed")
                         .record(start.elapsed().as_secs_f64());
                         return Ok(StageFlow::Stop);
@@ -146,6 +148,7 @@ mod tests {
             types::{WalEvent, WalOptions},
         },
         model::messages::telemetry::{TelemetryRecord, TelemetryValue},
+        pipeline::outcome::DeferredReason,
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
@@ -223,7 +226,8 @@ mod tests {
         let result = stage.run(&mut ctx).await;
 
         assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
+        assert!(!ctx.should_quarantine());
+        assert!(ctx.output_stored());
 
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
         assert_eq!(event.topic, "smarthome/esp32-1/bme680");
@@ -287,7 +291,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), run.as_mut()).await?;
         assert!(matches!(result, Ok(StageFlow::Continue)));
         drop(run);
-        assert!(!ctx.should_publish_dlq());
+        assert!(!ctx.should_quarantine());
         Ok(())
     }
 
@@ -383,7 +387,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), run.as_mut()).await?;
         assert!(matches!(result, Ok(StageFlow::Continue)));
         drop(run);
-        assert!(!ctx.should_publish_dlq());
+        assert!(!ctx.should_quarantine());
         Ok(())
     }
 
@@ -413,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_marks_dlq_with_queue_full_when_wal_queue_is_saturated() {
+    async fn run_defers_when_wal_queue_is_saturated() {
         let dir = tempdir().unwrap();
         let (wal, _sub) = open_wal(dir.path(), 1).await;
         let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
@@ -438,7 +442,7 @@ mod tests {
         for _ in 0..1_000 {
             let mut ctx = ctx_with_record();
             let result = stage.run(&mut ctx).await;
-            if ctx.should_publish_dlq() {
+            if ctx.deferred_reason() == Some(DeferredReason::PersistenceFailure) {
                 saturated = Some((result, ctx));
                 break;
             }
@@ -446,11 +450,11 @@ mod tests {
 
         let (result, ctx) = saturated.expect("WAL queue should saturate under producer contention");
         assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert_eq!(ctx.dlq_reason(), Some("wal queue full"));
+        assert!(!ctx.should_quarantine());
     }
 
     #[tokio::test]
-    async fn run_marks_dlq_with_queue_closed_when_wal_writer_has_exited() {
+    async fn run_defers_when_wal_writer_has_exited() {
         let dir = tempdir().unwrap();
         let (wal, _sub) = Wal::open(WalOptions {
             dir: dir.path().to_path_buf(),
@@ -485,7 +489,7 @@ mod tests {
         for _ in 0..200 {
             let mut ctx = ctx_with_record();
             let result = stage.run(&mut ctx).await;
-            if ctx.dlq_reason() == Some("wal queue closed") {
+            if ctx.deferred_reason() == Some(DeferredReason::PersistenceFailure) {
                 closed = Some((result, ctx));
                 break;
             }
@@ -494,8 +498,33 @@ mod tests {
 
         let (result, ctx) = closed.expect("WAL channel should close after writer fatal exit");
         assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert_eq!(ctx.dlq_reason(), Some("wal queue closed"));
+        assert!(!ctx.should_quarantine());
+    }
+
+    #[tokio::test]
+    async fn run_defers_sync_failure_without_quarantining_input() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let (wal, _sub) = open_wal(dir.path(), 16).await;
+        *wal.test_io_hook.lock().expect("WAL hook lock") = Some(Arc::new(|step| {
+            if step == TestIoStep::Sync {
+                Err(std::io::Error::other("sync failure"))
+            } else {
+                Ok(())
+            }
+        }));
+        let stage = PersistStage::new(
+            wal,
+            Arc::new(crate::infrastructure::sink::influx::InfluxEncoder),
+        );
+        let mut ctx = ctx_with_record();
+
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
+        assert_eq!(
+            ctx.deferred_reason(),
+            Some(DeferredReason::PersistenceFailure)
+        );
+        assert!(!ctx.should_quarantine());
+        Ok(())
     }
 
     #[tokio::test]
@@ -509,6 +538,6 @@ mod tests {
         let result = stage.run(&mut ctx).await;
 
         assert!(result.is_err());
-        assert!(!ctx.should_publish_dlq());
+        assert!(!ctx.should_quarantine());
     }
 }

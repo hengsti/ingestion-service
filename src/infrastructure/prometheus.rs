@@ -106,8 +106,9 @@ const ROUTE_COUNTERS: &[&str] = &[
     "ingest_queue_full_total",
     "ingest_queue_closed_total",
     "ingest_durability_ack_failed_total",
-    "ingest_messages_processed_total",
 ];
+
+const PIPELINE_OUTCOMES: &[&str] = &["output_stored", "rejection_stored", "deferred"];
 
 const WAL_WRITER_FATAL_REASONS: &[&str] =
     &["flush_before_rotation", "open_next_segment", "write_all"];
@@ -120,6 +121,9 @@ fn register_metrics(routes: &RouteSet) {
         for &name in ROUTE_COUNTERS {
             counter!(name, "route" => route.clone()).absolute(0);
         }
+    }
+    for &outcome in PIPELINE_OUTCOMES {
+        counter!("ingest_pipeline_outcomes_total", "outcome" => outcome).absolute(0);
     }
     for &reason in WAL_WRITER_FATAL_REASONS {
         counter!("wal_writer_fatal_total", "reason" => reason).absolute(0);
@@ -194,6 +198,29 @@ mod tests {
     }
 
     #[test]
+    fn register_metrics_exports_terminal_outcome_counters_at_zero() -> Result<()> {
+        let routes = RouteSet::compile(
+            crate::config::routes::load("config/routes.json")?,
+            "smarthome/_dlq/ingest",
+        )?;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || register_metrics(&routes));
+        let body = handle.render();
+
+        for outcome in ["output_stored", "rejection_stored", "deferred"] {
+            assert!(
+                body.contains(&format!(
+                    "ingest_pipeline_outcomes_total{{outcome=\"{outcome}\"}} 0\n"
+                )),
+                "missing terminal outcome metric {outcome}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_register_metrics_exports_configured_route_counters_at_zero() -> Result<()> {
         let bundle = crate::config::routes::load("config/routes.json")?;
         let route_ids: Vec<_> = bundle.routes.iter().map(|route| route.id.clone()).collect();
@@ -211,7 +238,6 @@ mod tests {
                 "ingest_queue_full_total",
                 "ingest_queue_closed_total",
                 "ingest_durability_ack_failed_total",
-                "ingest_messages_processed_total",
             ] {
                 assert!(
                     body.contains(&format!("{name}{{route=\"{route}\"}} 0\n")),
@@ -246,8 +272,7 @@ mod tests {
                 .select("smarthome/device/bme680")
                 .context("sensor route is missing")?;
             metrics::with_local_recorder(&recorder, || {
-                counter!("ingest_messages_processed_total", "route" => sensor.metric_label())
-                    .increment(1);
+                counter!("ingest_queue_full_total", "route" => sensor.metric_label()).increment(1);
             });
             let body = handle.render();
 
@@ -255,7 +280,7 @@ mod tests {
                 let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
                 assert!(
                     body.contains(&format!(
-                        "ingest_messages_processed_total{{route=\"{escaped}\"}} {value}\n"
+                        "ingest_queue_full_total{{route=\"{escaped}\"}} {value}\n"
                     )),
                     "incorrect or colliding route label {id:?}: {body}"
                 );

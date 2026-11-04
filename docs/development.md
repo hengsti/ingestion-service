@@ -63,8 +63,9 @@ Many modules also contain unit tests next to implementation code.
 2. Implement `PipelineStage`.
 3. Use `PipelineContext` for shared state. Prefer adding explicit getters/setters over reaching around stage ordering.
 4. Return `StageFlow::Continue` for success and `StageFlow::Stop` when the pipeline should stop.
-5. To route a rejected message to the DLQ, call `ctx.mark_dlq(...)`.
-6. To stop intentionally without DLQ, return `StageFlow::Stop` without marking the context.
+5. To route deterministic invalid input to quarantine, call `ctx.mark_rejection(...)`.
+6. Operational failures are deferred, not rejected. Return `StageFlow::Stop` only with
+   an explicit rejection or deferred disposition; an unmarked stop is deferred.
 7. Register the stage in `main.rs` and in integration test pipeline builders.
 8. Add unit tests for stage behavior and an integration test if it changes end-to-end behavior.
 

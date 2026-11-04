@@ -58,11 +58,11 @@ dispatch does not guarantee per-device processing order across workers.
   compilation, and bound copied mapping data before repeated pointers amplify it. Every
   encoder's allocation-free size bound must cover its encoded bytes and saturate on
   overflow. Validate it before cache/encoding and check actual size before WAL append.
-- **Stop is not rejection:** `Err` from a stage makes `PipelineRunner` mark the context
-  for DLQ. `StageFlow::Stop` only stops execution; it does not automatically mark DLQ.
-  Use `ctx.mark_dlq(reason)` for explicit rejection; an intentional non-DLQ stop returns
-  `StageFlow::Stop` without marking the context. A DLQ publish failure is logged, not
-  recursively republished.
+- **Outcomes are explicit:** deterministic invalid input uses
+  `ctx.mark_rejection(reason)` and is acknowledged only after durable quarantine.
+  Operational stage errors and `ctx.mark_deferred(reason)` never become input rejections.
+  `StageFlow::Stop` only stops execution; an unmarked stop is deferred. A supplementary
+  DLQ publish failure after quarantine is logged, not recursively republished.
 - **Context carries stage state:** use `PipelineContext` accessors and propagate missing
   state errors with `?`. Do not bypass validation or silently synthesize missing values.
 - **Transport boundaries stay paired:** `build_source` constructs `Source` and

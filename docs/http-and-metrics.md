@@ -90,7 +90,7 @@ startup. Route-labeled histograms appear when first recorded.
 | `ingest_queue_full_total` / `ingest_queue_closed_total` | `route` | WAL append failures |
 | `ingest_durability_ack_failed_total` | `route` | WAL acknowledgement failures |
 | `ingest_persist_duration_seconds` | `route`, `result` | Persistence-stage duration |
-| `ingest_messages_processed_total` | `route` | Records reaching the observation stage |
+| `ingest_pipeline_outcomes_total` | `outcome` | Terminal results: `output_stored`, `rejection_stored`, or `deferred` |
 | `influx_write_duration_seconds` | none | Successful Influx write duration |
 | `influx_lines_written_total` | none | Lines accepted by Influx write calls |
 | `influx_write_success_total` / `influx_write_errors_total` | none | Influx write outcomes |
