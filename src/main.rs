@@ -44,10 +44,28 @@ impl Drop for ForwarderLivenessGuard {
     }
 }
 
+struct IngestWorkerLivenessGuard(Arc<AtomicBool>);
+
+impl Drop for IngestWorkerLivenessGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 fn worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 8))
         .unwrap_or(4)
+}
+
+fn worker_queue_capacities(total_capacity: usize, requested_workers: usize) -> Vec<usize> {
+    let worker_total = requested_workers.min(total_capacity);
+    let base_capacity = total_capacity / worker_total;
+    let remainder = total_capacity % worker_total;
+
+    (0..worker_total)
+        .map(|worker_id| base_capacity + usize::from(worker_id < remainder))
+        .collect()
 }
 
 /// Waits for `SIGTERM`, the default signal Docker sends on `stop`/`down`.
@@ -134,6 +152,7 @@ async fn main() -> Result<()> {
     })
     .await?;
     let wal = Arc::new(wal);
+    let wal_capacity = wal.capacity_handle();
     let (wal_used_bytes, wal_max_bytes) = wal.capacity_bytes();
     info!(
         wal_used_bytes,
@@ -166,7 +185,7 @@ async fn main() -> Result<()> {
         &cfg.metrics_bind,
         &routes,
         wal.capacity_handle(),
-        quarantine_capacity,
+        quarantine_capacity.clone(),
     )
     .await?;
 
@@ -182,7 +201,14 @@ async fn main() -> Result<()> {
     });
 
     // Input source.
-    let (source, dlq_publisher) = build_source(&cfg, source_ready.clone(), routes.as_ref()).await?;
+    let (source, dlq_publisher) = build_source(
+        &cfg,
+        source_ready.clone(),
+        routes.as_ref(),
+        wal_capacity,
+        quarantine_capacity,
+    )
+    .await?;
 
     // Pipeline.
     let pipeline = Arc::new(
@@ -204,22 +230,24 @@ async fn main() -> Result<()> {
     info!("pipeline initialized");
 
     // Worker queue: one channel per worker, round-robin dispatch.
-    let worker_total = worker_count();
-    let per_worker_cap = cfg.input_queue_capacity / worker_total;
+    let worker_capacities = worker_queue_capacities(cfg.input_queue_capacity, worker_count());
+    let worker_total = worker_capacities.len();
     info!(workers = worker_total, "starting pipeline workers");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
     let mut job_txs: Vec<mpsc::Sender<IngestJob>> = Vec::with_capacity(worker_total);
 
-    for worker_id in 0..worker_total {
-        let (tx, mut rx) = mpsc::channel::<IngestJob>(per_worker_cap);
+    for (worker_id, queue_capacity) in worker_capacities.into_iter().enumerate() {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(queue_capacity);
         job_txs.push(tx);
 
         let pipeline = pipeline.clone();
         let mut shutdown_rx = shutdown_rx.clone();
+        let worker_ready = source_ready.clone();
 
         workers.spawn(async move {
+            let _liveness = IngestWorkerLivenessGuard(worker_ready);
             info!(worker_id, "pipeline worker started");
 
             loop {
@@ -236,6 +264,9 @@ async fn main() -> Result<()> {
                 );
                 ctx.set_receive_sequence(job.receive_sequence);
                 ctx.set_qos(job.qos);
+                if job.qos == 0 {
+                    ctx.mark_rejection("MQTT QoS 0 is not recoverable by the broker");
+                }
                 let outcome = pipeline.run(&mut ctx).await;
                 if let Some(acknowledgement) = job.acknowledgement {
                     if !acknowledgement.complete(outcome).await {
@@ -391,6 +422,29 @@ mod tests {
         drop(ForwarderLivenessGuard(alive.clone()));
 
         assert!(!alive.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn worker_queue_capacities_preserve_small_total_capacity() {
+        assert_eq!(worker_queue_capacities(1, 4), vec![1]);
+        assert_eq!(worker_queue_capacities(5, 3), vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn worker_queue_capacities_sum_to_configured_capacity() {
+        let capacities = worker_queue_capacities(17, 8);
+
+        assert_eq!(capacities.iter().sum::<usize>(), 17);
+        assert!(capacities.iter().all(|capacity| *capacity > 0));
+    }
+
+    #[test]
+    fn worker_liveness_guard_marks_source_unready_when_worker_exits() {
+        let ready = Arc::new(AtomicBool::new(true));
+
+        drop(IngestWorkerLivenessGuard(ready.clone()));
+
+        assert!(!ready.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
