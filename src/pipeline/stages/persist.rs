@@ -50,50 +50,77 @@ impl PipelineStage for PersistStage {
             wal_record_frame_size(ctx.topic().len(), payload.len())
                 .context("encoded telemetry exceeds the WAL reader record limit")?;
 
-            let event = WalEvent {
+            let mut event = WalEvent {
                 topic: ctx.topic().to_string(),
                 ts_ms: chrono::Utc::now().timestamp_millis(),
                 payload,
             };
 
-            match self.wal.append_durable(event).await {
-                Ok(()) => {
-                    counter!("ingest_messages_enqueued_total", "route" => route_id.clone())
-                        .increment(1);
-                    histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "success")
+            let mut capacity_warned = false;
+            loop {
+                let notified = self.wal.capacity_notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let writer_notified = self.wal.writer_notified();
+                tokio::pin!(writer_notified);
+                if capacity_warned {
+                    writer_notified.as_mut().enable();
+                }
+                match self.wal.append_durable(event).await {
+                    Ok(()) => {
+                        counter!("ingest_messages_enqueued_total", "route" => route_id.clone())
+                            .increment(1);
+                        histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "success")
                         .record(start.elapsed().as_secs_f64());
 
-                    Ok(StageFlow::Continue)
-                }
-                Err(AppendDurableError::Full(_)) => {
-                    counter!("ingest_queue_full_total", "route" => route_id.clone()).increment(1);
-                    warn!(topic = %ctx.topic(), "wal queue full; marking for DLQ");
-                    ctx.mark_dlq("wal queue full");
-                    histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_full")
+                        return Ok(StageFlow::Continue);
+                    }
+                    Err(AppendDurableError::Capacity(rejected)) => {
+                        if !capacity_warned {
+                            counter!("wal_capacity_full_total").increment(1);
+                            warn!("wal capacity exhausted; waiting for committed segments to be reclaimed");
+                            capacity_warned = true;
+                        }
+                        event = rejected;
+                        notified.await;
+                    }
+                    Err(AppendDurableError::Full(rejected)) if capacity_warned => {
+                        event = rejected;
+                        // Failed queue admission releases its reservation and wakes capacity waiters.
+                        writer_notified.await;
+                    }
+                    Err(AppendDurableError::Full(_)) => {
+                        counter!("ingest_queue_full_total", "route" => route_id.clone())
+                            .increment(1);
+                        warn!(topic = %ctx.topic(), "wal queue full; marking for DLQ");
+                        ctx.mark_dlq("wal queue full");
+                        histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_full")
                         .record(start.elapsed().as_secs_f64());
 
-                    Ok(StageFlow::Stop)
-                }
-                Err(AppendDurableError::Closed(_)) => {
-                    counter!("ingest_queue_closed_total", "route" => route_id.clone()).increment(1);
-                    warn!(topic = %ctx.topic(), "wal queue closed; marking for DLQ");
-                    ctx.mark_dlq("wal queue closed");
-                    histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_closed")
+                        return Ok(StageFlow::Stop);
+                    }
+                    Err(AppendDurableError::Closed(_)) => {
+                        counter!("ingest_queue_closed_total", "route" => route_id.clone())
+                            .increment(1);
+                        warn!(topic = %ctx.topic(), "wal queue closed; marking for DLQ");
+                        ctx.mark_dlq("wal queue closed");
+                        histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_closed")
                         .record(start.elapsed().as_secs_f64());
 
-                    Ok(StageFlow::Stop)
-                }
-                Err(AppendDurableError::TooLarge(_)) => {
-                    anyhow::bail!("encoded telemetry exceeds the WAL reader record limit")
-                }
-                Err(AppendDurableError::Durability(reason)) => {
-                    counter!("ingest_durability_ack_failed_total", "route" => route_id.clone())
-                        .increment(1);
-                    warn!(topic = %ctx.topic(), reason = %reason, "wal durability ack failed; marking for DLQ");
-                    ctx.mark_dlq("wal durability ack failed");
-                    histogram!("ingest_persist_duration_seconds", "route" => route_id, "result" => "durability_failed")
+                        return Ok(StageFlow::Stop);
+                    }
+                    Err(AppendDurableError::TooLarge(_)) => {
+                        anyhow::bail!("encoded telemetry exceeds the WAL reader record limit")
+                    }
+                    Err(AppendDurableError::Durability(reason)) => {
+                        counter!("ingest_durability_ack_failed_total", "route" => route_id.clone())
+                            .increment(1);
+                        warn!(topic = %ctx.topic(), reason = %reason, "wal durability ack failed; marking for DLQ");
+                        ctx.mark_dlq("wal durability ack failed");
+                        histogram!("ingest_persist_duration_seconds", "route" => route_id, "result" => "durability_failed")
                         .record(start.elapsed().as_secs_f64());
-                    Ok(StageFlow::Stop)
+                        return Ok(StageFlow::Stop);
+                    }
                 }
             }
         })
@@ -103,7 +130,7 @@ impl PipelineStage for PersistStage {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::OnceLock;
+    use std::sync::{mpsc, Mutex, OnceLock};
     use std::time::Duration;
 
     use tempfile::tempdir;
@@ -115,6 +142,7 @@ mod tests {
         infrastructure::wal::{
             segment::segment_path,
             subscription::WalSubscription,
+            test_support::TestIoStep,
             types::{WalEvent, WalOptions},
         },
         model::messages::telemetry::{TelemetryRecord, TelemetryValue},
@@ -167,6 +195,7 @@ mod tests {
     async fn open_wal(dir: &std::path::Path, queue_capacity: usize) -> (Arc<Wal>, WalSubscription) {
         let (wal, sub) = Wal::open(WalOptions {
             dir: dir.to_path_buf(),
+            max_bytes: 128 * 1024 * 1024,
             segment_bytes: 1024 * 1024,
             queue_capacity,
         })
@@ -199,6 +228,147 @@ mod tests {
         let event = recv_one(&mut sub, 500).await.expect("event should arrive");
         assert_eq!(event.topic, "smarthome/esp32-1/bme680");
         assert_eq!(event.payload, expected_line_protocol());
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_persist_waits_for_reclaim_without_routing_to_dlq(
+    ) -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let (wal, mut sub) = Wal::open(WalOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 3 * 1024 * 1024,
+            segment_bytes: 1024 * 1024,
+            queue_capacity: 8,
+        })
+        .await?;
+        let wal = Arc::new(wal);
+        let event = WalEvent {
+            topic: "t".to_string(),
+            ts_ms: 1,
+            payload: "x"
+                .repeat(crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES - 25),
+        };
+        wal.append_durable(event.clone())
+            .await
+            .expect("first append");
+        wal.append_durable(event).await.expect("second append");
+        let (used, max) = wal.capacity_bytes();
+        let frame_bytes =
+            (max - used - crate::infrastructure::wal::capacity::SEGMENT_ALLOWANCE_BYTES) as usize;
+        wal.append_durable(WalEvent {
+            topic: "t".to_string(),
+            ts_ms: 2,
+            payload: "x".repeat(frame_bytes - 29),
+        })
+        .await
+        .expect("fill remaining capacity");
+
+        let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
+        let stage = PersistStage::new(Arc::clone(&wal), encoder);
+        let mut ctx = ctx_with_record();
+        let mut run = stage.run(&mut ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), run.as_mut())
+                .await
+                .is_err()
+        );
+        let first = sub.next().await.context("first record")?;
+        let second = sub.next().await.context("second record")?;
+        sub.commit(first.offset_after).await?;
+        sub.commit(second.offset_after).await?;
+        let result = tokio::time::timeout(Duration::from_secs(2), run.as_mut()).await?;
+        assert!(matches!(result, Ok(StageFlow::Continue)));
+        drop(run);
+        assert!(!ctx.should_publish_dlq());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_retried_event_survives_a_full_writer_queue() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let (wal, mut sub) = Wal::open(WalOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 3 * 1024 * 1024,
+            segment_bytes: 1024 * 1024,
+            queue_capacity: 1,
+        })
+        .await?;
+        let wal = Arc::new(wal);
+        let large = WalEvent {
+            topic: "t".to_owned(),
+            ts_ms: 1,
+            payload: "x"
+                .repeat(crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES - 25),
+        };
+        wal.append_durable(large.clone())
+            .await
+            .expect("first append");
+        wal.append_durable(large).await.expect("second append");
+        let (used, max) = wal.capacity_bytes();
+        let frame_bytes =
+            (max - used - crate::infrastructure::wal::capacity::SEGMENT_ALLOWANCE_BYTES) as usize;
+        wal.append_durable(WalEvent {
+            topic: "t".to_owned(),
+            ts_ms: 2,
+            payload: "x".repeat(frame_bytes - 29),
+        })
+        .await
+        .expect("fill remaining capacity");
+
+        let stage = PersistStage::new(
+            Arc::clone(&wal),
+            Arc::new(crate::infrastructure::sink::influx::InfluxEncoder),
+        );
+        let mut ctx = ctx_with_record();
+        let mut run = stage.run(&mut ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), run.as_mut())
+                .await
+                .is_err()
+        );
+
+        let first = sub.next().await.context("first record")?;
+        let second = sub.next().await.context("second record")?;
+        sub.commit(first.offset_after).await?;
+        sub.commit(second.offset_after).await?;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *wal.test_io_hook.lock().expect("WAL hook lock") = Some(Arc::new(move |step| {
+            if step == TestIoStep::Write {
+                if let Some(tx) = entered_tx.lock().expect("entered lock").take() {
+                    let _ = tx.send(());
+                    release_rx
+                        .lock()
+                        .expect("release lock")
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release stalled writer");
+                }
+            }
+            Ok(())
+        }));
+        let small = WalEvent {
+            topic: "queue".to_owned(),
+            ts_ms: 3,
+            payload: "value".to_owned(),
+        };
+        wal.try_append(small.clone()).expect("writer append");
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await??;
+        wal.try_append(small).expect("fill writer queue");
+
+        let while_full = tokio::time::timeout(Duration::from_millis(100), run.as_mut()).await;
+        release_tx.send(())?;
+        assert!(
+            while_full.is_err(),
+            "an event deferred by capacity must not be sent to DLQ when the writer queue is full"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), run.as_mut()).await?;
+        assert!(matches!(result, Ok(StageFlow::Continue)));
+        drop(run);
+        assert!(!ctx.should_publish_dlq());
+        Ok(())
     }
 
     #[tokio::test]
@@ -268,6 +438,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (wal, _sub) = Wal::open(WalOptions {
             dir: dir.path().to_path_buf(),
+            max_bytes: 128 * 1024 * 1024,
             // Tiny segment limit guarantees rotation on the second record.
             segment_bytes: 1,
             queue_capacity: 64,
