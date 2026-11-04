@@ -61,8 +61,9 @@ When capacity is full, the persist stage retains its current event and waits for
 reclaim rather than treating storage pressure as a schema rejection. If the writer queue is
 full during a retry, that event remains pending until the writer progresses. Worker queues
 remain bounded; a long outage can fill them and prevent graceful shutdown until the sink recovers.
-Current MQTT acknowledgements are not deferred by this wait, so incoming messages can still
-be lost before reaching the WAL, including on forced termination.
+QoS 1 messages are acknowledged only after durable output WAL or quarantine persistence. Queue
+admission failures and failed quarantine appends leave messages unacknowledged; persistent broker
+sessions are required for redelivery after a disconnect.
 
 On Linux, file sync uses `fdatasync` and directory sync uses `fsync`. These calls are meaningful
 only when the filesystem, volume driver, and storage device honor flush requests; they cannot
@@ -174,8 +175,9 @@ Cursor commit failures after a successful sink write are retried in-loop. The si
 ## Delivery Semantics
 
 The service retains WAL batches and retries delivery after both retryable and permanent sink failures.
-The current MQTT acknowledgement and rejection paths are not yet coupled to the synced WAL
-boundary; this change alone does not provide durable QoS 1 ingestion.
+For QoS 1 input, PUBACK follows durable output WAL or quarantine persistence. If neither durable
+append completes, the message remains unacknowledged. This does not provide end-to-end delivery for
+QoS 0 publishers or clean broker sessions.
 
 With the current `InfluxSink`, cases to understand are:
 

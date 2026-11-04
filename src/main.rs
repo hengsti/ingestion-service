@@ -236,7 +236,12 @@ async fn main() -> Result<()> {
                 );
                 ctx.set_receive_sequence(job.receive_sequence);
                 ctx.set_qos(job.qos);
-                pipeline.run(&mut ctx).await;
+                let durable = pipeline.run(&mut ctx).await;
+                if let Some(acknowledgement) = job.acknowledgement {
+                    if !acknowledgement.complete(durable).await {
+                        warn!(topic = %ctx.topic(), "MQTT acknowledgement result could not be returned to source");
+                    }
+                }
             }
 
             info!(worker_id, "pipeline worker stopped");
@@ -399,6 +404,7 @@ mod tests {
             receive_sequence: 0,
             retained: false,
             qos: 1,
+            acknowledgement: None,
         })
         .unwrap();
 
@@ -422,6 +428,7 @@ mod tests {
             receive_sequence: 0,
             retained: false,
             qos: 1,
+            acknowledgement: None,
         })
         .unwrap();
         tx.try_send(IngestJob {
@@ -431,6 +438,7 @@ mod tests {
             receive_sequence: 0,
             retained: true,
             qos: 1,
+            acknowledgement: None,
         })
         .unwrap();
 

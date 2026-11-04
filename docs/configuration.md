@@ -132,9 +132,10 @@ and monitor the underlying storage separately.
 
 When WAL capacity is exhausted, a pipeline worker keeps its current event and waits for committed
 segments to be reclaimed. If the sink does not recover, graceful shutdown can wait indefinitely.
-The current MQTT source acknowledges independently of WAL persistence and can still drop messages
-when input queues fill; forced termination can also lose already-acknowledged, unpersisted events.
-These limits do not provide end-to-end delivery guarantees.
+For QoS 1 messages, MQTT acknowledgement is deferred until the output WAL or quarantine append is
+durable. A full input queue leaves the message unacknowledged; persistent broker sessions are
+required for redelivery after a disconnect. QoS 0 and clean-session operation do not provide
+crash-safe broker redelivery, so these limits do not provide end-to-end delivery guarantees.
 
 ## Input Queue
 

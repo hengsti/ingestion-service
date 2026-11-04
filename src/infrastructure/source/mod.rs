@@ -27,6 +27,46 @@ pub struct IngestJob {
     pub retained: bool,
     /// Transport QoS level of the received MQTT publication.
     pub qos: u8,
+    /// Completion handle for a publication that needs a durable outcome before acknowledgement.
+    pub acknowledgement: Option<AckHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AckKey {
+    pub generation: u64,
+    pub packet_id: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AckReceipt {
+    pub key: AckKey,
+    pub durable: bool,
+}
+
+/// Reports a pipeline's durable completion back to its input source.
+#[derive(Debug)]
+pub struct AckHandle {
+    key: AckKey,
+    tx: mpsc::Sender<AckReceipt>,
+}
+
+impl AckHandle {
+    pub(crate) fn new(key: AckKey, tx: mpsc::Sender<AckReceipt>) -> Self {
+        Self { key, tx }
+    }
+
+    /// Sends the pipeline's completion status to the source.
+    ///
+    /// Returns `false` if the source is no longer receiving completion reports.
+    pub async fn complete(self, durable: bool) -> bool {
+        self.tx
+            .send(AckReceipt {
+                key: self.key,
+                durable,
+            })
+            .await
+            .is_ok()
+    }
 }
 
 /// Round-robins [`IngestJob`]s across a fixed set of per-worker bounded channels.
@@ -63,13 +103,15 @@ impl IngestDispatcher {
     /// If that worker's queue is full, the job is dropped, a warning is logged,
     /// and `ingest_event_queue_full_total` is incremented. The DLQ is not used
     /// for this pre-pipeline drop.
-    pub fn dispatch(&self, mut job: IngestJob) {
+    pub fn dispatch(&self, mut job: IngestJob) -> bool {
         job.receive_sequence = self.receive_sequence.fetch_add(1, Ordering::Relaxed);
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         if let Err(err) = self.senders[idx].try_send(job) {
             metrics::counter!("ingest_event_queue_full_total").increment(1);
             warn!(error = %err, "event queue full; dropping incoming message before pipeline");
+            return false;
         }
+        true
     }
 }
 
@@ -125,20 +167,39 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn ack_handle_reports_deferred_completion() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let key = AckKey {
+            generation: 7,
+            packet_id: 42,
+        };
+
+        assert!(AckHandle::new(key, tx).complete(false).await);
+        assert_eq!(
+            rx.recv().await,
+            Some(AckReceipt {
+                key,
+                durable: false,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn ingest_dispatcher_dispatch_round_robins_across_senders() {
         let (tx_a, mut rx_a) = mpsc::channel::<IngestJob>(4);
         let (tx_b, mut rx_b) = mpsc::channel::<IngestJob>(4);
         let dispatcher = IngestDispatcher::new(vec![tx_a, tx_b]);
 
         for i in 0..4 {
-            dispatcher.dispatch(IngestJob {
+            assert!(dispatcher.dispatch(IngestJob {
                 topic: format!("topic/{i}"),
                 payload: Bytes::from_static(b"{}"),
                 received_at_ms: i,
                 receive_sequence: 0,
                 retained: i % 2 == 0,
                 qos: 1,
-            });
+                acknowledgement: None,
+            }));
         }
 
         let mut received_a = Vec::new();
@@ -181,22 +242,24 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<IngestJob>(1);
         let dispatcher = IngestDispatcher::new(vec![tx]);
 
-        dispatcher.dispatch(IngestJob {
+        assert!(dispatcher.dispatch(IngestJob {
             topic: "topic/first".to_string(),
             payload: Bytes::from_static(b"{}"),
             received_at_ms: 10,
             receive_sequence: 0,
             retained: false,
             qos: 1,
-        });
-        dispatcher.dispatch(IngestJob {
+            acknowledgement: None,
+        }));
+        assert!(!dispatcher.dispatch(IngestJob {
             topic: "topic/second".to_string(),
             payload: Bytes::from_static(b"{}"),
             received_at_ms: 11,
             receive_sequence: 0,
             retained: true,
             qos: 1,
-        });
+            acknowledgement: None,
+        }));
 
         let first = tokio::time::timeout(Duration::from_millis(50), rx.recv())
             .await

@@ -31,7 +31,7 @@ async fn configured_firmware_sensor_persists_and_caches_frozen_metadata() -> Res
         true,
     );
 
-    pipeline.run(&mut ctx).await;
+    assert!(pipeline.run(&mut ctx).await);
 
     assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
     let event = common::recv_event(&mut sub, 500)
