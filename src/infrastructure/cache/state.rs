@@ -70,10 +70,10 @@ impl CacheState {
         let value = Arc::new(record.fields.clone());
         {
             let mut map = self.devices.write().expect("devices lock poisoned");
-            if map.get(&device_id).is_some_and(|entry| {
-                (last_seen_ms, receive_sequence)
-                    <= (entry.state.last_seen_ms, entry.receive_sequence)
-            }) {
+            if map
+                .get(&device_id)
+                .is_some_and(|entry| receive_sequence <= entry.receive_sequence)
+            {
                 return false;
             }
 
@@ -85,7 +85,7 @@ impl CacheState {
             {
                 if let Some(oldest_key) = map
                     .iter()
-                    .min_by_key(|(_, entry)| entry.state.last_seen_ms)
+                    .min_by_key(|(_, entry)| entry.receive_sequence)
                     .map(|(k, _)| k.clone())
                 {
                     map.remove(&oldest_key);
@@ -102,13 +102,13 @@ impl CacheState {
                     receive_sequence,
                 },
             );
-        }
 
-        let _ = self.event_tx.send(CacheEvent::Telemetry {
-            device_id,
-            last_seen_ms,
-            value,
-        });
+            let _ = self.event_tx.send(CacheEvent::Telemetry {
+                device_id,
+                last_seen_ms,
+                value,
+            });
+        }
         true
     }
 
@@ -151,6 +151,7 @@ fn normalize_device_id(device_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
 
     fn record(device_id: &str) -> TelemetryRecord {
         TelemetryRecord {
@@ -248,15 +249,16 @@ mod tests {
     }
 
     #[test]
-    fn update_record_ignores_older_receive_time() {
+    fn update_record_orders_by_receive_sequence_when_clock_moves_backwards() {
         let cache = CacheState::new(60_000, 2);
         let mut events = cache.subscribe_events();
 
         assert!(cache.update_record(&record("dev-a"), 2_000, 2));
-        assert!(!cache.update_record(&record("dev-a"), 1_000, 3));
+        assert!(cache.update_record(&record("dev-a"), 1_000, 3));
+        assert!(!cache.update_record(&record("dev-a"), 3_000, 1));
 
         let (state, _) = cache.snapshot_device("dev-a").expect("device is cached");
-        assert_eq!(state.last_seen_ms, 2_000);
+        assert_eq!(state.last_seen_ms, 1_000);
         assert!(matches!(
             events.try_recv(),
             Ok(CacheEvent::Telemetry {
@@ -264,7 +266,49 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(CacheEvent::Telemetry {
+                last_seen_ms: 1_000,
+                ..
+            })
+        ));
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn update_record_broadcasts_concurrent_events_in_receive_order() {
+        let count = 64;
+        let cache = CacheState::new(60_000, count);
+        let mut events = cache.subscribe_events();
+        let barrier = Arc::new(Barrier::new(count + 1));
+        let workers = (1..=count)
+            .map(|sequence| {
+                let cache = cache.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.update_record(&record("dev-a"), sequence as u64, sequence as u64);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("cache update thread should finish");
+        }
+
+        let received = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| match event {
+                CacheEvent::Telemetry { last_seen_ms, .. } => last_seen_ms,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            received.windows(2).all(|pair| pair[0] < pair[1]),
+            "accepted SSE updates must be ordered by receive sequence: {received:?}"
+        );
+        assert_eq!(received.last(), Some(&(count as u64)));
     }
 
     #[test]
