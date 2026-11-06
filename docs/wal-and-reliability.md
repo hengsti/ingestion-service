@@ -111,8 +111,10 @@ preceding retained segment and preserves enough headroom to admit a maximum-size
 
 A corrupt or inconsistent committed cursor is a startup error, including an existing empty
 cursor file; recovery preserves the segment instead of truncating through it. Complete corrupt
-records beyond the committed cursor are still handled by the existing recovery/reader policy,
-not repaired by this change.
+records and missing or unreadable segments within the known durable range also fail closed.
+Only the documented incomplete trailing crash tail may be truncated, and only after the
+committed cursor has been validated. Complete corruption is preserved and reported with its
+offset; it is not skipped or automatically repaired.
 
 ## Subscription
 
@@ -120,17 +122,21 @@ The forwarder reads through `WalSubscription`.
 
 The subscription:
 
-- Reads records from the committed cursor forward.
+- Reads records from the committed cursor forward, but never beyond the last synced head
+  published by the WAL writer.
 - Uses blocking file reads on `spawn_blocking`.
 - Keeps a reusable payload buffer to reduce allocation.
-- Waits for writer notifications when it reaches EOF.
-- Advances to the next segment when the writer rotates.
-- Can currently inspect visible bytes past the synced head and skip corrupt records.
+- Waits for writer notifications when it reaches the synced head or an expected future
+  segment.
+- Advances to the next segment only when it is within the durable range.
+- Returns a read/integrity error at the offending durable offset for invalid frames,
+  unexpected short reads, or open/seek failures; it does not skip records or roll forward.
 
 The commit operation rejects offsets beyond the synced head. This prevents a cursor or segment
-reclamation from passing unsynced data, but the reader's existing corruption-skipping and
-read-error behavior is not fail-closed. Issue #39 must address those paths before the service
-can claim end-to-end durable delivery.
+reclamation from passing unread data. A read or cursor-commit/reclaim fault is exposed to readiness
+and retains uncommitted output. Stop the service and preserve the files for diagnosis; never
+advance the cursor or delete/truncate data to bypass a read failure. See the
+[reader fail-closed contract](https://github.com/hengsti/ingestion-service/issues/39).
 
 On commit, the subscription:
 
@@ -174,10 +180,13 @@ Cursor commit failures after a successful sink write are retried in-loop. The si
 
 ## Delivery Semantics
 
-The service retains WAL batches and retries delivery after both retryable and permanent sink failures.
-For QoS 1 input, PUBACK follows durable output WAL or quarantine persistence. If neither durable
-append completes, the message remains unacknowledged. This does not provide end-to-end delivery for
-QoS 0 publishers or clean broker sessions.
+The service retains WAL batches and retries delivery after both retryable and permanent sink
+failures. For QoS 1 input, PUBACK follows durable output WAL or quarantine persistence. If
+neither durable append completes, the message remains unacknowledged. QoS 0 input cannot be
+replayed through this contract; a persistent MQTT session is required for redelivery after
+disconnect. Broker expiry/queue limits and the local journal budgets bound the guarantee.
+Sync receipts depend on the filesystem and storage honoring sync, and do not provide
+exactly-once sink delivery or protection from lost media.
 
 With the current `InfluxSink`, cases to understand are:
 
@@ -200,3 +209,6 @@ The WAL is not a general event archive. Committed older segments are deleted.
   and underlying filesystem free space.
 - Investigate permanent sink-error logs and repair the cause; the forwarder retains the failed batch and does not advance the cursor.
 - Investigate `wal_writer_fatal_total`; it means the WAL writer exited and subsequent appends will fail.
+- Investigate `wal_forwarder_read_failed` and cursor commit/reclaim failures without
+  modifying the cursor or segment files. Stop the process and preserve the journal for
+  diagnosis; complete corruption is fail-closed, not a supported repair workflow.

@@ -46,6 +46,42 @@ cargo doc --all-features --no-deps
 | Output sink | `src/infrastructure/sink/` | `Sink`/`Encoder`, Influx sink, and line-protocol point builder |
 | WAL | `src/infrastructure/wal/` | Segment writer, subscription, cursor, recovery, forwarder |
 
+## Add a calculation
+
+Calculations are a closed, stateless registry in `src/calculations.rs`, not plugins.
+`CalculationRegistry::resolve` checks configured names, mapped input types, duplicate
+calculations, and output-field collisions when the route bundle is compiled.
+`CalculationRegistry::apply` runs the resolved sequence on each record. The inline tests
+are in `src/calculations.rs` under `#[cfg(test)] mod tests`.
+
+The current calculations use these canonical field names:
+
+| Route name | Required mapped inputs | Output fields | Domain |
+|---|---|---|---|
+| `dew_point` | `temp_c` float in °C; `rel_hum_perc` float in percent | `dew_point_c` float in °C | Finite temperature; humidity must be in `(0, 100]`; output must be finite |
+| `heat_index` | `temp_c` float in °C; `rel_hum_perc` float in percent | `heat_index_c` float in °C | Finite temperature; humidity must be in `(0, 100]`; output must be finite |
+| `iaq` | `gas_ohm` float in ohms; `rel_hum_perc` float in percent | `iaq_score` float and `iaq_text` string | Gas must be positive; humidity must be in `(0, 100]`; output must be finite |
+
+`iaq` clamps its gas contribution to 5,000–50,000 ohms. If the optional mapped
+`warmed_up` boolean is `false`, the calculation still validates its inputs but omits
+both IAQ outputs; if the field is absent, IAQ is calculated. Calculations do not
+accept parameters or carry state between messages.
+
+The current focused tests include
+`test_calculation_resolve_requires_expected_mapping_types`,
+`test_calculation_apply_rejects_invalid_humidity`, and
+`test_calculation_apply_omits_iaq_when_not_warmed_up`.
+
+To add a calculation, make the smallest matching edits in `src/calculations.rs`:
+add its private enum variant and output field types, add its accepted route name and
+input mappings in `CalculationRegistry::resolve`, and implement its checked operation
+in `CalculationRegistry::apply`. Add the public route spelling to `CalculationName` in
+`src/config/routes.rs`. Add focused inline tests for resolution, mapped types, domains,
+outputs, and collision/error cases. Exercise a real route through existing preflight
+and pipeline tests. Update the synthetic bundle/docs only when they help explain the
+new calculation. Do not add dynamic loading, an expression language, or
+history-dependent calculations.
+
 ## Test Layout
 
 | File | Purpose |
@@ -258,8 +294,12 @@ Steps:
 
 The CD workflow:
 
-- Builds and pushes ARM64 Docker images to GHCR on SemVer tags or manual dispatch.
-- Uses tags `latest`, `vX.Y.Z`, or `sha-<12hex>`.
-- Deploys the `ingest` service on the self-hosted ARM64 runner.
+- Validates the exact source revision before building or redeploying an ARM64 image.
+- Publishes a version tag and full-source-SHA tag, then deploys the registry digest;
+  it does not publish or deploy `latest` or short SHA tags.
+- Snapshots and preflights the complete host config bundle with the candidate image,
+  waits for durable-intake readiness, and restores the previous image/config pair on
+  failure without removing WAL or quarantine volumes.
 
-See [Releasing and Deploying](releasing.md).
+See [Releasing and Deploying](releasing.md) and the remotely accessible
+[Epic #23](https://github.com/hengsti/ingestion-service/issues/23).

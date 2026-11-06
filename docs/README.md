@@ -26,15 +26,16 @@ These docs are written for:
 |---|---|
 | `src/main.rs` | Runtime wiring: config, input source, workers, pipeline, WAL, output sink, HTTP, metrics, shutdown |
 | `src/config.rs` | Environment variable parsing and validation |
-| `src/model/` | MQTT topic matching and canonical message structs |
+| `src/model/` | MQTT topic matching and typed telemetry records |
 | `src/pipeline/` | Sequential processing pipeline and stages |
 | `src/infrastructure/source/` | `Source`/`DlqPublisher` traits and the MQTT implementation |
-| `src/infrastructure/router.rs` | Topic to schema and message type routing |
-| `src/infrastructure/schema.rs` | Embedded JSON Schema compilation and validation |
+| `src/infrastructure/router.rs` | Route bundle compilation, topic filters, schemas, mapping, and calculations |
+| `src/infrastructure/schema.rs` | JSON Schema loading and validation from the configured route bundle |
 | `src/infrastructure/cache/` | Latest sensor state cache and HTTP/SSE API |
 | `src/infrastructure/sink/` | `Sink`/`Encoder` traits, the InfluxDB implementation, and the line protocol point builder |
 | `src/infrastructure/wal/` | WAL writer, reader subscription, cursor, recovery, and forwarder |
-| `schema/` | Raw and business JSON Schemas embedded at compile time |
+| `config/routes.json` and `config/schemas/` | Shipped firmware routes and their runtime-loaded raw/output schemas |
+| `config/examples/climate/` | Synthetic copyable route, schemas, and environment reference |
 | `tests/` | Integration tests for pipeline, cache API, batching, and sink forwarding |
 | `.github/workflows/` | CI and CD workflows |
 
@@ -45,16 +46,27 @@ Input source (MQTT today)
   -> bounded worker queues
   -> decode
   -> raw validation
-  -> transform
-  -> business validation
-  -> cache update
-  -> WAL append (payload rendered by the active sink's Encoder)
+  -> typed mapping/calculations
+  -> output validation
+  -> optional cache update
+  -> synced WAL append (payload rendered by the active sink's Encoder)
   -> metrics observation
   -> WAL forwarder
   -> output sink (InfluxDB v2 today)
 ```
 
-Failures before persistence are routed to the DLQ via the active input source when a pipeline stage marks the message for DLQ. Messages dropped before entering the pipeline, for example because a worker queue is full, are counted in metrics but are not published to the DLQ.
+Deterministic invalid input is durably quarantined before a supplementary DLQ publication.
+Operational failures are deferred, not rejected. When a worker queue is full, admission is
+backpressured and the MQTT source withholds the acknowledgement; this is not a drop counter.
+QoS 1 redelivery remains bounded by broker persistence, expiry, queue capacity, and local
+journal capacity.
+
+## Route examples and roadmap
+
+- [Synthetic climate route walkthrough](../config/examples/climate/README.md)
+- [Shipped firmware routes](../config/routes.json)
+- [Epic #23](https://github.com/hengsti/ingestion-service/issues/23) and its
+  [unified route contract #19](https://github.com/hengsti/ingestion-service/issues/19)
 
 ## Rust Compatibility
 

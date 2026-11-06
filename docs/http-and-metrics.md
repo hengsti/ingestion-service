@@ -6,7 +6,10 @@ The service exposes a cache API on `CACHE_BIND` and Prometheus metrics on `METRI
 
 Routes with `cache: true` store the latest mapped record fields by normalized `device_id`.
 The cache uses the receive timestamp captured at intake for `last_seen_ms`; it does not
-represent persistence or sink delivery.
+represent persistence or sink delivery. It is process-local and starts empty after restart;
+a retained broker publication can repopulate it if delivered after subscription. This cached
+snapshot is not an event history or a delivery receipt. The shipped
+[`firmware-sensor` route](../config/routes.json) enables the cache; `firmware-status` does not.
 
 ### `GET /healthz`
 

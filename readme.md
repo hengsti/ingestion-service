@@ -2,7 +2,9 @@
 
 Performance-focused Rust service for ingesting smart home telemetry from a configurable input source (MQTT today), validating and mapping it through a configured route, durably staging typed sink output in a local write-ahead log (WAL), and forwarding batches to the configured output sink (InfluxDB v2 today).
 
-Invalid messages are published to a DLQ on the active input source (MQTT today). Cache-enabled route state is exposed through HTTP and Server-Sent Events (SSE), and Prometheus metrics are available for scraping.
+Deterministically invalid messages are durably quarantined before a supplementary DLQ
+publication on the active input source (MQTT today). Cache-enabled route state is exposed
+through HTTP and Server-Sent Events (SSE), and Prometheus metrics are available for scraping.
 
 ![CI](https://github.com/hengsti/ingestion-service/actions/workflows/ci.yaml/badge.svg)
 ![CD](https://github.com/hengsti/ingestion-service/actions/workflows/cd.yaml/badge.svg)
@@ -15,7 +17,8 @@ Invalid messages are published to a DLQ on the active input source (MQTT today).
 - Maps publisher payloads into typed telemetry records and applies configured calculations.
 - Writes a pre-rendered wire-format payload to a local WAL via a swappable output sink (only InfluxDB is implemented today, selected with `OUTPUT_SINK`).
 - Retries transient InfluxDB failures without advancing the WAL cursor.
-- Publishes rejected payloads to a DLQ destination on the active input source (an MQTT topic today).
+- Quarantines deterministic rejection before supplementary DLQ publication; operational
+  failures remain unacknowledged for retry instead of being called invalid input.
 - Serves latest state for cache-enabled routes over HTTP and SSE.
 - Exposes Prometheus metrics and structured JSON logs.
 
@@ -28,7 +31,8 @@ graph LR
     Q --> W[Worker pool]
     W --> P[Pipeline stages]
     P -->|valid| WAL[Write-ahead log]
-    P -->|invalid| DLQ[DLQ via input source]
+    P -->|rejected| QJ[Quarantine journal]
+    QJ --> DLQ[Supplementary DLQ publish]
     WAL --> F[WAL forwarder]
     F -->|batched writes| IDB[(InfluxDB v2)]
     P --> CACHE[Latest-state cache]
@@ -135,12 +139,19 @@ Start with [docs/README.md](docs/README.md).
 |---|---|
 | Run the service locally | [docs/tutorial.md](docs/tutorial.md) |
 | Configure runtime environment | [docs/configuration.md](docs/configuration.md) |
+| Copy a synthetic route or inspect firmware routes | [Climate example](config/examples/climate/README.md); [Firmware bundle](config/routes.json) |
 | Publish compatible MQTT payloads | [docs/messages-and-routing.md](docs/messages-and-routing.md) |
 | Use HTTP, SSE, and metrics | [docs/http-and-metrics.md](docs/http-and-metrics.md) |
 | Understand WAL behavior | [docs/wal-and-reliability.md](docs/wal-and-reliability.md) |
 | Operate the service | [docs/operations.md](docs/operations.md) |
 | Develop or extend the service | [docs/development.md](docs/development.md) |
 | Release and deploy | [docs/releasing.md](docs/releasing.md) |
+
+The route model and delivery assumptions are tracked in the remotely accessible
+[Epic #23](https://github.com/hengsti/ingestion-service/issues/23) and
+[issue #19](https://github.com/hengsti/ingestion-service/issues/19). QoS 1 intake
+and local sync are bounded by broker/session and storage capacity; duplicates are
+possible, and the service does not promise exactly-once delivery.
 
 ## Development
 
