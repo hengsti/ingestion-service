@@ -40,7 +40,8 @@ For the full design, see [docs/architecture.md](docs/architecture.md) and [docs/
 
 ## Quick Start
 
-The service requires an input source (MQTT today), InfluxDB v2, and a writable WAL directory.
+The service requires an input source (MQTT today), InfluxDB v2, and separate writable WAL and
+quarantine directories.
 
 Set the required environment:
 
@@ -59,6 +60,9 @@ INFLUX_TOKEN=change-me
 BATCH_SIZE=500
 FLUSH_INTERVAL_MS=1000
 WAL_DIR=./data/wal
+WAL_MAX_BYTES=268435456
+QUARANTINE_DIR=./data/quarantine
+QUARANTINE_MAX_BYTES=268435456
 METRICS_BIND=0.0.0.0:9090
 CACHE_BIND=0.0.0.0:8085
 CACHE_TTL_MS=60000
@@ -111,11 +115,15 @@ docker run --rm \
   -e BATCH_SIZE=500 \
   -e FLUSH_INTERVAL_MS=1000 \
   -e WAL_DIR=/data/wal \
+  -e WAL_MAX_BYTES=268435456 \
+  -e QUARANTINE_DIR=/data/quarantine \
+  -e QUARANTINE_MAX_BYTES=268435456 \
   -e METRICS_BIND=0.0.0.0:9090 \
   -e CACHE_BIND=0.0.0.0:8085 \
   -e CACHE_TTL_MS=60000 \
   -e CACHE_BUFFER=1024 \
   -v smarthome-ingest-wal:/data/wal \
+  -v smarthome-ingest-quarantine:/data/quarantine \
   smarthome-ingest
 ```
 

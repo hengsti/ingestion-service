@@ -4,7 +4,12 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::{infrastructure::router::CompiledRoute, model::messages::telemetry::TelemetryRecord};
+use crate::{
+    infrastructure::router::CompiledRoute, model::messages::telemetry::TelemetryRecord,
+    pipeline::outcome::DeferredReason,
+};
+
+const MAX_DLQ_REASON_BYTES: usize = 4096;
 
 pub struct PipelineContext {
     topic: String,
@@ -12,11 +17,14 @@ pub struct PipelineContext {
     received_at_ms: i64,
     receive_sequence: u64,
     retained: bool,
+    qos: u8,
     payload_utf8: Option<String>,
     payload_json: Option<Value>,
     route: Option<Arc<CompiledRoute>>,
     telemetry_record: Option<TelemetryRecord>,
-    dlq_reason: Option<String>,
+    rejection_reason: Option<String>,
+    deferred_reason: Option<DeferredReason>,
+    output_stored: bool,
     started_at: Instant,
 }
 
@@ -45,11 +53,14 @@ impl PipelineContext {
             received_at_ms,
             receive_sequence: 0,
             retained,
+            qos: 0,
             payload_utf8: None,
             payload_json: None,
             route: None,
             telemetry_record: None,
-            dlq_reason: None,
+            rejection_reason: None,
+            deferred_reason: None,
+            output_stored: false,
             started_at: Instant::now(),
         }
     }
@@ -80,6 +91,16 @@ impl PipelineContext {
     /// Returns whether the broker marked the source message as retained.
     pub fn retained(&self) -> bool {
         self.retained
+    }
+
+    /// Returns the transport QoS level captured at intake.
+    pub fn qos(&self) -> u8 {
+        self.qos
+    }
+
+    /// Sets the transport QoS level captured at intake.
+    pub fn set_qos(&mut self, qos: u8) {
+        self.qos = qos;
     }
 
     pub fn started_at(&self) -> Instant {
@@ -123,6 +144,11 @@ impl PipelineContext {
             .ok_or_else(|| anyhow!("selected route missing in pipeline context"))
     }
 
+    /// Returns the selected route identifier, if route selection completed.
+    pub fn route_id(&self) -> Option<&str> {
+        self.route.as_deref().map(CompiledRoute::id)
+    }
+
     /// Stores the mapped and calculated telemetry record.
     pub fn set_telemetry_record(&mut self, record: TelemetryRecord) {
         self.telemetry_record = Some(record);
@@ -139,18 +165,47 @@ impl PipelineContext {
             .ok_or_else(|| anyhow!("telemetry_record missing in pipeline context"))
     }
 
-    pub fn mark_dlq(&mut self, reason: impl Into<String>) {
-        if self.dlq_reason.is_none() {
-            self.dlq_reason = Some(reason.into());
+    /// Marks the input as invalid and eligible for durable quarantine.
+    pub fn mark_rejection(&mut self, reason: impl Into<String>) {
+        if self.rejection_reason.is_none() {
+            let mut reason = reason.into();
+            if reason.len() > MAX_DLQ_REASON_BYTES {
+                let mut end = MAX_DLQ_REASON_BYTES;
+                while !reason.is_char_boundary(end) {
+                    end -= 1;
+                }
+                reason.truncate(end);
+            }
+            self.rejection_reason = Some(reason);
         }
     }
 
-    pub fn dlq_reason(&self) -> Option<&str> {
-        self.dlq_reason.as_deref()
+    /// Marks an operational failure that must not be stored as an input rejection.
+    pub(crate) fn mark_deferred(&mut self, reason: DeferredReason) {
+        self.deferred_reason = Some(reason);
     }
 
-    pub fn should_publish_dlq(&self) -> bool {
-        self.dlq_reason.is_some()
+    /// Marks that the persistence stage received confirmation of a durable append.
+    pub(crate) fn mark_output_stored(&mut self) {
+        self.output_stored = true;
+    }
+
+    pub(crate) fn deferred_reason(&self) -> Option<DeferredReason> {
+        self.deferred_reason
+    }
+
+    pub(crate) fn output_stored(&self) -> bool {
+        self.output_stored
+    }
+
+    /// Returns the reason the input was marked for quarantine, if any.
+    pub fn rejection_reason(&self) -> Option<&str> {
+        self.rejection_reason.as_deref()
+    }
+
+    /// Returns whether deterministic rejection requires quarantine.
+    pub fn should_quarantine(&self) -> bool {
+        self.rejection_reason.is_some()
     }
 
     pub fn payload_for_dlq(&self) -> String {
@@ -162,5 +217,32 @@ impl PipelineContext {
             Ok(s) => s.to_string(),
             Err(_) => "<non-utf8>".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::outcome::DeferredReason;
+
+    #[test]
+    fn test_mark_rejection_reason_truncates_at_utf8_boundary() {
+        let mut ctx = PipelineContext::new("topic", Vec::<u8>::new());
+        ctx.mark_rejection("é".repeat(3000));
+
+        assert_eq!(ctx.rejection_reason().map(str::len), Some(4096));
+    }
+
+    #[test]
+    fn test_deferred_operational_failure_is_not_a_rejection() {
+        let mut ctx = PipelineContext::new("topic", Vec::<u8>::new());
+
+        ctx.mark_deferred(DeferredReason::PersistenceFailure);
+
+        assert_eq!(
+            ctx.deferred_reason(),
+            Some(DeferredReason::PersistenceFailure)
+        );
+        assert!(!ctx.should_quarantine());
     }
 }

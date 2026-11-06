@@ -10,6 +10,7 @@ use smarthome_ingest::{
     config::routes,
     infrastructure::{
         cache::state::CacheState,
+        quarantine::Quarantine,
         router::RouteSet,
         sink::{influx::InfluxEncoder, Encoder},
         source::{mqtt::MqttDlqPublisher, DlqPublisher},
@@ -51,6 +52,7 @@ pub async fn open_temp_wal() -> (Arc<Wal>, WalSubscription, TempDir) {
     let tmp = tempfile::tempdir().expect("create temp WAL dir");
     let (wal, sub) = Wal::open(WalOptions {
         dir: tmp.path().to_path_buf(),
+        max_bytes: 128 * 1024 * 1024,
         segment_bytes: 1024 * 1024,
         queue_capacity: 1_000,
     })
@@ -93,6 +95,15 @@ pub async fn build_pipeline_with_routes_and_encoder(
 ) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
     let cache = CacheState::new(60_000, 64);
     let (wal, sub, tmp) = open_temp_wal().await;
+    let (quarantine, quarantine_subscription) = Quarantine::open(WalOptions {
+        dir: tmp.path().join("quarantine"),
+        max_bytes: 16 * 1024 * 1024,
+        segment_bytes: 1024 * 1024,
+        queue_capacity: 1_000,
+    })
+    .await
+    .expect("open quarantine journal");
+    drop(quarantine_subscription);
 
     let pipeline = PipelineRunner::new()
         .add_stage(DecodeStage::new())
@@ -105,6 +116,7 @@ pub async fn build_pipeline_with_routes_and_encoder(
         .with_failure_stage(DlqPublishStage::new(
             dlq_publisher(),
             "smarthome/_dlq/ingest",
+            Arc::new(quarantine),
         ));
 
     (pipeline, sub, cache, tmp)
@@ -113,11 +125,11 @@ pub async fn build_pipeline_with_routes_and_encoder(
 /// Pulls the next persisted event from the WAL, returning `None` if none
 /// arrives within `ms` milliseconds (used to assert "nothing was persisted").
 pub async fn recv_event(sub: &mut WalSubscription, ms: u64) -> Option<WalEvent> {
-    tokio::time::timeout(Duration::from_millis(ms), sub.next())
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.event)
+    match tokio::time::timeout(Duration::from_millis(ms), sub.next()).await {
+        Ok(Ok(Some(entry))) => Some(entry.event),
+        Ok(Ok(None)) | Err(_) => None,
+        Ok(Err(error)) => panic!("WAL subscription failed: {error:#}"),
+    }
 }
 
 pub fn valid_sensor_payload(device_id: &str) -> Vec<u8> {

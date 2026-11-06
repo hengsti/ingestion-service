@@ -159,6 +159,6 @@ mod tests {
         let mut ctx = PipelineContext::new(TOPIC, vec![]);
 
         assert!(stage.run(&mut ctx).await.is_err());
-        assert!(!ctx.should_publish_dlq());
+        assert!(!ctx.should_quarantine());
     }
 }

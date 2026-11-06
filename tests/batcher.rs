@@ -396,7 +396,6 @@ async fn forwarder_replays_mixed_type_conflict_batch_after_http_400() {
         spawn_scripted_mock_influx(vec![StatusCode::BAD_REQUEST, StatusCode::NO_CONTENT]).await;
     let sink = make_sink(&url);
     let (wal, sub, tmp) = common::open_temp_wal().await;
-    let handle = tokio::spawn(run_forwarder(sub, sink, 2, 1));
 
     let valid = status_event("dev-conflict");
     let conflicting = WalEvent {
@@ -405,10 +404,15 @@ async fn forwarder_replays_mixed_type_conflict_batch_after_http_400() {
         ..status_event("dev-conflict")
     };
     let expected_body = format!("{}\n{}", valid.payload, conflicting.payload);
-    wal.try_append(valid).unwrap();
-    wal.try_append(conflicting).unwrap();
+    wal.append_durable(valid)
+        .await
+        .expect("persist valid event");
+    wal.append_durable(conflicting)
+        .await
+        .expect("persist conflicting event");
+    let handle = tokio::spawn(run_forwarder(sub, sink, 2, 60_000));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while post_count(&received) < 2 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

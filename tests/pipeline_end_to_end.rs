@@ -14,13 +14,13 @@ use smarthome_ingest::{
     config::routes::{self, RouteBundle},
     infrastructure::{router::RouteSet, sink::Encoder},
     model::messages::telemetry::{TelemetryRecord, TelemetryValue},
-    pipeline::context::PipelineContext,
+    pipeline::{context::PipelineContext, outcome::PipelineOutcome},
 };
 
 const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
 
 #[tokio::test]
-async fn configured_firmware_sensor_persists_and_caches_frozen_metadata() -> Result<()> {
+async fn test_pipeline_outcome_output_stored_for_configured_firmware_sensor() -> Result<()> {
     let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;
     let topic = "smarthome/esp32-1/bme680";
     let received_at_ms = 1_700_000_000_456;
@@ -31,9 +31,9 @@ async fn configured_firmware_sensor_persists_and_caches_frozen_metadata() -> Res
         true,
     );
 
-    pipeline.run(&mut ctx).await;
+    assert_eq!(pipeline.run(&mut ctx).await, PipelineOutcome::OutputStored);
 
-    assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
+    assert!(!ctx.should_quarantine(), "{:?}", ctx.rejection_reason());
     let event = common::recv_event(&mut sub, 500)
         .await
         .expect("configured route should persist to WAL");
@@ -57,6 +57,28 @@ async fn configured_firmware_sensor_persists_and_caches_frozen_metadata() -> Res
         state.value.get("temp_c"),
         Some(&TelemetryValue::Float(22.5))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pipeline_outcome_unrouted_qos_one_is_durably_rejected() -> Result<()> {
+    let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
+    let mut ctx = PipelineContext::new_with_metadata(
+        "smarthome/esp32-1/unconfigured",
+        b"{}".to_vec(),
+        1_700_000_000_456,
+        false,
+    );
+    ctx.set_qos(1);
+
+    assert_eq!(
+        pipeline.run(&mut ctx).await,
+        PipelineOutcome::RejectionStored
+    );
+    assert!(ctx
+        .rejection_reason()
+        .is_some_and(|reason| reason.contains("no configured route")));
+    assert!(common::recv_event(&mut sub, 100).await.is_none());
     Ok(())
 }
 
@@ -185,9 +207,9 @@ async fn arbitrary_topic_uses_configured_mapping_calculation_and_output_schema()
         true,
     );
 
-    pipeline.run(&mut ctx).await;
+    assert_eq!(pipeline.run(&mut ctx).await, PipelineOutcome::OutputStored);
 
-    assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
+    assert!(!ctx.should_quarantine(), "{:?}", ctx.rejection_reason());
     let event = common::recv_event(&mut sub, 500)
         .await
         .expect("arbitrary-topic configured route should persist to WAL");
@@ -239,9 +261,12 @@ async fn alternate_route_config_changes_schema_mapping_calculation_and_output() 
         1_700_000_000_456,
         false,
     );
-    pipeline.run(&mut invalid_ctx).await;
+    assert_eq!(
+        pipeline.run(&mut invalid_ctx).await,
+        PipelineOutcome::RejectionStored
+    );
     assert!(
-        invalid_ctx.should_publish_dlq(),
+        invalid_ctx.should_quarantine(),
         "alternate raw schema must apply"
     );
     assert!(common::recv_event(&mut sub, 100).await.is_none());
@@ -258,9 +283,12 @@ async fn alternate_route_config_changes_schema_mapping_calculation_and_output() 
         1_700_000_000_456,
         false,
     );
-    pipeline.run(&mut invalid_output_ctx).await;
+    assert_eq!(
+        pipeline.run(&mut invalid_output_ctx).await,
+        PipelineOutcome::RejectionStored
+    );
     assert!(
-        invalid_output_ctx.should_publish_dlq(),
+        invalid_output_ctx.should_quarantine(),
         "alternate output schema must require battery_pct"
     );
     assert!(common::recv_event(&mut sub, 100).await.is_none());
@@ -278,8 +306,8 @@ async fn alternate_route_config_changes_schema_mapping_calculation_and_output() 
         1_700_000_000_456,
         false,
     );
-    pipeline.run(&mut ctx).await;
-    assert!(!ctx.should_publish_dlq(), "{:?}", ctx.dlq_reason());
+    assert_eq!(pipeline.run(&mut ctx).await, PipelineOutcome::OutputStored);
+    assert!(!ctx.should_quarantine(), "{:?}", ctx.rejection_reason());
     let event = common::recv_event(&mut sub, 500)
         .await
         .context("alternate configured route should persist to WAL")?;
@@ -318,9 +346,12 @@ async fn valid_timestamp_zero_is_rejected_before_wal_persistence() -> Result<()>
         false,
     );
 
-    pipeline.run(&mut ctx).await;
+    assert_eq!(
+        pipeline.run(&mut ctx).await,
+        PipelineOutcome::RejectionStored
+    );
 
-    assert!(ctx.should_publish_dlq());
+    assert!(ctx.should_quarantine());
     assert!(
         common::recv_event(&mut sub, 100).await.is_none(),
         "invalid output must not reach the WAL"
@@ -333,10 +364,13 @@ async fn oversized_payload_is_rejected_before_json_decoding() -> Result<()> {
     let (pipeline, mut sub, _cache, _tmp) = common::build_pipeline().await;
     let mut ctx = PipelineContext::new("smarthome/esp32-1/bme680", vec![b'x'; 64 * 1024 + 1]);
 
-    pipeline.run(&mut ctx).await;
+    assert_eq!(
+        pipeline.run(&mut ctx).await,
+        PipelineOutcome::RejectionStored
+    );
 
-    assert!(ctx.should_publish_dlq());
-    assert!(ctx.dlq_reason().unwrap_or("").contains("too large"));
+    assert!(ctx.should_quarantine());
+    assert!(ctx.rejection_reason().unwrap_or("").contains("too large"));
     assert!(common::recv_event(&mut sub, 100).await.is_none());
     Ok(())
 }
@@ -371,12 +405,12 @@ async fn oversized_encoded_output_is_rejected_before_cache_update() -> Result<()
         false,
     );
 
-    pipeline.run(&mut ctx).await;
-
-    assert!(
-        ctx.should_publish_dlq(),
-        "oversized output must be rejected"
+    assert_eq!(
+        pipeline.run(&mut ctx).await,
+        PipelineOutcome::RejectionStored
     );
+
+    assert!(ctx.should_quarantine(), "oversized output must be rejected");
     assert!(
         !called.load(Ordering::Relaxed),
         "must reject before encoding"

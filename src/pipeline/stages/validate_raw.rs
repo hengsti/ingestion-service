@@ -36,15 +36,15 @@ impl PipelineStage for ValidateRawStage {
             let start = Instant::now();
             let Some(route) = self.routes.select(ctx.topic()) else {
                 counter!("ingest_validate_raw_failed_total").increment(1);
-                ctx.mark_dlq("raw validation failed: no configured route for topic");
+                ctx.mark_rejection("raw validation failed: no configured route for topic");
                 histogram!("ingest_validate_raw_duration_seconds", "result" => "failed")
                     .record(start.elapsed().as_secs_f64());
                 return Ok(StageFlow::Stop);
             };
+            ctx.set_route(route.clone());
 
             match route.validate_raw(ctx.payload_json()?) {
                 Ok(()) => {
-                    ctx.set_route(route);
                     counter!("ingest_validate_raw_success_total").increment(1);
                     histogram!("ingest_validate_raw_duration_seconds", "result" => "success")
                         .record(start.elapsed().as_secs_f64());
@@ -55,10 +55,9 @@ impl PipelineStage for ValidateRawStage {
                     warn!(
                         topic = %ctx.topic(),
                         route = %route.id(),
-                        error = %err,
                         "raw validation failed; marking for DLQ"
                     );
-                    ctx.mark_dlq(format!("raw validation failed: {err}"));
+                    ctx.mark_rejection(format!("raw validation failed: {err}"));
                     histogram!("ingest_validate_raw_duration_seconds", "result" => "failed")
                         .record(start.elapsed().as_secs_f64());
                     Ok(StageFlow::Stop)
@@ -162,9 +161,9 @@ mod tests {
         );
 
         assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
-        assert!(ctx.should_publish_dlq());
+        assert!(ctx.should_quarantine());
         assert!(ctx
-            .dlq_reason()
+            .rejection_reason()
             .is_some_and(|reason| reason.contains("route")));
         Ok(())
     }
@@ -180,7 +179,7 @@ mod tests {
         );
 
         assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
-        assert!(ctx.should_publish_dlq());
+        assert!(ctx.should_quarantine());
         Ok(())
     }
 }

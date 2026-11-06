@@ -29,7 +29,7 @@ fn initial_backoff_ms(flush_interval_ms: u64) -> u64 {
 ///
 /// A flush is triggered when either the batch reaches `batch_size` or the
 /// `flush_interval_ms` ticker fires with a non-empty batch. The loop exits
-/// cleanly when the subscription is closed (`next()` returns `None`).
+/// cleanly when the subscription is closed (`next()` returns `Ok(None)`).
 ///
 /// On any sink failure the batch is held and retried with bounded backoff
 /// without advancing the cursor, so the WAL buffers across the outage; new
@@ -37,9 +37,9 @@ fn initial_backoff_ms(flush_interval_ms: u64) -> u64 {
 /// a flush is in flight.
 ///
 /// # Errors
-/// This function only returns `Ok(())` on normal shutdown. Sink failures are
-/// handled in-loop with bounded backoff, and cursor commit failures are
-/// retried in-loop until durable.
+/// Returns an error on WAL read failure without committing the affected batch.
+/// Sink failures are handled in-loop with bounded backoff, and cursor commit
+/// failures are retried in-loop until durable.
 pub async fn run_forwarder(
     mut sub: WalSubscription,
     sink: Arc<dyn Sink>,
@@ -59,6 +59,7 @@ pub async fn run_forwarder(
                 }
             }
             maybe = sub.next() => {
+                let maybe = maybe?;
                 match maybe {
                     Some(entry) => {
                         batch.push(entry);
@@ -180,9 +181,11 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use std::collections::VecDeque;
     use std::fs;
     use std::future::Future;
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -260,6 +263,7 @@ mod tests {
     fn opts(dir: &std::path::Path) -> WalOptions {
         WalOptions {
             dir: dir.to_path_buf(),
+            max_bytes: 128 * 1024 * 1024,
             segment_bytes: 1024 * 1024,
             queue_capacity: 32,
         }
@@ -271,10 +275,65 @@ mod tests {
             let entry = tokio::time::timeout(Duration::from_millis(500), sub.next())
                 .await
                 .expect("timed out draining")
+                .expect("WAL subscription failed")
                 .expect("subscription closed early");
             out.push(entry);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_outage_recovery_reclaims_and_readmits() -> Result<()> {
+        let dir = tempdir()?;
+        let mut options = opts(dir.path());
+        options.max_bytes = 3 * 1024 * 1024;
+        let (wal, sub) = Wal::open(options).await?;
+        let event = WalEvent {
+            topic: "t".to_string(),
+            ts_ms: 1,
+            payload: "x"
+                .repeat(crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES - 25),
+        };
+        assert!(wal.append_durable(event.clone()).await.is_ok());
+        assert!(wal.append_durable(event.clone()).await.is_ok());
+        let mut rejected = match wal.append_durable(event).await {
+            Err(crate::infrastructure::wal::types::AppendDurableError::Capacity(event)) => event,
+            _ => panic!("a full journal must return the rejected event"),
+        };
+        let mock = Arc::new(MockSink::new((0..100).map(|_| Resp::Retry).collect()));
+        let sink: Arc<dyn Sink> = mock.clone();
+        let forwarder = tokio::spawn(run_forwarder(sub, sink, 1, 10));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.call_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert!(read_cursor(dir.path())?.is_none());
+        mock.responses.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match wal.append_durable(rejected).await {
+                    Ok(()) => break,
+                    Err(crate::infrastructure::wal::types::AppendDurableError::Capacity(event)) => {
+                        rejected = event;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(_) => panic!("reclaimed capacity should admit the event"),
+                }
+            }
+        })
+        .await?;
+        drop(wal);
+        tokio::time::timeout(Duration::from_secs(5), forwarder).await???;
+        assert_eq!(
+            read_cursor(dir.path())?
+                .context("committed cursor")?
+                .segment_id,
+            3
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -362,6 +421,55 @@ mod tests {
 
         assert_eq!(mock.call_count(), 1);
         assert_eq!(read_cursor(dir.path()).unwrap(), Some(highest));
+    }
+
+    #[tokio::test]
+    async fn test_forwarder_stops_on_corrupt_record_without_committing() -> Result<()> {
+        let dir = tempdir()?;
+        let (wal, sub) = Wal::open(opts(dir.path())).await?;
+        let first = sample_event(0);
+        let first_payload = first.payload.clone();
+        let mut first_frame = Vec::new();
+        crate::infrastructure::wal::codec::encode_into(&mut first_frame, &first)?;
+        assert!(wal.append_durable(first).await.is_ok());
+        assert!(wal.append_durable(sample_event(1)).await.is_ok());
+
+        let path = crate::infrastructure::wal::segment::segment_path(dir.path(), 1);
+        let mut file = fs::OpenOptions::new().write(true).open(path)?;
+        file.seek(SeekFrom::Start(first_frame.len() as u64 + 4))?;
+        file.write_all(&[0xFF; 8])?;
+        file.sync_all()?;
+
+        let mock = Arc::new(MockSink::new(Vec::new()));
+        let sink: Arc<dyn Sink> = mock.clone();
+        let result = run_forwarder(sub, sink, 10, 60_000).await;
+
+        let error = result.expect_err("WAL read failures must stop the forwarder");
+        assert!(
+            error.to_string().contains("durable offset 1:"),
+            "failure should identify its WAL offset: {error:#}"
+        );
+        let batches = mock.batches.lock().unwrap();
+        assert!(batches.len() <= 1, "only the valid record may be flushed");
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .all(|payload| payload == &first_payload),
+            "corrupt records must not reach the sink: {batches:?}"
+        );
+        drop(batches);
+        let cursor = read_cursor(dir.path())?;
+        assert!(
+            cursor.is_none()
+                || cursor
+                    == Some(WalOffset {
+                        segment_id: 1,
+                        byte_offset: first_frame.len() as u64,
+                    }),
+            "cursor must stop at or before the corrupt record, got {cursor:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

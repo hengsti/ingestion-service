@@ -70,7 +70,7 @@ impl PipelineStage for DecodeStage {
                     counter!("ingest_incoming_oversized_total").increment(1);
                     warn!(topic = %ctx.topic(), size, "payload too large; marking for DLQ");
 
-                    ctx.mark_dlq(format!("payload too large: {size} bytes"));
+                    ctx.mark_rejection(format!("payload too large: {size} bytes"));
 
                     (StageFlow::Stop, "too_large")
                 }
@@ -78,7 +78,7 @@ impl PipelineStage for DecodeStage {
                     counter!("ingest_incoming_non_utf8_total").increment(1);
                     warn!(topic = %ctx.topic(), error = %e, "payload not utf8; marking for DLQ");
 
-                    ctx.mark_dlq("payload not utf8".to_string());
+                    ctx.mark_rejection("payload not utf8".to_string());
 
                     (StageFlow::Stop, "non_utf8")
                 }
@@ -90,7 +90,7 @@ impl PipelineStage for DecodeStage {
                     warn!(topic = %ctx.topic(), error = %source, "invalid JSON; marking for DLQ");
 
                     ctx.set_payload_utf8(payload_str);
-                    ctx.mark_dlq("payload not valid JSON".to_string());
+                    ctx.mark_rejection("payload not valid JSON".to_string());
 
                     (StageFlow::Stop, "invalid_json")
                 }
@@ -257,7 +257,7 @@ mod tests {
         let result = DecodeStage::new().run(&mut ctx).await;
 
         assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
+        assert!(!ctx.should_quarantine());
         assert_eq!(
             ctx.payload_json().unwrap(),
             &json!({"device_id": "esp32-1", "temp_c": 22.4})
@@ -272,8 +272,8 @@ mod tests {
         let result = DecodeStage::new().run(&mut ctx).await;
 
         assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert!(ctx.dlq_reason().unwrap().contains("too large"));
+        assert!(ctx.should_quarantine());
+        assert!(ctx.rejection_reason().unwrap().contains("too large"));
     }
 
     #[tokio::test]
@@ -284,8 +284,8 @@ mod tests {
         let result = DecodeStage::new().run(&mut ctx).await;
 
         assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert_eq!(ctx.dlq_reason().unwrap(), "payload not utf8");
+        assert!(ctx.should_quarantine());
+        assert_eq!(ctx.rejection_reason().unwrap(), "payload not utf8");
     }
 
     #[tokio::test]
@@ -296,8 +296,8 @@ mod tests {
         let result = DecodeStage::new().run(&mut ctx).await;
 
         assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert_eq!(ctx.dlq_reason().unwrap(), "payload not valid JSON");
+        assert!(ctx.should_quarantine());
+        assert_eq!(ctx.rejection_reason().unwrap(), "payload not valid JSON");
         // Keep the UTF-8 payload for the DLQ stage even when JSON parsing fails.
         assert_eq!(ctx.payload_utf8().unwrap(), r#"{"device_id":"esp32-1""#);
     }

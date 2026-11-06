@@ -46,10 +46,10 @@ async fn assert_configured_cases(path: &str) -> Result<()> {
         match case.unified_line_protocol {
             Some(expected) => {
                 assert!(
-                    !context.should_publish_dlq(),
+                    !context.should_quarantine(),
                     "{} unexpectedly rejected: {:?}",
                     case.id,
-                    context.dlq_reason()
+                    context.rejection_reason()
                 );
                 let event = common::recv_event(&mut subscription, 500)
                     .await
@@ -62,7 +62,7 @@ async fn assert_configured_cases(path: &str) -> Result<()> {
             }
             None => {
                 assert!(
-                    context.should_publish_dlq(),
+                    context.should_quarantine(),
                     "{} should be rejected: {:?}",
                     case.id,
                     case.unified_rejection
@@ -182,7 +182,15 @@ async fn test_golden_cache_state_device_and_sse_envelopes() -> Result<()> {
     let cache = CacheState::new(60_000, 64);
     cache.update_record(&cache_record(), received_at_ms, 1);
     let ready = Arc::new(AtomicBool::new(false));
-    let app = cache_http::router(cache.clone(), ready);
+    let (wal, _subscription, _wal_dir) = common::open_temp_wal().await;
+    let wal_capacity = wal.capacity_handle();
+    let app = cache_http::router(
+        cache.clone(),
+        ready,
+        Arc::new(AtomicBool::new(true)),
+        wal_capacity.clone(),
+        wal_capacity,
+    );
 
     let mut state_list = request_json(app.clone(), "/v1/state").await?;
     normalize_cache_timestamp(&mut state_list, received_at_ms);

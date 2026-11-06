@@ -78,8 +78,10 @@ The Influx encoder uses the existing point builder for sorting and escaping, han
 configured scalar type, and always writes the record timestamp with `precision=ms`.
 
 The payload is encoded once before WAL append. `WalEvent` serialization and the on-disk WAL
-format are unchanged. WAL append acknowledgement means the writer flushed its buffer; it
-does not imply `fsync` or power-loss durability.
+format are unchanged. A WAL append receipt follows a buffer flush and file sync; segment
+creation and cursor replacement also sync their directory metadata. These guarantees depend
+on the filesystem and storage honoring sync. They do not yet establish durable MQTT
+acknowledgement or a fail-closed WAL reader; see [WAL and Reliability](wal-and-reliability.md).
 
 ## Cache and HTTP
 

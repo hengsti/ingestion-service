@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::DateTime;
 use metrics::counter;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::{
     config::routes::{
@@ -41,7 +42,7 @@ impl PipelineStage for TelemetryMappingStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            let record = {
+            let result = {
                 let route = ctx.route()?;
                 let mapped = map_payload(
                     route.config(),
@@ -49,8 +50,16 @@ impl PipelineStage for TelemetryMappingStage {
                     ctx.topic(),
                     ctx.received_at_ms(),
                     ctx.retained(),
-                )?;
-                route.calculations().apply(mapped)?
+                );
+                mapped.and_then(|record| route.calculations().apply(record))
+            };
+            let record = match result {
+                Ok(record) => record,
+                Err(_) => {
+                    warn!(topic = %ctx.topic(), "telemetry mapping failed; marking for quarantine");
+                    ctx.mark_rejection("telemetry mapping failed");
+                    return Ok(StageFlow::Stop);
+                }
             };
             ctx.set_telemetry_record(record);
             counter!("ingest_transform_success_total").increment(1);
@@ -323,11 +332,34 @@ pub(crate) fn validate_timestamp_range(timestamp_ms: i64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use serde_json::{json, Value};
 
-    use crate::config::routes::RouteConfig;
+    use crate::{
+        config::routes::{self, RouteConfig},
+        infrastructure::router::RouteSet,
+        pipeline::{context::PipelineContext, stage::PipelineStage},
+    };
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_telemetry_mapping_rejects_invalid_route_payload() -> Result<()> {
+        let bundle_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/routes.json");
+        let routes = RouteSet::compile(routes::load(bundle_path)?, "smarthome/_dlq/ingest")?;
+        let topic = "smarthome/esp32-1/bme680";
+        let route = routes.select(topic).expect("configured sensor route");
+        let mut ctx = PipelineContext::new(topic, Vec::<u8>::new());
+        ctx.set_route(route);
+        ctx.set_payload_json(json!({"device_id": "esp32-1"}));
+
+        let result = TelemetryMappingStage::new().run(&mut ctx).await;
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+        assert!(ctx.should_quarantine());
+        Ok(())
+    }
 
     fn route_config(
         device_id: Value,

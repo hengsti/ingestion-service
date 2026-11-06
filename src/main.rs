@@ -13,6 +13,7 @@ use anyhow::Result;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::prometheus::MetricsServer;
+use infrastructure::quarantine::Quarantine;
 use infrastructure::router::RouteSet;
 use infrastructure::source::{build_source, IngestDispatcher, IngestJob};
 use infrastructure::wal::forwarder::run_forwarder;
@@ -35,10 +36,36 @@ use tracing::{error, info, warn};
 
 use crate::infrastructure::sink::build_output;
 
+struct ForwarderLivenessGuard(Arc<AtomicBool>);
+
+impl Drop for ForwarderLivenessGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+struct IngestWorkerLivenessGuard(Arc<AtomicBool>);
+
+impl Drop for IngestWorkerLivenessGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 fn worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 8))
         .unwrap_or(4)
+}
+
+fn worker_queue_capacities(total_capacity: usize, requested_workers: usize) -> Vec<usize> {
+    let worker_total = requested_workers.min(total_capacity);
+    let base_capacity = total_capacity / worker_total;
+    let remainder = total_capacity % worker_total;
+
+    (0..worker_total)
+        .map(|worker_id| base_capacity + usize::from(worker_id < remainder))
+        .collect()
 }
 
 /// Waits for `SIGTERM`, the default signal Docker sends on `stop`/`down`.
@@ -84,6 +111,10 @@ async fn recv_worker_job(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if infrastructure::quarantine::run_maintenance_command().await? {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .json()
@@ -99,13 +130,49 @@ async fn main() -> Result<()> {
     // Cache / HTTP state.
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
     let source_ready = Arc::new(AtomicBool::new(false));
+    let forwarder_alive = Arc::new(AtomicBool::new(true));
+
+    let (quarantine, quarantine_subscription) = Quarantine::open(WalOptions {
+        dir: cfg.quarantine_dir.clone(),
+        max_bytes: cfg.quarantine_max_bytes,
+        segment_bytes: cfg.wal_segment_bytes,
+        queue_capacity: cfg.wal_queue_capacity,
+    })
+    .await?;
+    drop(quarantine_subscription);
+    let quarantine = Arc::new(quarantine);
+    let quarantine_capacity = quarantine.capacity_handle();
+
+    // WAL, configured sink, and forwarder.
+    let (wal, wal_sub) = Wal::open(WalOptions {
+        dir: cfg.wal_dir.clone(),
+        max_bytes: cfg.wal_max_bytes,
+        segment_bytes: cfg.wal_segment_bytes,
+        queue_capacity: cfg.wal_queue_capacity,
+    })
+    .await?;
+    let wal = Arc::new(wal);
+    let wal_capacity = wal.capacity_handle();
+    let (wal_used_bytes, wal_max_bytes) = wal.capacity_bytes();
+    info!(
+        wal_used_bytes,
+        wal_max_bytes, "journal capacity initialized"
+    );
 
     let http_state = app_state.clone();
     let cache_bind = cfg.cache_bind.clone();
     let source_ready_http = source_ready.clone();
-
+    let forwarder_alive_http = forwarder_alive.clone();
+    let wal_capacity_http = wal.capacity_handle();
+    let quarantine_capacity_http = quarantine_capacity.clone();
     let mut _http_task = tokio::spawn(async move {
-        let app = http::router(http_state, source_ready_http);
+        let app = http::router(
+            http_state,
+            source_ready_http,
+            forwarder_alive_http,
+            wal_capacity_http,
+            quarantine_capacity_http,
+        );
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
@@ -116,30 +183,37 @@ async fn main() -> Result<()> {
     });
 
     // Metrics server.
-    let _metrics_server = MetricsServer::start(&cfg.metrics_bind, &routes).await?;
-
-    // WAL, configured sink, and forwarder.
-    let (wal, wal_sub) = Wal::open(WalOptions {
-        dir: cfg.wal_dir.clone(),
-        segment_bytes: cfg.wal_segment_bytes,
-        queue_capacity: cfg.wal_queue_capacity,
-    })
+    let _metrics_server = MetricsServer::start(
+        &cfg.metrics_bind,
+        &routes,
+        wal.capacity_handle(),
+        quarantine_capacity.clone(),
+    )
     .await?;
-    let wal = Arc::new(wal);
 
     let (encoder, sink) = build_output(&cfg)?;
 
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
+    let forwarder_alive_task = forwarder_alive.clone();
+    let (forwarder_stopped_tx, forwarder_stopped_rx) = watch::channel(false);
 
-    let forwarder_task = tokio::spawn(async move {
-        if let Err(err) = run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await {
-            error!(error = %err, "wal forwarder failed");
-        }
+    let mut forwarder_task = tokio::spawn(async move {
+        let _liveness = ForwarderLivenessGuard(forwarder_alive_task);
+        let result = run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await;
+        let _ = forwarder_stopped_tx.send(true);
+        result
     });
 
     // Input source.
-    let (source, dlq_publisher) = build_source(&cfg, source_ready.clone(), routes.as_ref()).await?;
+    let (source, dlq_publisher) = build_source(
+        &cfg,
+        source_ready.clone(),
+        routes.as_ref(),
+        wal_capacity,
+        quarantine_capacity,
+    )
+    .await?;
 
     // Pipeline.
     let pipeline = Arc::new(
@@ -149,30 +223,39 @@ async fn main() -> Result<()> {
             .add_stage(TelemetryMappingStage::new())
             .add_stage(ValidateOutputStage::new(encoder.clone()))
             .add_stage(CacheUpdateStage::new(app_state.clone()))
-            .add_stage(PersistStage::new(wal.clone(), encoder))
+            .add_stage(
+                PersistStage::new(wal.clone(), encoder)
+                    .with_forwarder_stopped(forwarder_stopped_rx),
+            )
             .add_stage(ObserveStage::new())
-            .with_failure_stage(DlqPublishStage::new(dlq_publisher, dlq_topic.clone())),
+            .with_failure_stage(DlqPublishStage::new(
+                dlq_publisher,
+                dlq_topic.clone(),
+                quarantine.clone(),
+            )),
     );
 
     info!("pipeline initialized");
 
     // Worker queue: one channel per worker, round-robin dispatch.
-    let worker_total = worker_count();
-    let per_worker_cap = cfg.input_queue_capacity / worker_total;
+    let worker_capacities = worker_queue_capacities(cfg.input_queue_capacity, worker_count());
+    let worker_total = worker_capacities.len();
     info!(workers = worker_total, "starting pipeline workers");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
     let mut job_txs: Vec<mpsc::Sender<IngestJob>> = Vec::with_capacity(worker_total);
 
-    for worker_id in 0..worker_total {
-        let (tx, mut rx) = mpsc::channel::<IngestJob>(per_worker_cap);
+    for (worker_id, queue_capacity) in worker_capacities.into_iter().enumerate() {
+        let (tx, mut rx) = mpsc::channel::<IngestJob>(queue_capacity);
         job_txs.push(tx);
 
         let pipeline = pipeline.clone();
         let mut shutdown_rx = shutdown_rx.clone();
+        let worker_ready = source_ready.clone();
 
         workers.spawn(async move {
+            let _liveness = IngestWorkerLivenessGuard(worker_ready);
             info!(worker_id, "pipeline worker started");
 
             loop {
@@ -188,7 +271,16 @@ async fn main() -> Result<()> {
                     job.retained,
                 );
                 ctx.set_receive_sequence(job.receive_sequence);
-                pipeline.run(&mut ctx).await;
+                ctx.set_qos(job.qos);
+                if job.qos == 0 {
+                    ctx.mark_rejection("MQTT QoS 0 is not recoverable by the broker");
+                }
+                let outcome = pipeline.run(&mut ctx).await;
+                if let Some(acknowledgement) = job.acknowledgement {
+                    if !acknowledgement.complete(outcome).await {
+                        warn!(topic = %ctx.topic(), "MQTT acknowledgement result could not be returned to source");
+                    }
+                }
             }
 
             info!(worker_id, "pipeline worker stopped");
@@ -201,8 +293,9 @@ async fn main() -> Result<()> {
     let mut source_task = tokio::spawn(source.run(dispatcher, shutdown_rx.clone()));
 
     // Wait for ctrl-c, SIGTERM, the HTTP task, or the input source, then signal shutdown.
-    let mut fatal_source_err: Option<anyhow::Error> = None;
+    let mut fatal_err: Option<anyhow::Error> = None;
     let mut source_task_handled = false;
+    let mut forwarder_task_handled = false;
 
     tokio::select! {
         res = tokio::signal::ctrl_c() => {
@@ -238,14 +331,28 @@ async fn main() -> Result<()> {
                 Ok(Err(err)) => {
                     source_ready.store(false, Ordering::Relaxed);
                     error!(error = %err, "input source failed");
-                    fatal_source_err = Some(err);
+                    fatal_err = Some(err);
                 }
                 Err(join_err) => {
                     source_ready.store(false, Ordering::Relaxed);
                     error!(error = %join_err, "input source task panicked");
-                    fatal_source_err = Some(join_err.into());
+                    fatal_err = Some(join_err.into());
                 }
             }
+        }
+
+        res = &mut forwarder_task => {
+            forwarder_task_handled = true;
+            source_ready.store(false, Ordering::Relaxed);
+            forwarder_alive.store(false, Ordering::Relaxed);
+            let err = match res {
+                Ok(Ok(())) => anyhow::anyhow!("WAL forwarder stopped unexpectedly"),
+                Ok(Err(err)) => err,
+                Err(join_err) => join_err.into(),
+            };
+            error!(error = %err, "WAL forwarder stopped unexpectedly");
+            fatal_err = Some(err);
+            let _ = shutdown_tx.send(true);
         }
     }
 
@@ -257,12 +364,12 @@ async fn main() -> Result<()> {
             Ok(Err(err)) => {
                 source_ready.store(false, Ordering::Relaxed);
                 error!(error = %err, "input source failed");
-                fatal_source_err = Some(err);
+                fatal_err = Some(err);
             }
             Err(join_err) => {
                 source_ready.store(false, Ordering::Relaxed);
                 error!(error = %join_err, "input source task panicked");
-                fatal_source_err = Some(join_err.into());
+                fatal_err = Some(join_err.into());
             }
         }
     }
@@ -280,23 +387,32 @@ async fn main() -> Result<()> {
     // Drop both `Arc<Wal>` handles (pipeline's and main's) so the writer
     // closes its channel, flushes, and lets the forwarder drain.
     drop(pipeline);
+    drop(quarantine);
     drop(wal);
 
-    let mut forwarder_task = forwarder_task;
-    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut forwarder_task).await {
-        Ok(Ok(())) => info!("wal forwarder drained cleanly"),
-        Ok(Err(err)) => error!(error = %err, "wal forwarder task panicked during drain"),
-        Err(_) => {
-            warn!("wal forwarder drain timed out after 5s; aborting and exiting");
-            forwarder_task.abort();
+    if !forwarder_task_handled {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut forwarder_task).await {
+            Ok(Ok(Ok(()))) => info!("wal forwarder drained cleanly"),
+            Ok(Ok(Err(err))) => {
+                error!(error = %err, "wal forwarder failed during drain");
+                fatal_err.get_or_insert(err);
+            }
+            Ok(Err(err)) => {
+                error!(error = %err, "wal forwarder task failed during drain");
+                fatal_err.get_or_insert(err.into());
+            }
+            Err(_) => {
+                warn!("wal forwarder drain timed out after 5s; aborting and exiting");
+                forwarder_task.abort();
+            }
         }
     }
 
     info!("ingestion service stopped");
 
-    // A fatal input-source error still exits the process non-zero, but only
-    // after workers and the WAL have drained cleanly above.
-    match fatal_source_err {
+    // A fatal source or forwarder error exits non-zero after workers and the WAL
+    // have drained.
+    match fatal_err {
         Some(err) => Err(err),
         None => Ok(()),
     }
@@ -306,6 +422,38 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn forwarder_liveness_guard_marks_task_not_alive_when_dropped() {
+        let alive = Arc::new(AtomicBool::new(true));
+
+        drop(ForwarderLivenessGuard(alive.clone()));
+
+        assert!(!alive.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn worker_queue_capacities_preserve_small_total_capacity() {
+        assert_eq!(worker_queue_capacities(1, 4), vec![1]);
+        assert_eq!(worker_queue_capacities(5, 3), vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn worker_queue_capacities_sum_to_configured_capacity() {
+        let capacities = worker_queue_capacities(17, 8);
+
+        assert_eq!(capacities.iter().sum::<usize>(), 17);
+        assert!(capacities.iter().all(|capacity| *capacity > 0));
+    }
+
+    #[test]
+    fn worker_liveness_guard_marks_source_unready_when_worker_exits() {
+        let ready = Arc::new(AtomicBool::new(true));
+
+        drop(IngestWorkerLivenessGuard(ready.clone()));
+
+        assert!(!ready.load(Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn recv_worker_job_after_shutdown_drains_queued_messages_before_stopping() {
@@ -317,6 +465,8 @@ mod tests {
             received_at_ms: 1,
             receive_sequence: 0,
             retained: false,
+            qos: 1,
+            acknowledgement: None,
         })
         .unwrap();
 
@@ -339,6 +489,8 @@ mod tests {
             received_at_ms: 1,
             receive_sequence: 0,
             retained: false,
+            qos: 1,
+            acknowledgement: None,
         })
         .unwrap();
         tx.try_send(IngestJob {
@@ -347,6 +499,8 @@ mod tests {
             received_at_ms: 2,
             receive_sequence: 0,
             retained: true,
+            qos: 1,
+            acknowledgement: None,
         })
         .unwrap();
 

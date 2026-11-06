@@ -13,19 +13,43 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use smarthome_ingest::infrastructure::cache::{http as cache_http, state::CacheState};
+use smarthome_ingest::infrastructure::wal::{subscription::WalSubscription, wal::Wal};
 use smarthome_ingest::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn make_app(source_ready: bool) -> axum::Router {
+async fn make_app(
+    source_ready: bool,
+) -> (axum::Router, Arc<Wal>, WalSubscription, tempfile::TempDir) {
     let cache = CacheState::new(60_000, 64);
     let ready = Arc::new(AtomicBool::new(source_ready));
-    cache_http::router(cache, ready)
+    let (wal, subscription, directory) = common::open_temp_wal().await;
+    let wal_capacity = wal.capacity_handle();
+    let app = cache_http::router(
+        cache,
+        ready,
+        Arc::new(AtomicBool::new(true)),
+        wal_capacity.clone(),
+        wal_capacity,
+    );
+    (app, wal, subscription, directory)
 }
 
-fn make_app_with_cache(cache: CacheState, source_ready: bool) -> axum::Router {
+async fn make_app_with_cache(
+    cache: CacheState,
+    source_ready: bool,
+) -> (axum::Router, Arc<Wal>, WalSubscription, tempfile::TempDir) {
     let ready = Arc::new(AtomicBool::new(source_ready));
-    cache_http::router(cache, ready)
+    let (wal, subscription, directory) = common::open_temp_wal().await;
+    let wal_capacity = wal.capacity_handle();
+    let app = cache_http::router(
+        cache,
+        ready,
+        Arc::new(AtomicBool::new(true)),
+        wal_capacity.clone(),
+        wal_capacity,
+    );
+    (app, wal, subscription, directory)
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
@@ -37,7 +61,7 @@ async fn response_json(response: axum::response::Response) -> serde_json::Value 
 
 #[tokio::test]
 async fn healthz_returns_200() {
-    let app = make_app(false);
+    let (app, _wal, _subscription, _directory) = make_app(false).await;
 
     let response = app
         .oneshot(
@@ -56,7 +80,7 @@ async fn healthz_returns_200() {
 
 #[tokio::test]
 async fn readyz_returns_503_when_source_not_ready() {
-    let app = make_app(false);
+    let (app, _wal, _subscription, _directory) = make_app(false).await;
 
     let response = app
         .oneshot(
@@ -73,7 +97,7 @@ async fn readyz_returns_503_when_source_not_ready() {
 
 #[tokio::test]
 async fn readyz_returns_200_when_source_ready() {
-    let app = make_app(true);
+    let (app, _wal, _subscription, _directory) = make_app(true).await;
 
     let response = app
         .oneshot(
@@ -88,11 +112,39 @@ async fn readyz_returns_200_when_source_ready() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn readyz_returns_503_when_forwarder_stopped() {
+    let cache = CacheState::new(60_000, 64);
+    let source_ready = Arc::new(AtomicBool::new(true));
+    let forwarder_alive = Arc::new(AtomicBool::new(false));
+    let (wal, _subscription, _directory) = common::open_temp_wal().await;
+    let wal_capacity = wal.capacity_handle();
+    let app = cache_http::router(
+        cache,
+        source_ready,
+        forwarder_alive,
+        wal_capacity.clone(),
+        wal_capacity,
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 // ── /v1/state ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn list_state_returns_empty_when_cache_is_empty() {
-    let app = make_app(false);
+    let (app, _wal, _subscription, _directory) = make_app(false).await;
 
     let response = app
         .oneshot(
@@ -135,7 +187,7 @@ async fn list_state_returns_cached_typed_telemetry() {
         1,
     );
 
-    let app = make_app_with_cache(cache, false);
+    let (app, _wal, _subscription, _directory) = make_app_with_cache(cache, false).await;
 
     let response = app
         .oneshot(
@@ -162,7 +214,7 @@ async fn list_state_returns_cached_typed_telemetry() {
 
 #[tokio::test]
 async fn get_state_returns_null_sensor_for_unknown_device() {
-    let app = make_app(false);
+    let (app, _wal, _subscription, _directory) = make_app(false).await;
 
     let response = app
         .oneshot(

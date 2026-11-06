@@ -58,31 +58,41 @@ dispatch does not guarantee per-device processing order across workers.
   compilation, and bound copied mapping data before repeated pointers amplify it. Every
   encoder's allocation-free size bound must cover its encoded bytes and saturate on
   overflow. Validate it before cache/encoding and check actual size before WAL append.
-- **Stop is not rejection:** `Err` from a stage makes `PipelineRunner` mark the context
-  for DLQ. `StageFlow::Stop` only stops execution; it does not automatically mark DLQ.
-  Use `ctx.mark_dlq(reason)` for explicit rejection; an intentional non-DLQ stop returns
-  `StageFlow::Stop` without marking the context. A DLQ publish failure is logged, not
-  recursively republished.
+- **Outcomes are explicit:** deterministic invalid input uses
+  `ctx.mark_rejection(reason)` and is acknowledged only after durable quarantine.
+  Operational stage errors and `ctx.mark_deferred(reason)` never become input rejections.
+  `StageFlow::Stop` only stops execution; an unmarked stop is deferred. A supplementary
+  DLQ publish failure after quarantine is logged, not recursively republished.
 - **Context carries stage state:** use `PipelineContext` accessors and propagate missing
   state errors with `?`. Do not bypass validation or silently synthesize missing values.
 - **Transport boundaries stay paired:** `build_source` constructs `Source` and
   `DlqPublisher` together; `build_output` constructs `Encoder` and `Sink` together.
   Keep concrete MQTT/InfluxDB dependencies out of generic pipeline and WAL code.
   `Encoder::encode` remains synchronous and performs no I/O.
-- **WAL acknowledgement is a flush boundary:** `PersistStage` must await
-  `Wal::append_durable`, not substitute `try_append`. Acknowledgement means
-  `BufWriter::flush`, not `fsync`/power-loss durability. WAL records contain already
-  encoded sink payloads, not raw input JSON; account for queued records when changing
-  encoders, sink formats, or on-disk serialization.
+- **WAL acknowledgement is a sync boundary:** `PersistStage` must await
+  `Wal::append_durable`, not substitute `try_append`. The writer flushes and syncs
+  the record before publishing its head or resolving its receipt; new segment and
+  cursor directory entries are synced before success or reclamation. Guarantees
+  depend on the filesystem and storage honoring sync, and do not yet imply durable
+  MQTT acknowledgement. WAL records contain already encoded sink payloads, not raw
+  input JSON; account for queued records when changing encoders or serialization.
 - **Replay and commit are coupled:** both retryable and permanent sink errors retain
   the batch without advancing the cursor. Only successful sink writes advance through
-  `offset_after`. Retry cursor commits without repeating an already-completed sink
-  write. A crash before commit can replay writes:
+  `offset_after`, never past the synced WAL head. Retry cursor commits without
+  repeating an already-completed sink write. The reader can still inspect visible
+  bytes past the head and skip corruption; #39 owns the fail-closed reader contract.
+  A crash before commit can replay writes:
   do not claim exactly-once or lossless end-to-end delivery.
 - **Overflow paths differ:** a full input worker queue drops the message before the
   pipeline, increments `ingest_event_queue_full_total`, and does not publish DLQ.
-  WAL append failures inside `PersistStage` do mark DLQ. Do not silently change either
-  policy or replace bounded queues with unbounded buffering.
+  WAL capacity pressure retains the current event and waits for reclaim, including through
+  subsequent writer-queue contention. An initially full queue and terminal writer failures
+  inside `PersistStage` still mark DLQ. MQTT acknowledgements remain independent of WAL
+  persistence. Do not replace bounded queues with unbounded buffering.
+- **Journal ownership and budgets:** WAL and quarantine use separate, exclusively locked
+  directories and required byte limits. Count recovered segments, pending reservations,
+  metadata headroom, and pending deletions; release reclaimed bytes only after directory
+  sync. Do not scan the filesystem per append or claim these budgets are filesystem quotas.
 - **Cache is not a delivery receipt:** only routes with `cache: true` update the
   latest-state cache, and that update occurs before WAL persistence. Preserve HTTP/SSE
   envelopes; cached state does not prove successful persistence or sink delivery. When
@@ -155,7 +165,8 @@ Release build: `cargo build --release --locked`. Container build:
 - The binary reads process environment through `Config::from_env`; it does not load
   `.env` itself. Most runtime settings are required. Existing defaults include the
   WAL segment/queue sizes, input queue capacity, and `MQTT_CLEAN_SESSION=true`.
-  Compose supplies its own values; do not confuse them with code defaults.
+  `WAL_QUEUE_CAPACITY` must be positive. Compose supplies its own values; do not
+  confuse them with code defaults.
 - `INGEST_ROUTES_FILE` supplies the route bundle; MQTT subscriptions derive only from
   its compiled filters. The shipped firmware sensor filter is `smarthome/+/bme680`.
   `MQTT_TOPIC_DLQ` is required and publish-only. Removed
@@ -167,8 +178,8 @@ Release build: `cargo build --release --locked`. Container build:
   changing the environment contract. CI renders Compose and checks its environment
   keys against the code; update that check when the contract requires it.
 - The Docker healthcheck targets port 8085 and `/healthz`; keep `CACHE_BIND` compatible.
-  Keep the WAL volume mount and `WAL_DIR` aligned. Use disposable WAL directories and
-  separate MQTT client IDs for local experiments, never production state.
+  Keep both journal volume mounts and their directory settings aligned. Use disposable WAL
+  directories and separate MQTT client IDs for local experiments, never production state.
 - Never expose tokens, passwords, raw sensitive payloads, or personal data in logs,
   fixtures, commits, or responses. Preserve `SecretString` handling and redacted
   configuration debug output. Use structured `tracing` fields and bounded metric
