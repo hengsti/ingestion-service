@@ -17,6 +17,54 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  broker-integration:
+    name: Isolated EMQX and InfluxDB integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      INGEST_IT_PROJECT: ingest-it-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.87.0
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2.8.1
+
+      - name: Render isolated Compose stack
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" config --quiet
+
+      - name: Start isolated services
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" up -d --wait --wait-timeout 180
+
+      - name: Run real-container tests
+        run: cargo test --all-features --locked --test broker_integration -- --ignored --test-threads=1
+
+      - name: Collect bounded container logs
+        if: failure()
+        run: |
+          mkdir -p target/broker-integration
+          docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" logs --no-color --tail 100 \
+            | tail -c 65536 > target/broker-integration/compose.log
+
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/broker-integration/
+          retention-days: 7
+
+      - name: Remove successful test stack
+        if: success()
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" down -v --remove-orphans
+
+      - name: Stop failed test stack without deleting its volumes
+        if: failure()
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" down --remove-orphans
+
   test:
     name: Test Rust project
     runs-on: ubuntu-latest
