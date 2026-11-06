@@ -27,10 +27,7 @@ async fn make_app(
     let wal_capacity = wal.capacity_handle();
     let app = cache_http::router(
         cache,
-        ready,
-        Arc::new(AtomicBool::new(true)),
-        wal_capacity.clone(),
-        wal_capacity,
+        common::http_operations(ready, true, wal_capacity.clone(), wal_capacity),
     );
     (app, wal, subscription, directory)
 }
@@ -44,10 +41,7 @@ async fn make_app_with_cache(
     let wal_capacity = wal.capacity_handle();
     let app = cache_http::router(
         cache,
-        ready,
-        Arc::new(AtomicBool::new(true)),
-        wal_capacity.clone(),
-        wal_capacity,
+        common::http_operations(ready, true, wal_capacity.clone(), wal_capacity),
     );
     (app, wal, subscription, directory)
 }
@@ -77,6 +71,43 @@ async fn healthz_returns_200() {
 }
 
 // ── /readyz ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_durable_readiness_checks_both_journal_capacities_independently() -> anyhow::Result<()>
+{
+    use smarthome_ingest::infrastructure::wal::types::{WalEvent, WalOptions};
+
+    let directory = tempfile::tempdir()?;
+    let (wal, _subscription) = Wal::open(WalOptions {
+        dir: directory.path().to_path_buf(),
+        max_bytes: 3 * 1024 * 1024,
+        segment_bytes: 1024 * 1024,
+        queue_capacity: 32,
+    })
+    .await?;
+    let event = WalEvent {
+        topic: "test".to_owned(),
+        ts_ms: 1,
+        payload: "x".repeat(1024 * 1024 - 64),
+    };
+    assert!(wal.append_durable(event.clone()).await.is_ok());
+    assert!(wal.append_durable(event).await.is_ok());
+    let (quarantine, _quarantine_sub, _quarantine_dir) = common::open_temp_wal().await;
+    for (output, rejected) in [
+        (wal.capacity_handle(), quarantine.capacity_handle()),
+        (quarantine.capacity_handle(), wal.capacity_handle()),
+    ] {
+        let app = cache_http::router(
+            CacheState::new(60_000, 64),
+            common::http_operations(Arc::new(AtomicBool::new(true)), true, output, rejected),
+        );
+        let response = app
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn readyz_returns_503_when_source_not_ready() {
@@ -116,15 +147,11 @@ async fn readyz_returns_200_when_source_ready() {
 async fn readyz_returns_503_when_forwarder_stopped() {
     let cache = CacheState::new(60_000, 64);
     let source_ready = Arc::new(AtomicBool::new(true));
-    let forwarder_alive = Arc::new(AtomicBool::new(false));
     let (wal, _subscription, _directory) = common::open_temp_wal().await;
     let wal_capacity = wal.capacity_handle();
     let app = cache_http::router(
         cache,
-        source_ready,
-        forwarder_alive,
-        wal_capacity.clone(),
-        wal_capacity,
+        common::http_operations(source_ready, false, wal_capacity.clone(), wal_capacity),
     );
 
     let response = app
@@ -138,6 +165,70 @@ async fn readyz_returns_503_when_forwarder_stopped() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_durable_readiness_admission_recovers_without_changing_liveness() -> anyhow::Result<()>
+{
+    let (wal, _sub, _directory) = common::open_temp_wal().await;
+    let ready = Arc::new(AtomicBool::new(true));
+    let operations = common::http_operations(
+        ready.clone(),
+        true,
+        wal.capacity_handle(),
+        wal.capacity_handle(),
+    );
+    let app = cache_http::router(CacheState::new(60_000, 64), operations.clone());
+    for (available, expected) in [(0, StatusCode::SERVICE_UNAVAILABLE), (1, StatusCode::OK)] {
+        operations.update_admission(available, 1, 1 - available);
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), expected);
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    ready.store(false, std::sync::atomic::Ordering::Relaxed);
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
+    let response = app
+        .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_operations_snapshot_has_only_bounded_operational_fields() -> anyhow::Result<()> {
+    let (app, _wal, _sub, _directory) = make_app(true).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/operations")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["sink"], "healthy");
+    assert_eq!(json["ready"], true);
+    let object = json.as_object().expect("operational snapshot object");
+    assert_eq!(object.len(), 19);
+    assert!(object
+        .values()
+        .all(|value| value.is_boolean() || value.is_number() || value == "healthy"));
+    for forbidden in ["payload", "topic", "device_id", "token", "error"] {
+        assert!(!object.contains_key(forbidden));
+    }
+    Ok(())
 }
 
 // ── /v1/state ────────────────────────────────────────────────────────────────

@@ -26,7 +26,11 @@ impl PipelineStage for ObserveStage {
         ctx: &'a mut PipelineContext,
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
-            histogram!("ingest_pipeline_duration_seconds")
+            let route = ctx
+                .route()
+                .map(|route| metrics::SharedString::from(route.metric_label()))
+                .unwrap_or_else(|_| metrics::SharedString::from(""));
+            histogram!("ingest_pipeline_duration_seconds", "route" => route)
                 .record(ctx.started_at().elapsed().as_secs_f64());
 
             Ok(StageFlow::Continue)

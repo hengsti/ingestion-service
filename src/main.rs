@@ -12,6 +12,7 @@ use std::sync::{
 use anyhow::Result;
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
+use infrastructure::operations::Operations;
 use infrastructure::prometheus::MetricsServer;
 use infrastructure::quarantine::Quarantine;
 use infrastructure::router::RouteSet;
@@ -130,7 +131,6 @@ async fn main() -> Result<()> {
     // Cache / HTTP state.
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
     let source_ready = Arc::new(AtomicBool::new(false));
-    let forwarder_alive = Arc::new(AtomicBool::new(true));
 
     let (quarantine, quarantine_subscription) = Quarantine::open(WalOptions {
         dir: cfg.quarantine_dir.clone(),
@@ -153,6 +153,14 @@ async fn main() -> Result<()> {
     .await?;
     let wal = Arc::new(wal);
     let wal_capacity = wal.capacity_handle();
+    let forwarder_state = wal_sub.forwarder_state();
+    let forwarder_alive = forwarder_state.liveness_handle();
+    let operations = Arc::new(Operations::new(
+        source_ready.clone(),
+        forwarder_state,
+        wal_capacity.clone(),
+        quarantine_capacity.clone(),
+    ));
     let (wal_used_bytes, wal_max_bytes) = wal.capacity_bytes();
     info!(
         wal_used_bytes,
@@ -161,18 +169,9 @@ async fn main() -> Result<()> {
 
     let http_state = app_state.clone();
     let cache_bind = cfg.cache_bind.clone();
-    let source_ready_http = source_ready.clone();
-    let forwarder_alive_http = forwarder_alive.clone();
-    let wal_capacity_http = wal.capacity_handle();
-    let quarantine_capacity_http = quarantine_capacity.clone();
+    let operations_http = operations.clone();
     let mut _http_task = tokio::spawn(async move {
-        let app = http::router(
-            http_state,
-            source_ready_http,
-            forwarder_alive_http,
-            wal_capacity_http,
-            quarantine_capacity_http,
-        );
+        let app = http::router(http_state, operations_http);
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
             .expect("failed to bind CACHE_BIND");
@@ -183,13 +182,8 @@ async fn main() -> Result<()> {
     });
 
     // Metrics server.
-    let _metrics_server = MetricsServer::start(
-        &cfg.metrics_bind,
-        &routes,
-        wal.capacity_handle(),
-        quarantine_capacity.clone(),
-    )
-    .await?;
+    let _metrics_server =
+        MetricsServer::start(&cfg.metrics_bind, &routes, operations.clone()).await?;
 
     let (encoder, sink) = build_output(&cfg)?;
 
@@ -206,14 +200,7 @@ async fn main() -> Result<()> {
     });
 
     // Input source.
-    let (source, dlq_publisher) = build_source(
-        &cfg,
-        source_ready.clone(),
-        routes.as_ref(),
-        wal_capacity,
-        quarantine_capacity,
-    )
-    .await?;
+    let (source, dlq_publisher) = build_source(&cfg, routes.as_ref(), operations.clone()).await?;
 
     // Pipeline.
     let pipeline = Arc::new(
@@ -252,10 +239,10 @@ async fn main() -> Result<()> {
 
         let pipeline = pipeline.clone();
         let mut shutdown_rx = shutdown_rx.clone();
-        let worker_ready = source_ready.clone();
+        let workers_alive = operations.workers_alive.clone();
 
         workers.spawn(async move {
-            let _liveness = IngestWorkerLivenessGuard(worker_ready);
+            let _liveness = IngestWorkerLivenessGuard(workers_alive);
             info!(worker_id, "pipeline worker started");
 
             loop {
@@ -290,7 +277,12 @@ async fn main() -> Result<()> {
 
     // Source task dispatches into the worker queue via `IngestDispatcher`.
     let dispatcher = IngestDispatcher::new(job_txs.clone());
-    let mut source_task = tokio::spawn(source.run(dispatcher, shutdown_rx.clone()));
+    let source_future = source.run(dispatcher, shutdown_rx.clone());
+    let source_ready_task = source_ready.clone();
+    let mut source_task = tokio::spawn(async move {
+        let _liveness = ForwarderLivenessGuard(source_ready_task);
+        source_future.await
+    });
 
     // Wait for ctrl-c, SIGTERM, the HTTP task, or the input source, then signal shutdown.
     let mut fatal_err: Option<anyhow::Error> = None;
@@ -354,7 +346,21 @@ async fn main() -> Result<()> {
             fatal_err = Some(err);
             let _ = shutdown_tx.send(true);
         }
+
+        res = workers.join_next() => {
+            let err = match res {
+                Some(Ok(Err(err))) => err,
+                Some(Err(err)) => err.into(),
+                _ => anyhow::anyhow!("pipeline worker stopped unexpectedly"),
+            };
+            error!(error = %err, "pipeline worker stopped unexpectedly");
+            fatal_err = Some(err);
+            let _ = shutdown_tx.send(true);
+        }
     }
+
+    operations.accepting.store(false, Ordering::Relaxed);
+    source_ready.store(false, Ordering::Relaxed);
 
     // Join the source task if shutdown was triggered by ctrl-c or the HTTP
     // task, so its senders drop before the worker channels close below.
@@ -447,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_liveness_guard_marks_source_unready_when_worker_exits() {
+    fn worker_liveness_guard_marks_workers_dead_when_worker_exits() {
         let ready = Arc::new(AtomicBool::new(true));
 
         drop(IngestWorkerLivenessGuard(ready.clone()));

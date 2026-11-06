@@ -35,6 +35,7 @@ Broker/database administration, device firmware, and dashboards are outside this
 | Encoding, sink errors, InfluxDB line protocol | `src\infrastructure\sink\mod.rs`, `src\infrastructure\sink\influx.rs`, `src\infrastructure\sink\point.rs` |
 | WAL append, writer thread, recovery, cursor, forwarding | `src\infrastructure\wal` |
 | Latest-state cache, HTTP/SSE, metrics | `src\infrastructure\cache`, `src\infrastructure\prometheus.rs` |
+| Shared intake/storage/forwarder operational snapshots | `src\infrastructure\operations.rs` |
 | Integration tests and reusable fixtures | `tests`, `tests\common\mod.rs` |
 | Build/deployment contracts | `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `compose.yaml`, `.github\workflows` |
 
@@ -100,6 +101,11 @@ dispatch does not guarantee per-device processing order across workers.
 - **Shutdown must drain:** preserve queued-worker draining and the forwarder's final
   partial-batch flush. WAL recovery, cursor commits, and segment deletion must not
   discard uncommitted data.
+- **Readiness is durable intake, not database delivery:** `/healthz` remains liveness.
+  `/readyz` requires reconciled subscriptions, available bounded admission, both writable
+  journals with capacity, live workers/forwarder and no reader or cursor-commit fault.
+  Sink retrying/blocked alone does not make intake unready. Shutdown disables readiness
+  before draining; HTTP and metrics share the in-memory operational snapshots.
 
 ## Rust conventions and change boundaries
 

@@ -119,7 +119,10 @@ impl Quarantine {
             payload,
         };
         match self.wal.append_durable(event).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                metrics::counter!("quarantine_appends_total").increment(1);
+                Ok(())
+            }
             Err(AppendDurableError::Full(_)) => {
                 bail!("quarantine writer queue is full; rejection was not persisted")
             }

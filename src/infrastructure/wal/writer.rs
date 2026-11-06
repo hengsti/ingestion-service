@@ -118,6 +118,7 @@ struct WriterCompletion {
 
 impl Drop for WriterCompletion {
     fn drop(&mut self) {
+        self.capacity.mark_unwritable();
         if thread::panicking() {
             self.state.fail("WAL writer thread panicked");
         }

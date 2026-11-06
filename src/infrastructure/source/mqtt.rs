@@ -20,6 +20,7 @@ use super::{AckKey, AckReceipt, DlqPublisher, IngestDispatcher, IngestJob, Sourc
 mod subscriptions;
 
 use crate::config::{Config, MqttSourceConfig};
+use crate::infrastructure::operations::Operations;
 use crate::infrastructure::router::RouteSet;
 use crate::infrastructure::wal::capacity::Capacity;
 use subscriptions::{filter_plan, BrokerIdentity, SubscriptionManifest};
@@ -46,6 +47,7 @@ pub struct MqttSource {
     subscribe_pending: bool,
     expected_suback: Option<u16>,
     ready: Arc<AtomicBool>,
+    operations: Arc<Operations>,
     ack_tx: mpsc::Sender<AckReceipt>,
     ack_rx: mpsc::Receiver<AckReceipt>,
     generation: u64,
@@ -56,6 +58,13 @@ pub struct MqttSource {
     wal_capacity: Arc<Capacity>,
     quarantine_capacity: Arc<Capacity>,
     reconnect_pending: bool,
+}
+
+impl Drop for MqttSource {
+    fn drop(&mut self) {
+        self.ready.store(false, Ordering::Relaxed);
+        self.operations.update_admission(0, 0, 0);
+    }
 }
 
 struct Reconciliation {
@@ -149,8 +158,21 @@ impl MqttSource {
     }
 
     fn has_storage_capacity(&self) -> bool {
-        self.wal_capacity.has_room_for_max_record()
+        self.wal_capacity.is_writable()
+            && self.quarantine_capacity.is_writable()
+            && self.wal_capacity.has_room_for_max_record()
             && self.quarantine_capacity.has_room_for_max_record()
+    }
+
+    fn publish_admission(&self, dispatcher: &IngestDispatcher) {
+        self.operations.bind_dispatcher(dispatcher);
+        self.operations
+            .pending_acks
+            .store(self.pending_acks.len(), Ordering::Relaxed);
+        self.operations.admission_paused.store(
+            self.reconnect_pending || self.pending_qos0.is_some(),
+            Ordering::Relaxed,
+        );
     }
 
     fn try_dispatch_pending_qos0(&mut self, dispatcher: &IngestDispatcher) -> bool {
@@ -236,6 +258,7 @@ impl MqttSource {
         self.reconciliation = None;
         if self.has_intake_capacity(dispatcher) {
             self.ready.store(true, Ordering::Relaxed);
+            self.publish_admission(dispatcher);
             info!(topics = self.filters.len(), "MQTT subscriptions reconciled");
         } else {
             self.reset_connection()?;
@@ -245,6 +268,10 @@ impl MqttSource {
 
     fn reset_connection(&mut self) -> Result<()> {
         self.ready.store(false, Ordering::Relaxed);
+        self.operations
+            .admission_paused
+            .store(true, Ordering::Relaxed);
+        self.operations.pending_acks.store(0, Ordering::Relaxed);
         self.invalidate_acknowledgements()?;
         self.reconciliation = None;
         self.subscribe_pending = false;
@@ -334,6 +361,7 @@ impl Source for MqttSource {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
         Box::pin(async move {
             loop {
+                self.publish_admission(&dispatcher);
                 if *shutdown_rx.borrow() {
                     if self.pending_qos0.is_some()
                         && (!self.has_intake_capacity(&dispatcher)
@@ -493,6 +521,8 @@ impl Source for MqttSource {
                     }
                 }
             }
+            self.ready.store(false, Ordering::Relaxed);
+            self.operations.update_admission(0, 0, 0);
             Ok(())
         })
     }
@@ -551,10 +581,8 @@ impl DlqPublisher for MqttDlqPublisher {
 /// guarantees it's populated when `input_source == InputSourceKind::Mqtt`).
 pub async fn build(
     cfg: &Config,
-    ready: Arc<AtomicBool>,
     routes: &RouteSet,
-    wal_capacity: Arc<Capacity>,
-    quarantine_capacity: Arc<Capacity>,
+    operations: Arc<Operations>,
 ) -> Result<(Box<dyn Source>, Arc<dyn DlqPublisher>)> {
     let mqtt_cfg = cfg
         .mqtt
@@ -602,7 +630,7 @@ pub async fn build(
         fresh_session_filters: None,
         subscribe_pending: false,
         expected_suback: None,
-        ready,
+        ready: operations.source_ready.clone(),
         ack_tx,
         ack_rx,
         generation: 0,
@@ -610,8 +638,9 @@ pub async fn build(
         pending_acks: HashMap::new(),
         ready_acks: VecDeque::new(),
         pending_qos0: None,
-        wal_capacity,
-        quarantine_capacity,
+        wal_capacity: operations.wal.clone(),
+        quarantine_capacity: operations.quarantine.clone(),
+        operations,
         reconnect_pending: false,
     });
     let publisher: Arc<dyn DlqPublisher> = Arc::new(publisher);
@@ -791,6 +820,12 @@ mod tests {
         .expect("subscription manifest");
         let (ack_tx, ack_rx) = mpsc::channel(MAX_INFLIGHT_MESSAGES);
         let publisher_client = Arc::new(Mutex::new(client.clone()));
+        let operations = Arc::new(Operations::new(
+            ready.clone(),
+            Arc::new(crate::infrastructure::operations::ForwarderState::default()),
+            capacity.clone(),
+            capacity.clone(),
+        ));
 
         (
             MqttSource {
@@ -805,6 +840,7 @@ mod tests {
                 subscribe_pending: false,
                 expected_suback: None,
                 ready,
+                operations,
                 ack_tx,
                 ack_rx,
                 generation: 0,
@@ -1056,6 +1092,39 @@ mod tests {
         });
 
         assert!(options.manual_acks());
+    }
+
+    #[test]
+    fn test_durable_readiness_pending_ack_and_admission_reset_on_reconnect_and_exit() -> Result<()>
+    {
+        let options = TestMqttOptions::new("test-state", "localhost", 1883);
+        let (client, eventloop) = AsyncClient::new(options.clone(), 10);
+        let (mut source, _directory) = test_source(
+            options,
+            client,
+            eventloop,
+            Arc::new(AtomicBool::new(true)),
+            Vec::new(),
+            u64::MAX,
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let dispatcher = IngestDispatcher::new(vec![tx]);
+        source.dispatch_publish(test_publish(QoS::AtLeastOnce, 7), &dispatcher)?;
+        source.publish_admission(&dispatcher);
+        let operations = source.operations.clone();
+        assert_eq!(operations.pending_acks.load(Ordering::Relaxed), 1);
+        assert!(!operations.admission_available());
+        assert!(rx.try_recv().is_ok());
+        assert!(operations.admission_available());
+
+        source.reset_connection()?;
+        assert_eq!(operations.pending_acks.load(Ordering::Relaxed), 0);
+        assert!(!operations.admission_available());
+        assert!(!operations.source_ready.load(Ordering::Relaxed));
+        operations.source_ready.store(true, Ordering::Relaxed);
+        drop(source);
+        assert!(!operations.source_ready.load(Ordering::Relaxed));
+        Ok(())
     }
 
     #[test]

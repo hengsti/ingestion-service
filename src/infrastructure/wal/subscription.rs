@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::{
     fs::File,
@@ -9,6 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use tokio::sync::Notify;
 
+use crate::infrastructure::operations::ForwarderState;
 #[cfg(test)]
 use crate::infrastructure::wal::test_support::{run_test_io_hook, TestIoHookSlot, TestIoStep};
 use crate::infrastructure::wal::{
@@ -21,6 +23,7 @@ use crate::infrastructure::wal::{
 use crate::infrastructure::wal::{codec, cursor};
 
 pub struct WalSubscription {
+    forwarder: Arc<ForwarderState>,
     journal: Arc<Journal>,
     capacity: Arc<Capacity>,
     head: Arc<AtomicWalOffset>,
@@ -53,6 +56,7 @@ impl WalSubscription {
         start: WalOffset,
     ) -> Self {
         Self {
+            forwarder: Arc::new(ForwarderState::default()),
             journal,
             capacity,
             head,
@@ -66,6 +70,11 @@ impl WalSubscription {
             payload_buf: Vec::new(),
             last_gc_segment_id: start.segment_id.saturating_sub(1),
         }
+    }
+
+    /// Shares the state published by the forwarder consuming this subscription.
+    pub fn forwarder_state(&self) -> Arc<ForwarderState> {
+        Arc::clone(&self.forwarder)
     }
 
     /// Reads the next record at or before the writer's synced head.
@@ -103,6 +112,9 @@ impl WalSubscription {
             }
 
             if segment_id == head.segment_id && byte_offset == head.byte_offset {
+                if !self.forwarder.batch_pending.load(Ordering::Relaxed) {
+                    self.forwarder.set_oldest_pending(0);
+                }
                 if through.is_some() {
                     return Ok(None);
                 }

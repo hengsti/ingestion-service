@@ -186,10 +186,7 @@ async fn test_golden_cache_state_device_and_sse_envelopes() -> Result<()> {
     let wal_capacity = wal.capacity_handle();
     let app = cache_http::router(
         cache.clone(),
-        ready,
-        Arc::new(AtomicBool::new(true)),
-        wal_capacity.clone(),
-        wal_capacity,
+        common::http_operations(ready, true, wal_capacity.clone(), wal_capacity),
     );
 
     let mut state_list = request_json(app.clone(), "/v1/state").await?;
