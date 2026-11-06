@@ -20,15 +20,48 @@ The service ingests messages through a swappable `Source` abstraction (see `docs
 
 The shipped bundle is [`config/routes.json`](../config/routes.json). It is compiled once at startup;
 an empty route list or invalid route/schema fails startup. Schema-resource paths are relative to the
-bundle's directory. Keep the bundle and its `schemas/` directory together when deploying. The
-image includes them at `/app/config`; Compose can override them with a bind mount.
+bundle's directory. Keep the bundle and every referenced schema file together when deploying; the
+repository's firmware bundle stores its schemas under `config/schemas/`. The image includes the
+repository bundle at `/app/config`; Compose can override it with a complete read-only bind mount.
 
-The bundled firmware sensor filter is `smarthome/+/bme680`. If publishers use a different
-topic, configure the sensor route's `topic` to match.
+Every subscribed topic, including firmware sensor and status traffic, must be represented by one
+route in this bundle. The firmware sensor filter is `smarthome/+/bme680`; the status filter is
+`smarthome/+/status`. Their measurements, schemas, mappings, calculations, and cache policy are in
+[`config/routes.json`](../config/routes.json). For a complete synthetic route and payload, see
+[`config/examples/climate`](../config/examples/climate/README.md).
 
 The former `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other non-DLQ `MQTT_TOPIC_*` variables, and
 `ENFORCE_TOPIC_DEVICE_MATCH` are rejected at startup with a migration hint to use the route bundle.
-Do not set them alongside `INGEST_ROUTES_FILE`.
+Do not set them alongside `INGEST_ROUTES_FILE`; use the
+[stopped-ingest filter/session migration procedure](operations.md#route-changes-and-subscription-migration)
+when adopting the unified route bundle with a resumed persistent broker session.
+
+### Static preflight
+
+Run the same required-environment, journal-budget, route, schema, calculation, and output-type
+checks as startup without connecting to MQTT or InfluxDB, opening journal directories, or binding
+HTTP listeners:
+
+```bash
+./target/release/smarthome-ingest --check-config
+```
+
+For the deployed Compose environment and its read-only `config/` mount:
+
+```bash
+docker compose run --rm --no-deps ingest /app/smarthome-ingest --check-config
+```
+
+Both commands require the normal runtime environment variables to be set. To validate the
+synthetic route example instead, set `INGEST_ROUTES_FILE` to
+`config/examples/climate/routes.json` (or `/app/config/examples/climate/routes.json` in the
+container). The example's route-bundle version and environment-variable reference are in
+[`config/examples/climate/README.md`](../config/examples/climate/README.md).
+
+This is static validation only. It does not prove that credentials work, the broker's
+persistence/expiry/queue settings are correct, journal storage is writable, or target hardware
+has sufficient capacity. Runtime storage preflight and operational evidence are still required.
+This boundary follows the [side-effect-free preflight contract in issue #41](https://github.com/hengsti/ingestion-service/issues/41).
 
 ## MQTT
 
@@ -49,7 +82,9 @@ the publish destination for rejected messages; it is not a subscription.
 The MQTT client enforces a fixed 128 KiB maximum wire-packet size, including packet headers,
 topic, and payload. The application rejects payloads larger than 64 KiB before JSON decoding;
 messages between these limits can be received and durably quarantined as oversized. Packets
-above the MQTT wire limit are outside the local quarantine guarantee.
+above the MQTT wire limit are outside the local quarantine guarantee. Rejection reasons are
+bounded to 4,096 UTF-8 bytes; quarantine journal capacity is separately bounded by
+`QUARANTINE_MAX_BYTES`.
 
 With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
 
@@ -66,6 +101,14 @@ the manifest, startup fails closed until an operator verifies and supplies the o
 [route changes and subscription migration](operations.md#route-changes-and-subscription-migration).
 Do not delete the manifest or replace the broker session as a shortcut; either can hide queued
 work.
+
+The durable intake contract requires publisher QoS 1, the stable unique client ID, a persistent
+broker session, retained broker state, and explicitly sized broker session expiry and per-client
+queue/storage limits. PUBACK is eligible only after the output WAL or quarantine record is synced;
+queue or journal pressure leaves input unacknowledged. If broker expiry or capacity is exceeded,
+the broker may discard messages and replay is no longer guaranteed. A persistent session is
+bounded storage, not a lossless-delivery guarantee. See the
+[broker deployment prerequisites](../config/examples/deployment/README.md).
 
 ## InfluxDB
 
@@ -177,8 +220,8 @@ are ignored by the cache but continue through the pipeline.
 
 | Variable | Required | Used for |
 |---|---:|---|
-| `INGEST_TAG` | Yes | Image tag: a release tag (`v1.2.3`) or `sha-<12hex>`. CD rewrites it in the stack `.env` |
-| `GHCR_OWNER` | Yes | Image owner in `ghcr.io/<owner>/ingestion-service` |
+| `INGEST_IMAGE` | Yes | Immutable image reference; deployment uses a registry digest |
+| `INGEST_CONFIG_DIR` | No | Complete route/schema bundle mounted read-only at `/app/config`; defaults to `./config` |
 | `INFLUX_TOKEN` | Yes | Passed to the container. Never commit it |
 | `MQTT_HOST` | Yes | Broker hostname |
 | `MQTT_PORT` | Yes | Broker port |
@@ -192,12 +235,16 @@ are ignored by the cache but continue through the pipeline.
 volume. Keep paths and mounts aligned. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set,
 so the code defaults apply. The image `HEALTHCHECK` is used as-is.
 
-Compose mounts the repository's `config/` directory read-only at `/app/config` and sets
-`INGEST_ROUTES_FILE=/app/config/routes.json`; no route-file path is needed in the host `.env`.
+Compose mounts the complete `INGEST_CONFIG_DIR` read-only at `/app/config` and sets
+`INGEST_ROUTES_FILE=/app/config/routes.json`. For deployment, keep the full bundle under
+`/opt/smarthome-ingest/config` as described in [Releasing and Deploying](releasing.md); all schema
+files referenced by `routes.json` must be present in that same bundle. CD snapshots the bundle,
+preflights the candidate image against it, and rolls back the image/config pair together. The
+workflow never merges the repository's config files into the host bundle.
 
 CI renders the file with `docker compose config` and compares its `environment` keys with the variables read in `src/config.rs`. A variable that the code does not read, or a missing required variable, fails the build. Update `compose.yaml`, `src/config.rs`, and this page together.
 
-See [Operations](operations.md#run-with-docker-compose) for standalone use and inclusion in the Server stack.
+See [Operations](operations.md#run-with-docker-compose) for standalone use.
 
 ## Logging
 

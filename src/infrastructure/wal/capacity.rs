@@ -2,7 +2,7 @@ use std::{
     fs,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -43,6 +43,7 @@ pub(crate) fn validate_limit(name: &str, max_bytes: u64, segment_bytes: u64) -> 
 pub struct Capacity {
     max_bytes: u64,
     used_bytes: AtomicU64,
+    writable: AtomicBool,
     excess_metadata_bytes: u64,
     notify: Notify,
 }
@@ -98,6 +99,7 @@ impl Capacity {
         Ok(Arc::new(Self {
             max_bytes,
             used_bytes: AtomicU64::new(used),
+            writable: AtomicBool::new(true),
             excess_metadata_bytes,
             notify: Notify::new(),
         }))
@@ -167,6 +169,15 @@ impl Capacity {
     pub(crate) fn has_room_for_max_record(&self) -> bool {
         let used = self.used_bytes.load(Ordering::Acquire);
         self.max_bytes.saturating_sub(used) >= MAX_FRAME_BYTES + SEGMENT_ALLOWANCE_BYTES
+    }
+
+    /// Returns whether the journal writer has not stopped or failed.
+    pub fn is_writable(&self) -> bool {
+        self.writable.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_unwritable(&self) {
+        self.writable.store(false, Ordering::Release);
     }
 
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {

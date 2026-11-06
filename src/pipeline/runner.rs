@@ -7,6 +7,19 @@ use crate::pipeline::{
     stage::{PipelineStage, StageFlow},
 };
 
+pub(crate) const STAGE_LABELS: &[&str] = &[
+    "decode",
+    "validate_raw",
+    "transform",
+    "validate_output",
+    "cache_update",
+    "persist",
+    "observe",
+    "dlq_publish",
+    "other",
+];
+pub(crate) const STAGE_OUTCOMES: &[&str] = &["continue", "stop", "error"];
+
 pub struct PipelineRunner {
     stages: Vec<Box<dyn PipelineStage>>,
     failure_stage: Option<Box<dyn PipelineStage>>,
@@ -44,16 +57,28 @@ impl PipelineRunner {
                 debug!(stage=%stage.name(), topic=%ctx.topic(), "running pipeline stage");
 
                 let flow = match stage.run(ctx).await {
-                    Ok(flow) => flow,
+                    Ok(flow) => {
+                        Self::record_stage(
+                            ctx,
+                            stage.name(),
+                            match flow {
+                                StageFlow::Continue => "continue",
+                                StageFlow::Stop => "stop",
+                            },
+                        );
+                        flow
+                    }
                     Err(_) => {
+                        Self::record_stage(ctx, stage.name(), "error");
                         warn!(
                             stage = stage.name(),
                             topic = %ctx.topic(),
                             "pipeline stage failed; deferring outcome"
                         );
-                        return Self::record_outcome(PipelineOutcome::Deferred(
-                            DeferredReason::StageFailure,
-                        ));
+                        return Self::record_outcome(
+                            ctx,
+                            PipelineOutcome::Deferred(DeferredReason::StageFailure),
+                        );
                     }
                 };
 
@@ -65,22 +90,27 @@ impl PipelineRunner {
         }
 
         if let Some(reason) = ctx.deferred_reason() {
-            return Self::record_outcome(PipelineOutcome::Deferred(reason));
+            return Self::record_outcome(ctx, PipelineOutcome::Deferred(reason));
         }
 
         if ctx.should_quarantine() {
             if let Some(stage) = &self.failure_stage {
                 return match stage.run(ctx).await {
-                    Ok(_) => Self::record_outcome(PipelineOutcome::RejectionStored),
+                    Ok(_) => {
+                        Self::record_stage(ctx, stage.name(), "stop");
+                        Self::record_outcome(ctx, PipelineOutcome::RejectionStored)
+                    }
                     Err(_) => {
+                        Self::record_stage(ctx, stage.name(), "error");
                         warn!(
                             stage = stage.name(),
                             topic = %ctx.topic(),
                             "failure stage failed to persist rejection"
                         );
-                        Self::record_outcome(PipelineOutcome::Deferred(
-                            DeferredReason::QuarantineFailure,
-                        ))
+                        Self::record_outcome(
+                            ctx,
+                            PipelineOutcome::Deferred(DeferredReason::QuarantineFailure),
+                        )
                     }
                 };
             } else {
@@ -88,27 +118,50 @@ impl PipelineRunner {
                     topic = %ctx.topic(),
                     "rejected message has no durable quarantine stage"
                 );
-                return Self::record_outcome(PipelineOutcome::Deferred(
-                    DeferredReason::QuarantineFailure,
-                ));
+                return Self::record_outcome(
+                    ctx,
+                    PipelineOutcome::Deferred(DeferredReason::QuarantineFailure),
+                );
             }
         }
 
         if stopped {
-            return Self::record_outcome(PipelineOutcome::Deferred(DeferredReason::UnexpectedStop));
+            return Self::record_outcome(
+                ctx,
+                PipelineOutcome::Deferred(DeferredReason::UnexpectedStop),
+            );
         }
 
         if ctx.output_stored() {
-            Self::record_outcome(PipelineOutcome::OutputStored)
+            Self::record_outcome(ctx, PipelineOutcome::OutputStored)
         } else {
-            Self::record_outcome(PipelineOutcome::Deferred(
-                DeferredReason::MissingPersistence,
-            ))
+            Self::record_outcome(
+                ctx,
+                PipelineOutcome::Deferred(DeferredReason::MissingPersistence),
+            )
         }
     }
 
-    fn record_outcome(outcome: PipelineOutcome) -> PipelineOutcome {
-        counter!("ingest_pipeline_outcomes_total", "outcome" => outcome.metric_label())
+    fn record_stage(ctx: &PipelineContext, stage: &str, outcome: &'static str) {
+        let stage = STAGE_LABELS
+            .iter()
+            .copied()
+            .find(|label| *label == stage)
+            .unwrap_or("other");
+        let route = ctx
+            .route()
+            .map(|route| metrics::SharedString::from(route.metric_label()))
+            .unwrap_or_else(|_| metrics::SharedString::from(""));
+        counter!("ingest_stage_outcomes_total", "route" => route, "stage" => stage, "outcome" => outcome)
+            .increment(1);
+    }
+
+    fn record_outcome(ctx: &PipelineContext, outcome: PipelineOutcome) -> PipelineOutcome {
+        let route = ctx
+            .route()
+            .map(|route| metrics::SharedString::from(route.metric_label()))
+            .unwrap_or_else(|_| metrics::SharedString::from(""));
+        counter!("ingest_pipeline_outcomes_total", "route" => route, "outcome" => outcome.metric_label())
             .increment(1);
         outcome
     }
@@ -299,13 +352,14 @@ mod tests {
         let handle = recorder.handle();
 
         metrics::with_local_recorder(&recorder, || {
-            PipelineRunner::record_outcome(PipelineOutcome::Deferred(
-                DeferredReason::PersistenceFailure,
-            ));
+            PipelineRunner::record_outcome(
+                &PipelineContext::new("topic", vec![]),
+                PipelineOutcome::Deferred(DeferredReason::PersistenceFailure),
+            );
         });
 
         assert!(handle
             .render()
-            .contains("ingest_pipeline_outcomes_total{outcome=\"deferred\"} 1\n"));
+            .contains("ingest_pipeline_outcomes_total{route=\"\",outcome=\"deferred\"} 1\n"));
     }
 }

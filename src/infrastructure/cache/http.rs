@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::{collections::BTreeMap, convert::Infallible};
 
 use axum::{
@@ -21,52 +18,38 @@ use tokio_stream::{
 };
 
 use super::state::{CacheEvent, CacheState};
-use crate::infrastructure::wal::capacity::Capacity;
+use crate::infrastructure::operations::Operations;
 use crate::model::messages::telemetry::TelemetryValue;
 
-#[derive(Clone)]
-struct ForwarderAlive(Arc<AtomicBool>);
-
 /// Builds the cache HTTP API router.
-pub fn router(
-    state: CacheState,
-    source_ready: Arc<AtomicBool>,
-    forwarder_alive: Arc<AtomicBool>,
-    wal_capacity: Arc<Capacity>,
-    quarantine_capacity: Arc<Capacity>,
-) -> Router {
+pub fn router(state: CacheState, operations: Arc<Operations>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/v1/operations", get(operations_snapshot))
         .route("/v1/state", get(list_state))
         .route("/v1/state/{device_id}", get(get_state))
         .route("/v1/stream", get(stream_updates))
         .with_state(state)
-        .layer(Extension(source_ready))
-        .layer(Extension(ForwarderAlive(forwarder_alive)))
-        .layer(Extension(wal_capacity))
-        .layer(Extension(quarantine_capacity))
+        .layer(Extension(operations))
 }
 
 async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-async fn readyz(
-    Extension(source_ready): Extension<Arc<AtomicBool>>,
-    Extension(ForwarderAlive(forwarder_alive)): Extension<ForwarderAlive>,
-    Extension(wal_capacity): Extension<Arc<Capacity>>,
-    Extension(quarantine_capacity): Extension<Arc<Capacity>>,
-) -> StatusCode {
-    if source_ready.load(Ordering::Relaxed)
-        && forwarder_alive.load(Ordering::Relaxed)
-        && wal_capacity.has_room_for_max_record()
-        && quarantine_capacity.has_room_for_max_record()
-    {
+async fn readyz(Extension(operations): Extension<Arc<Operations>>) -> StatusCode {
+    if operations.ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+async fn operations_snapshot(
+    Extension(operations): Extension<Arc<Operations>>,
+) -> impl IntoResponse {
+    Json(operations.snapshot())
 }
 
 #[derive(Serialize)]
@@ -185,7 +168,10 @@ async fn stream_updates(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use crate::infrastructure::operations::ForwarderState;
     use crate::infrastructure::wal::capacity::{
         self, Capacity, METADATA_RESERVE_BYTES, SEGMENT_ALLOWANCE_BYTES,
     };
@@ -207,13 +193,7 @@ mod tests {
         let quarantine_dir = tempfile::tempdir()?;
         let quarantine = Capacity::recover(quarantine_dir.path(), max_bytes)?;
 
-        let response = readyz(
-            Extension(Arc::new(AtomicBool::new(true))),
-            Extension(ForwarderAlive(Arc::new(AtomicBool::new(true)))),
-            Extension(wal),
-            Extension(quarantine),
-        )
-        .await;
+        let response = readyz(Extension(test_operations(wal, quarantine))).await;
 
         assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
@@ -237,15 +217,22 @@ mod tests {
         let wal = Capacity::recover(wal_dir.path(), max_bytes)?;
         let quarantine = Capacity::recover(quarantine_dir.path(), max_bytes)?;
 
-        let response = readyz(
-            Extension(Arc::new(AtomicBool::new(true))),
-            Extension(ForwarderAlive(Arc::new(AtomicBool::new(true)))),
-            Extension(wal),
-            Extension(quarantine),
-        )
-        .await;
+        let response = readyz(Extension(test_operations(wal, quarantine))).await;
 
         assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
+    }
+
+    fn test_operations(wal: Arc<Capacity>, quarantine: Arc<Capacity>) -> Arc<Operations> {
+        let forwarder = Arc::new(ForwarderState::default());
+        forwarder.alive.store(true, Ordering::Relaxed);
+        let state = Arc::new(Operations::new(
+            Arc::new(AtomicBool::new(true)),
+            forwarder,
+            wal,
+            quarantine,
+        ));
+        state.update_admission(1, 1, 0);
+        state
     }
 }

@@ -1,0 +1,61 @@
+# Isolated test resources only; image versions match the Server deployment.
+services:
+  emqx:
+    image: emqx/emqx:6.3.1
+    hostname: emqx
+    environment:
+      EMQX_NODE__NAME: emqx@emqx
+      EMQX_DURABLE_SESSIONS__ENABLE: "true"
+      EMQX_MQTT__SESSION_EXPIRY_INTERVAL: 1h
+      EMQX_MQTT__MAX_INFLIGHT: "16"
+      EMQX_MQTT__MAX_MQUEUE_LEN: "1000"
+      EMQX_API_KEY__BOOTSTRAP_FILE: /opt/emqx/etc/test-api-key
+      EMQX_AUTHENTICATION: '[{mechanism = password_based, backend = built_in_database, user_id_type = username}]'
+    ports:
+      - "127.0.0.1:${INGEST_IT_MQTT_PORT:-0}:1883"
+      - "127.0.0.1:${INGEST_IT_EMQX_API_PORT:-0}:18083"
+    volumes:
+      - emqx-data:/opt/emqx/data
+      - emqx-log:/opt/emqx/log
+      - ./fixtures/broker/api-key:/opt/emqx/etc/test-api-key:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18083/api/v5/status"]
+      interval: 2s
+      timeout: 10s
+      retries: 60
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "1"
+
+  influxdb:
+    image: influxdb:2.7
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ingest-test
+      DOCKER_INFLUXDB_INIT_PASSWORD: synthetic-test-password
+      DOCKER_INFLUXDB_INIT_ORG: ingest-test
+      DOCKER_INFLUXDB_INIT_BUCKET: ingest-test
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: synthetic-integration-token
+    ports:
+      - "127.0.0.1:${INGEST_IT_INFLUX_PORT:-0}:8086"
+    volumes:
+      - influx-data:/var/lib/influxdb2
+      - influx-config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping", "--host", "http://localhost:8086"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "1"
+
+volumes:
+  emqx-data:
+  emqx-log:
+  influx-data:
+  influx-config:

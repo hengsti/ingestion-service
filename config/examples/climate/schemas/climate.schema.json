@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Synthetic climate input",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "temp_c": {
+      "type": "number"
+    },
+    "rel_hum_perc": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 100
+    },
+    "site_label": {
+      "type": "string"
+    },
+    "sensor_label": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "temp_c",
+    "rel_hum_perc"
+  ]
+}

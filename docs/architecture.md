@@ -41,8 +41,11 @@ route, and mapped record in a `PipelineContext`. The pipeline stages are:
 7. **observe** — record success metrics labeled with configured route ID.
 8. **dlq_publish** — publish rejected input through the active source's DLQ publisher.
 
-Stage errors mark the context for DLQ; an intentional `StageFlow::Stop` does not. The
-failure publisher does not recursively republish its own failures.
+Deterministic invalid input calls `ctx.mark_rejection(reason)` and reaches the durable
+quarantine failure stage. Operational stage errors and `ctx.mark_deferred(reason)` defer
+the input; they are not converted into rejection. `StageFlow::Stop` only stops remaining
+stages, and an unmarked stop is deferred. A supplementary DLQ publication failure after
+quarantine is logged, not recursively republished.
 
 The canonical record contains a configured measurement, typed tags and fields, device ID,
 source topic, frozen timestamp in epoch milliseconds, and MQTT retained metadata. The
@@ -80,8 +83,12 @@ configured scalar type, and always writes the record timestamp with `precision=m
 The payload is encoded once before WAL append. `WalEvent` serialization and the on-disk WAL
 format are unchanged. A WAL append receipt follows a buffer flush and file sync; segment
 creation and cursor replacement also sync their directory metadata. These guarantees depend
-on the filesystem and storage honoring sync. They do not yet establish durable MQTT
-acknowledgement or a fail-closed WAL reader; see [WAL and Reliability](wal-and-reliability.md).
+on the filesystem and storage honoring sync. For QoS 1 input, PUBACK is eligible only after
+the output WAL or quarantine append is durable. The WAL reader consumes only the published
+synced head and fails closed at read/corruption faults; readiness remains false while those
+faults are active. Broker session expiry/capacity and the local journal budgets bound the
+delivery guarantee. This is not a promise of lossless delivery or power-loss durability on
+storage that does not honor sync. See [WAL and Reliability](wal-and-reliability.md).
 
 ## Cache and HTTP
 

@@ -2,8 +2,8 @@ pub mod mqtt;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use crate::config::{Config, InputSourceKind};
-use crate::infrastructure::wal::capacity::Capacity;
+use crate::infrastructure::operations::Operations;
 use crate::pipeline::outcome::PipelineOutcome;
 
 /// A single unit of work dispatched from a [`Source`] into the worker pool.
@@ -142,6 +142,10 @@ impl IngestDispatcher {
     pub fn all_workers_open(&self) -> bool {
         self.senders.iter().all(|sender| !sender.is_closed())
     }
+
+    pub(crate) fn queue_handle(&self) -> Weak<[mpsc::Sender<IngestJob>]> {
+        Arc::downgrade(&self.senders)
+    }
 }
 
 /// A transport that produces [`IngestJob`]s (e.g. an MQTT client, a future Kafka consumer).
@@ -181,15 +185,11 @@ pub trait DlqPublisher: Send + Sync {
 /// Returns an error if the configured source is unsupported or lacks the MQTT configuration.
 pub async fn build_source(
     cfg: &Config,
-    ready: Arc<AtomicBool>,
     routes: &crate::infrastructure::router::RouteSet,
-    wal_capacity: Arc<Capacity>,
-    quarantine_capacity: Arc<Capacity>,
+    operations: Arc<Operations>,
 ) -> Result<(Box<dyn Source>, Arc<dyn DlqPublisher>)> {
     match cfg.input_source {
-        InputSourceKind::Mqtt => {
-            mqtt::build(cfg, ready, routes, wal_capacity, quarantine_capacity).await
-        }
+        InputSourceKind::Mqtt => mqtt::build(cfg, routes, operations).await,
     }
 }
 
