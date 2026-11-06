@@ -12,7 +12,7 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::operations::Operations;
@@ -115,6 +115,10 @@ async fn recv_worker_job(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if run_config_check_command()? {
+        return Ok(());
+    }
+
     if infrastructure::quarantine::run_maintenance_command().await? {
         return Ok(());
     }
@@ -439,6 +443,34 @@ async fn main() -> Result<()> {
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+fn run_config_check_command() -> Result<bool> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match args.as_slice() {
+        [flag] if flag == "--check-config" => {
+            if let Err(error) = check_config() {
+                let diagnostic: String = format!("{error:#}").chars().take(1024).collect();
+                bail!("configuration check failed: {diagnostic}");
+            }
+            Ok(true)
+        }
+        [flag, ..] if flag == "--check-config" => {
+            bail!("usage: --check-config");
+        }
+        _ => Ok(false),
+    }
+}
+
+fn check_config() -> Result<()> {
+    let cfg = Config::from_env()?;
+    let route_bundle = config::routes::load(&cfg.routes_file)?;
+    let routes = RouteSet::compile(route_bundle, &cfg.dlq_topic)?;
+    println!(
+        "Configuration is valid ({} routes).",
+        routes.subscriptions().len()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

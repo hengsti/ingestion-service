@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Synthetic climate output",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "route_id": {
+      "const": "example-climate"
+    },
+    "device_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "measurement": {
+      "const": "climate"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "device_id"
+      ]
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/scalar"
+      },
+      "properties": {
+        "temp_c": {
+          "type": "number"
+        },
+        "rel_hum_perc": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "dew_point_c": {
+          "type": "number"
+        },
+        "mqtt_retained": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "temp_c",
+        "rel_hum_perc",
+        "dew_point_c",
+        "mqtt_retained"
+      ]
+    },
+    "source_topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "retained": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "route_id",
+    "device_id",
+    "measurement",
+    "timestamp_ms",
+    "tags",
+    "fields",
+    "source_topic",
+    "retained"
+  ],
+  "definitions": {
+    "scalar": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    }
+  }
+}

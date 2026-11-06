@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "id": "example-climate",
+      "topic": "example/climate/+",
+      "schema": "schemas/climate.schema.json",
+      "output_schema": "schemas/climate.output.schema.json",
+      "device_id": {
+        "topic_segment": 2
+      },
+      "measurement": "climate",
+      "fields": {
+        "temp_c": {
+          "pointer": "/temp_c",
+          "type": "float"
+        },
+        "rel_hum_perc": {
+          "pointer": "/rel_hum_perc",
+          "type": "float"
+        }
+      },
+      "timestamp": {
+        "source": "received_at"
+      },
+      "calculations": [
+        "dew_point"
+      ]
+    }
+  ]
+}

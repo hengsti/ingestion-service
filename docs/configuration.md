@@ -30,6 +30,32 @@ The former `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other non-DLQ `MQTT_TOPIC_*
 `ENFORCE_TOPIC_DEVICE_MATCH` are rejected at startup with a migration hint to use the route bundle.
 Do not set them alongside `INGEST_ROUTES_FILE`.
 
+### Static preflight
+
+Run the same required-environment, journal-budget, route, schema, calculation, and output-type
+checks as startup without connecting to MQTT or InfluxDB, opening journal directories, or binding
+HTTP listeners:
+
+```bash
+./target/release/smarthome-ingest --check-config
+```
+
+For the deployed Compose environment and its read-only `config/` mount:
+
+```bash
+docker compose run --rm --no-deps ingest /app/smarthome-ingest --check-config
+```
+
+Both commands require the normal runtime environment variables to be set. To validate the
+synthetic route example instead, set `INGEST_ROUTES_FILE` to
+`config/examples/climate/routes.json` (or `/app/config/examples/climate/routes.json` in the
+container). The example's route-bundle version and environment-variable reference are in
+[`config/examples/climate/README.md`](../config/examples/climate/README.md).
+
+This is static validation only. It does not prove that credentials work, the broker's
+persistence/expiry/queue settings are correct, journal storage is writable, or target hardware
+has sufficient capacity. Runtime storage preflight and operational evidence are still required.
+
 ## MQTT
 
 The broker variables below are required only when `INPUT_SOURCE=mqtt`. MQTT subscriptions come
