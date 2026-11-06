@@ -24,11 +24,13 @@ async fn make_app(
     let cache = CacheState::new(60_000, 64);
     let ready = Arc::new(AtomicBool::new(source_ready));
     let (wal, subscription, directory) = common::open_temp_wal().await;
+    let wal_capacity = wal.capacity_handle();
     let app = cache_http::router(
         cache,
         ready,
         Arc::new(AtomicBool::new(true)),
-        wal.capacity_handle(),
+        wal_capacity.clone(),
+        wal_capacity,
     );
     (app, wal, subscription, directory)
 }
@@ -39,11 +41,13 @@ async fn make_app_with_cache(
 ) -> (axum::Router, Arc<Wal>, WalSubscription, tempfile::TempDir) {
     let ready = Arc::new(AtomicBool::new(source_ready));
     let (wal, subscription, directory) = common::open_temp_wal().await;
+    let wal_capacity = wal.capacity_handle();
     let app = cache_http::router(
         cache,
         ready,
         Arc::new(AtomicBool::new(true)),
-        wal.capacity_handle(),
+        wal_capacity.clone(),
+        wal_capacity,
     );
     (app, wal, subscription, directory)
 }
@@ -114,7 +118,14 @@ async fn readyz_returns_503_when_forwarder_stopped() {
     let source_ready = Arc::new(AtomicBool::new(true));
     let forwarder_alive = Arc::new(AtomicBool::new(false));
     let (wal, _subscription, _directory) = common::open_temp_wal().await;
-    let app = cache_http::router(cache, source_ready, forwarder_alive, wal.capacity_handle());
+    let wal_capacity = wal.capacity_handle();
+    let app = cache_http::router(
+        cache,
+        source_ready,
+        forwarder_alive,
+        wal_capacity.clone(),
+        wal_capacity,
+    );
 
     let response = app
         .oneshot(

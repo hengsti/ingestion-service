@@ -74,8 +74,24 @@ impl WalSubscription {
     /// Returns an error when a segment or record inside the durable range cannot
     /// be read. The reader position remains at the offending record.
     pub async fn next(&mut self) -> Result<Option<WalEntry>> {
+        self.next_before(None).await
+    }
+
+    /// Reads the next record without waiting past a fixed durable snapshot.
+    pub(crate) async fn next_until(&mut self, through: WalOffset) -> Result<Option<WalEntry>> {
+        self.next_before(Some(through)).await
+    }
+
+    async fn next_before(&mut self, through: Option<WalOffset>) -> Result<Option<WalEntry>> {
         loop {
-            let head = self.head.load();
+            let durable_head = self.head.load();
+            let head = match through {
+                Some(through) if through <= durable_head => through,
+                Some(through) => {
+                    anyhow::bail!("WAL snapshot {through:?} exceeds durable head {durable_head:?}")
+                }
+                None => durable_head,
+            };
             let segment_id = self.cur_segment_id;
             let byte_offset = self.cur_byte_offset;
             if segment_id > head.segment_id
@@ -87,6 +103,9 @@ impl WalSubscription {
             }
 
             if segment_id == head.segment_id && byte_offset == head.byte_offset {
+                if through.is_some() {
+                    return Ok(None);
+                }
                 if !self.wait_or_advance().await {
                     if self.writer_state.failure().is_some() {
                         anyhow::bail!("WAL writer failed at {segment_id}:{byte_offset}");

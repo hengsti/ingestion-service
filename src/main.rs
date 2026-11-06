@@ -164,12 +164,14 @@ async fn main() -> Result<()> {
     let source_ready_http = source_ready.clone();
     let forwarder_alive_http = forwarder_alive.clone();
     let wal_capacity_http = wal.capacity_handle();
+    let quarantine_capacity_http = quarantine_capacity.clone();
     let mut _http_task = tokio::spawn(async move {
         let app = http::router(
             http_state,
             source_ready_http,
             forwarder_alive_http,
             wal_capacity_http,
+            quarantine_capacity_http,
         );
         let listener = tokio::net::TcpListener::bind(&cache_bind)
             .await
@@ -194,10 +196,13 @@ async fn main() -> Result<()> {
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
     let forwarder_alive_task = forwarder_alive.clone();
+    let (forwarder_stopped_tx, forwarder_stopped_rx) = watch::channel(false);
 
     let mut forwarder_task = tokio::spawn(async move {
         let _liveness = ForwarderLivenessGuard(forwarder_alive_task);
-        run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await
+        let result = run_forwarder(wal_sub, sink, batch_size, flush_interval_ms).await;
+        let _ = forwarder_stopped_tx.send(true);
+        result
     });
 
     // Input source.
@@ -218,7 +223,10 @@ async fn main() -> Result<()> {
             .add_stage(TelemetryMappingStage::new())
             .add_stage(ValidateOutputStage::new(encoder.clone()))
             .add_stage(CacheUpdateStage::new(app_state.clone()))
-            .add_stage(PersistStage::new(wal.clone(), encoder))
+            .add_stage(
+                PersistStage::new(wal.clone(), encoder)
+                    .with_forwarder_stopped(forwarder_stopped_rx),
+            )
             .add_stage(ObserveStage::new())
             .with_failure_stage(DlqPublishStage::new(
                 dlq_publisher,

@@ -33,6 +33,7 @@ pub fn router(
     source_ready: Arc<AtomicBool>,
     forwarder_alive: Arc<AtomicBool>,
     wal_capacity: Arc<Capacity>,
+    quarantine_capacity: Arc<Capacity>,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -44,6 +45,7 @@ pub fn router(
         .layer(Extension(source_ready))
         .layer(Extension(ForwarderAlive(forwarder_alive)))
         .layer(Extension(wal_capacity))
+        .layer(Extension(quarantine_capacity))
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -54,10 +56,12 @@ async fn readyz(
     Extension(source_ready): Extension<Arc<AtomicBool>>,
     Extension(ForwarderAlive(forwarder_alive)): Extension<ForwarderAlive>,
     Extension(wal_capacity): Extension<Arc<Capacity>>,
+    Extension(quarantine_capacity): Extension<Arc<Capacity>>,
 ) -> StatusCode {
     if source_ready.load(Ordering::Relaxed)
         && forwarder_alive.load(Ordering::Relaxed)
         && wal_capacity.has_room_for_max_record()
+        && quarantine_capacity.has_room_for_max_record()
     {
         StatusCode::OK
     } else {
@@ -200,11 +204,44 @@ mod tests {
             vec![0; segment_bytes as usize],
         )?;
         let wal = Capacity::recover(dir.path(), max_bytes)?;
+        let quarantine_dir = tempfile::tempdir()?;
+        let quarantine = Capacity::recover(quarantine_dir.path(), max_bytes)?;
 
         let response = readyz(
             Extension(Arc::new(AtomicBool::new(true))),
             Extension(ForwarderAlive(Arc::new(AtomicBool::new(true)))),
             Extension(wal),
+            Extension(quarantine),
+        )
+        .await;
+
+        assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_quarantine_cannot_admit_a_maximum_record() -> anyhow::Result<()>
+    {
+        let wal_dir = tempfile::tempdir()?;
+        let quarantine_dir = tempfile::tempdir()?;
+        let max_bytes = capacity::minimum_capacity(1024 * 1024)?;
+        let required = crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES as u64
+            + 4
+            + SEGMENT_ALLOWANCE_BYTES;
+        let segment_bytes =
+            max_bytes - required - METADATA_RESERVE_BYTES - SEGMENT_ALLOWANCE_BYTES + 1;
+        std::fs::write(
+            quarantine_dir.path().join("00000000000000000001.log"),
+            vec![0; segment_bytes as usize],
+        )?;
+        let wal = Capacity::recover(wal_dir.path(), max_bytes)?;
+        let quarantine = Capacity::recover(quarantine_dir.path(), max_bytes)?;
+
+        let response = readyz(
+            Extension(Arc::new(AtomicBool::new(true))),
+            Extension(ForwarderAlive(Arc::new(AtomicBool::new(true)))),
+            Extension(wal),
+            Extension(quarantine),
         )
         .await;
 

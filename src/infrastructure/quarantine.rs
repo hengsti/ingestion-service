@@ -20,7 +20,7 @@ use crate::infrastructure::wal::{
 
 const MAX_QUARANTINE_REASON_BYTES: usize = 4096;
 const ENVELOPE_FIXED_OVERHEAD_BYTES: usize = 256;
-const MAX_EXPORT_LINE_BYTES: usize = 1024 * 1024 + 1024;
+const MAX_EXPORT_LINE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_QUEUE_CAPACITY: usize = 16_384;
 
@@ -201,10 +201,10 @@ impl Quarantine {
         let mut current = from;
         let mut records = 0u64;
         while current < through {
-            let entry = subscription
-                .next()
-                .await?
-                .context("quarantine journal ended before its durable head")?;
+            let Some(entry) = subscription.next_until(through).await? else {
+                current = through;
+                break;
+            };
             let rejection = serde_json::from_str(&entry.event.payload)
                 .context("decoding quarantine record for export")?;
             write_export_line(
@@ -249,6 +249,7 @@ impl Quarantine {
         let mut reader = BufReader::new(file);
         let mut line = Vec::new();
         let from = journal_start_offset(&self.dir)?;
+        let snapshot = subscription.durable_head();
         let journal_id = self.journal_id()?;
 
         if !read_export_line(&mut reader, &mut line)? {
@@ -282,7 +283,7 @@ impl Quarantine {
                     event,
                 } => {
                     let entry = subscription
-                        .next()
+                        .next_until(snapshot)
                         .await?
                         .context("quarantine export extends beyond the journal")?;
                     if offset != format_offset(entry.offset)
@@ -766,6 +767,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_quarantine_export_line_fits_maximum_packet_rejection() -> anyhow::Result<()> {
+        let topic = "\u{0001}".repeat(65_500);
+        let payload = vec![u8::MAX; 65_500];
+        let reason = "\u{0001}".repeat(MAX_QUARANTINE_REASON_BYTES);
+        let envelope = encode_envelope(&topic, 1, &payload, &reason, None, false, 1)?;
+        let event = ExportEvent {
+            topic,
+            ts_ms: 1,
+            rejection: serde_json::from_slice(&envelope)?,
+        };
+        let line = ExportLine::Record {
+            offset: "1:0".to_owned(),
+            offset_after: "1:1".to_owned(),
+            event,
+        };
+        let dir = tempfile::tempdir()?;
+        let file = File::create(dir.path().join("export.jsonl"))?;
+        let mut writer = BufWriter::new(file);
+
+        write_export_line(&mut writer, &line)?;
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_quarantine_sync_failure_is_not_reported_as_persisted() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -839,6 +865,64 @@ mod tests {
             .await?
             .expect("unresolved record remains after restart");
         assert_eq!(unresolved.event.topic, "topic/second");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_export_finishes_at_empty_trailing_segment() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let journal_dir = root.path().join("quarantine");
+        let export_path = root.path().join("quarantine.jsonl");
+        let (quarantine, subscription) = Quarantine::open(options(&journal_dir)).await?;
+        append_test_record(&quarantine, "topic").await?;
+        drop(subscription);
+        drop(quarantine);
+
+        File::create(segment::segment_path(&journal_dir, 2))?.sync_all()?;
+        let (quarantine, mut subscription) = reopen_quarantine(&journal_dir).await?;
+        let exported = tokio::time::timeout(
+            Duration::from_secs(1),
+            quarantine.export(&mut subscription, &export_path),
+        )
+        .await??;
+
+        assert_eq!(exported, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_resolution_rejects_record_after_snapshot_without_waiting(
+    ) -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let journal_dir = root.path().join("quarantine");
+        let export_path = root.path().join("quarantine.jsonl");
+        let (quarantine, mut subscription) = Quarantine::open(options(&journal_dir)).await?;
+        append_test_record(&quarantine, "topic").await?;
+        quarantine.export(&mut subscription, &export_path).await?;
+        let lines: Vec<_> = fs::read_to_string(&export_path)?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let record: ExportLine = serde_json::from_str(&lines[1])?;
+        let target = match record {
+            ExportLine::Record { offset_after, .. } => parse_offset(&offset_after)?,
+            _ => anyhow::bail!("expected an exported record"),
+        };
+        let mut tampered = lines[..3].to_vec();
+        tampered.insert(2, lines[1].clone());
+        fs::write(&export_path, tampered.join("\n") + "\n")?;
+        drop(subscription);
+        drop(quarantine);
+
+        let (quarantine, mut subscription) = reopen_quarantine(&journal_dir).await?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            quarantine.resolve_prefix(&mut subscription, target, &export_path),
+        )
+        .await?;
+
+        assert!(result.is_err());
+        assert!(cursor::read_cursor(&journal_dir)?.is_none());
         Ok(())
     }
 

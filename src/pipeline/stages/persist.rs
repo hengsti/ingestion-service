@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::{future::Future, pin::Pin, time::Instant};
 
 use anyhow::Context;
+use tokio::sync::watch;
 use tracing::warn;
 
 use metrics::{counter, histogram};
@@ -24,11 +25,39 @@ use crate::{
 pub struct PersistStage {
     wal: Arc<Wal>,
     encoder: Arc<dyn Encoder>,
+    forwarder_stopped: Option<watch::Receiver<bool>>,
 }
 
 impl PersistStage {
     pub fn new(wal: Arc<Wal>, encoder: Arc<dyn Encoder>) -> Self {
-        Self { wal, encoder }
+        Self {
+            wal,
+            encoder,
+            forwarder_stopped: None,
+        }
+    }
+
+    /// Stops capacity waits when the WAL forwarder terminates.
+    pub fn with_forwarder_stopped(mut self, stopped: watch::Receiver<bool>) -> Self {
+        self.forwarder_stopped = Some(stopped);
+        self
+    }
+}
+
+async fn wait_for_progress(
+    notification: impl Future<Output = ()>,
+    forwarder_stopped: Option<&mut watch::Receiver<bool>>,
+) -> bool {
+    match forwarder_stopped {
+        Some(receiver) if *receiver.borrow() => true,
+        Some(receiver) => tokio::select! {
+            _ = notification => false,
+            changed = receiver.changed() => changed.is_err() || *receiver.borrow(),
+        },
+        None => {
+            notification.await;
+            false
+        }
     }
 }
 
@@ -43,6 +72,7 @@ impl PipelineStage for PersistStage {
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
             let start = Instant::now();
+            let mut forwarder_stopped = self.forwarder_stopped.clone();
 
             let route_id = ctx.route()?.metric_label();
             let record = ctx.telemetry_record()?;
@@ -84,12 +114,26 @@ impl PipelineStage for PersistStage {
                             capacity_warned = true;
                         }
                         event = rejected;
-                        notified.await;
+                        if wait_for_progress(notified.as_mut(), forwarder_stopped.as_mut()).await {
+                            warn!(topic = %ctx.topic(), "wal forwarder stopped; deferring message");
+                            ctx.mark_deferred(DeferredReason::PersistenceFailure);
+                            histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "forwarder_stopped")
+                                .record(start.elapsed().as_secs_f64());
+                            return Ok(StageFlow::Stop);
+                        }
                     }
                     Err(AppendDurableError::Full(rejected)) if capacity_warned => {
                         event = rejected;
                         // Failed queue admission releases its reservation and wakes capacity waiters.
-                        writer_notified.await;
+                        if wait_for_progress(writer_notified.as_mut(), forwarder_stopped.as_mut())
+                            .await
+                        {
+                            warn!(topic = %ctx.topic(), "wal forwarder stopped; deferring message");
+                            ctx.mark_deferred(DeferredReason::PersistenceFailure);
+                            histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "forwarder_stopped")
+                                .record(start.elapsed().as_secs_f64());
+                            return Ok(StageFlow::Stop);
+                        }
                     }
                     Err(AppendDurableError::Full(_)) => {
                         counter!("ingest_queue_full_total", "route" => route_id.clone())
@@ -292,6 +336,64 @@ mod tests {
         assert!(matches!(result, Ok(StageFlow::Continue)));
         drop(run);
         assert!(!ctx.should_quarantine());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_capacity_wait_stops_when_forwarder_exits() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let (wal, _sub) = Wal::open(WalOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 3 * 1024 * 1024,
+            segment_bytes: 1024 * 1024,
+            queue_capacity: 8,
+        })
+        .await?;
+        let wal = Arc::new(wal);
+        let event = WalEvent {
+            topic: "t".to_owned(),
+            ts_ms: 1,
+            payload: "x"
+                .repeat(crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES - 25),
+        };
+        wal.append_durable(event.clone())
+            .await
+            .expect("first append");
+        wal.append_durable(event).await.expect("second append");
+        let (used, max) = wal.capacity_bytes();
+        let frame_bytes =
+            (max - used - crate::infrastructure::wal::capacity::SEGMENT_ALLOWANCE_BYTES) as usize;
+        wal.append_durable(WalEvent {
+            topic: "t".to_owned(),
+            ts_ms: 2,
+            payload: "x".repeat(frame_bytes - 29),
+        })
+        .await
+        .expect("fill remaining capacity");
+
+        let (forwarder_stopped_tx, forwarder_stopped_rx) = tokio::sync::watch::channel(false);
+        let stage = PersistStage::new(
+            wal,
+            Arc::new(crate::infrastructure::sink::influx::InfluxEncoder),
+        )
+        .with_forwarder_stopped(forwarder_stopped_rx);
+        let mut ctx = ctx_with_record();
+        let mut run = stage.run(&mut ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), run.as_mut())
+                .await
+                .is_err()
+        );
+
+        forwarder_stopped_tx.send(true)?;
+        let result = tokio::time::timeout(Duration::from_secs(1), run.as_mut()).await?;
+        drop(run);
+
+        assert!(matches!(result, Ok(StageFlow::Stop)));
+        assert_eq!(
+            ctx.deferred_reason(),
+            Some(DeferredReason::PersistenceFailure)
+        );
         Ok(())
     }
 
