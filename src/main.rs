@@ -4,6 +4,9 @@ mod infrastructure;
 mod model;
 mod pipeline;
 
+#[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+mod test_hooks;
+
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,

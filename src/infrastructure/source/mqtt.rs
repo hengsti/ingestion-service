@@ -427,6 +427,8 @@ impl Source for MqttSource {
                             Event::Incoming(Incoming::ConnAck(connack)) => {
                                 info!("MQTT connected");
                                 self.invalidate_acknowledgements()?;
+                                #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                                crate::test_hooks::trace(format!("connack {} {}", self.generation, connack.session_present)).await?;
                                 self.ready.store(false, Ordering::Relaxed);
                                 if !connack.session_present {
                                     self.fresh_session_filters = Some(Vec::new());
@@ -498,6 +500,18 @@ impl Source for MqttSource {
                                         .context("unexpected MQTT unsubscribe request")?;
                                     reconciliation.expected_unsubacks.insert(*packet_id);
                                 }
+                            }
+                            _ => {}
+                        }
+
+                        #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                        match &event {
+                            Event::Incoming(Incoming::Publish(publish)) => {
+                                crate::test_hooks::trace(format!("publish {} {}", self.generation, publish.pkid)).await?;
+                            }
+                            Event::Outgoing(Outgoing::PubAck(packet_id)) => {
+                                // rumqttc yields this event after network.flush(); confirm receipt with broker state.
+                                crate::test_hooks::trace(format!("puback {} {}", self.generation, packet_id)).await?;
                             }
                             _ => {}
                         }

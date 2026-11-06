@@ -88,6 +88,8 @@ impl PipelineStage for PersistStage {
             };
 
             let mut capacity_warned = false;
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            crate::test_hooks::barrier("before_append").await?;
             loop {
                 let notified = self.wal.capacity_notified();
                 tokio::pin!(notified);
@@ -99,6 +101,8 @@ impl PipelineStage for PersistStage {
                 }
                 match self.wal.append_durable(event).await {
                     Ok(()) => {
+                        #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                        crate::test_hooks::barrier("after_sync").await?;
                         ctx.mark_output_stored();
                         counter!("ingest_messages_enqueued_total", "route" => route_id.clone())
                             .increment(1);

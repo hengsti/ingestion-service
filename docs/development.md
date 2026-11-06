@@ -54,8 +54,95 @@ cargo doc --all-features --no-deps
 | `tests/http_cache.rs` | Cache HTTP API behavior |
 | `tests/batcher.rs` | Influx sink and WAL forwarder behavior |
 | `tests/common/mod.rs` | Shared integration test helpers |
+| `tests/broker_integration.rs`, `tests/common/broker.rs` | Isolated real EMQX/InfluxDB process driver and baseline probes |
 
 Many modules also contain unit tests next to implementation code.
+
+## Run the isolated broker integration tests
+
+These tests need Docker's Linux engine. They never use the Server stack, a Zigbee adapter,
+production credentials, or production journals. The container tests are `#[ignore]`d in
+ordinary runs; the synthetic route/oracle check still runs without Docker.
+
+From the repository root, on Windows:
+
+```powershell
+docker compose -f .\tests\compose.integration.yaml -p ingest-it up -d --wait
+cargo test --all-features --locked --test broker_integration -- --ignored --test-threads=1
+```
+
+The firmware baseline selector is `test_firmware_sensor_happy_path`. The same suite probes
+status/Zigbee publications, all three driver barriers, and a broker restart with a resumed
+durable session. This establishes the harness, not the complete crash/saturation matrix.
+
+`ingest-it` is a local example, not a shared CI project. For simultaneous runs use separate
+projects and set `INGEST_IT_PROJECT` to the exact project used by Compose:
+
+```powershell
+$env:INGEST_IT_PROJECT = "ingest-it-local-35"
+docker compose -f .\tests\compose.integration.yaml -p $env:INGEST_IT_PROJECT up -d --wait
+cargo test --all-features --locked --test broker_integration -- --ignored --test-threads=1
+```
+
+Linux/CI uses the same test command, `export INGEST_IT_PROJECT=ingest-it-<unique-run>`,
+and `docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" up -d --wait`.
+The integration job uses the GitHub run ID and attempt. Keep `--test-threads=1`: probes within
+one project share its broker and can restart it.
+
+All published ports bind to `127.0.0.1` and default to Docker-assigned ports, discovered using
+`docker compose port`. Optional `INGEST_IT_MQTT_PORT`, `INGEST_IT_EMQX_API_PORT`, and
+`INGEST_IT_INFLUX_PORT` overrides select unused host ports on Windows or Linux. Each ingest
+process gets reserved ephemeral HTTP/metrics ports and a unique stable MQTT client ID.
+The restart driver recreates only the test EMQX container with its discovered ports fixed,
+preserving named volumes and the broker identity stored in the subscription manifest.
+
+The stack uses the deployment image tags `emqx/emqx:6.3.1` and `influxdb:2.7`; the latter
+is a floating patch tag, not an immutable digest. Keep these aligned when deployment tags change.
+Credentials in this fixture are deliberately synthetic and valid only for this loopback test stack.
+The MQTT test user is created through the synthetic management API key.
+
+EMQX durable sessions are explicitly enabled. The driver records the actual broker
+version/edition, durable settings and client state, and rejects non-durable sessions rather
+than substituting a different broker or assuming `clean_session=false` implies persistence.
+The single-node Community License in the pinned image supports the internal test deployment.
+Session expiry is one hour and inflight is 16. The configured regular-session queue limit is
+1,000; it does **not** cap durable-session disk backlog. Effective message expiry and durable
+retention are recorded in `broker-settings.txt` (currently infinity and one day respectively).
+These test settings do not establish the deployed broker's persistence, publisher QoS,
+outage budget, filesystem quota, or ARM64 capacity.
+
+The generated bundle reuses `config/routes.json`, its schemas, and the existing synthetic
+Zigbee fixture. Only test mappings add a scalar string `test_id`; no production per-event tags
+are introduced. Recovery publications use distinct device identities or millisecond timestamps
+so Influx point merging cannot hide an omitted event. Deliberately colliding points require a
+separate Influx-semantics oracle, not this baseline's query.
+
+Publisher PUBACK proves broker receipt only. The debug test build traces ingest's incoming
+packet IDs/connection generations and outgoing subscriber PUBACK **after rumqttc's transport
+flush**, then waits for actual EMQX inflight state to clear. Trace output contains no payloads
+or credentials and is capped at 64 KiB. Three file barriers prepare deterministic crash probes:
+`before_append`, `after_sync` (before ACK eligibility), and `before_sink`. The sink barrier
+can hold writes while the source sends its ACK; the driver observes that ACK before proceeding.
+Barrier waits expire rather than hang indefinitely.
+
+Hooks compile only with **both** `integration-test-hooks` and debug assertions.
+`--all-features` enables them for these debug tests; normal builds without the feature and all
+release builds omit the hooks, even with `--all-features`. There is no production fault-injection
+HTTP endpoint. Process termination/restart probes are not evidence of physical power-loss durability.
+
+On failure the tracked ingest process is killed/reaped and its generated bundle, journals,
+broker settings/client snapshots, bounded logs and packet trace remain under
+`target/broker-integration/ingest-it-*`. CI uploads this evidence. Successful scenarios remove
+their temporary process state; the external Compose stack remains available for inspection.
+After a successful local run, remove **only that test project**:
+
+```powershell
+docker compose -f .\tests\compose.integration.yaml -p ingest-it down -v --remove-orphans
+```
+
+For a custom project use its exact `-p` value. On failure retain diagnostic files and volumes;
+`down` without `-v` stops that project's containers without deleting its named test volumes.
+Never point this command at the Server project or production volume names.
 
 ## Add a Pipeline Stage
 

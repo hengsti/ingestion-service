@@ -136,6 +136,8 @@ async fn flush(
     let mut backoff_ms = initial_backoff_ms(flush_interval_ms);
     let mut outage_started_at: Option<Instant> = None;
     loop {
+        #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+        crate::test_hooks::barrier("before_sink").await?;
         match sink.write(&events).await {
             Ok(()) => {
                 state.set_sink(SinkState::Healthy);
