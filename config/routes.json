@@ -51,6 +51,10 @@
           "pointer": "/time_valid",
           "type": "boolean"
         },
+        "time_iso": {
+          "pointer": "/time_iso",
+          "type": "string"
+        },
         "boot_id": {
           "pointer": "/boot_id",
           "type": "unsigned",
@@ -113,6 +117,10 @@
         "time_valid": {
           "pointer": "/time_valid",
           "type": "boolean"
+        },
+        "time_iso": {
+          "pointer": "/time_iso",
+          "type": "string"
         },
         "rssi": {
           "pointer": "/rssi",
