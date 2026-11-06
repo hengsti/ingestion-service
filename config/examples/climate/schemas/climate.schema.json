@@ -11,6 +11,12 @@
       "type": "number",
       "exclusiveMinimum": 0,
       "maximum": 100
+    },
+    "site_label": {
+      "type": "string"
+    },
+    "sensor_label": {
+      "type": "string"
     }
   },
   "required": [

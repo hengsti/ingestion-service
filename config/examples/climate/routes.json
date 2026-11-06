@@ -18,6 +18,16 @@
         "rel_hum_perc": {
           "pointer": "/rel_hum_perc",
           "type": "float"
+        },
+        "site_label": {
+          "pointer": "/site_label",
+          "type": "string",
+          "default": "unassigned"
+        },
+        "sensor_label": {
+          "pointer": "/sensor_label",
+          "type": "string",
+          "optional": true
         }
       },
       "timestamp": {
@@ -25,7 +35,8 @@
       },
       "calculations": [
         "dew_point"
-      ]
+      ],
+      "cache": false
     }
   ]
 }
