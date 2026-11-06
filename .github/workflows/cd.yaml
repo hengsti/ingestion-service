@@ -256,27 +256,32 @@ jobs:
           fi
 
           image_digest="${image_ref#*@}"
-          key="${image_revision}-${image_digest#sha256:}"
-          bundle="${state_root}/${key}"
+          image_key="${image_revision}-${image_digest#sha256:}"
           active_file="${state_root}/active"
+          active_key=""
           if [[ -f "${active_file}" ]]; then
             active_key=$(cat "${active_file}")
-            if [[ "${active_key}" != "${key}" ]]; then
+            if [[ ! "${active_key}" =~ ^${image_key}(-[0-9a-f]{64})?$ ]]; then
               echo "::error::Active deployment marker does not match the running image."
               exit 1
             fi
+            key="${active_key}"
+          else
+            key="${image_key}"
+          fi
+          bundle="${state_root}/${key}"
+
+          if [[ -e "${bundle}" ]]; then
             if [[ ! -f "${bundle}/.env" || ! -f "${bundle}/compose.yaml" || ! -d "${bundle}/config" \
               || ! -f "${bundle}/.image" ]]; then
-              echo "::error::Active deployment snapshot is incomplete; refusing rollout."
-              exit 1
-            fi
-          elif [[ -e "${bundle}" ]]; then
-            if [[ ! -f "${bundle}/.env" || ! -f "${bundle}/compose.yaml" || ! -d "${bundle}/config" \
-              || ! -f "${bundle}/.image" ]]; then
-              echo "::error::Existing deployment snapshot is incomplete; refusing to overwrite it."
+              echo "::error::Deployment snapshot is incomplete; refusing rollout."
               exit 1
             fi
           else
+            if [[ -n "${active_key}" ]]; then
+              echo "::error::Active deployment snapshot is missing; refusing rollout."
+              exit 1
+            fi
             mkdir -p "${bundle}/config"
             chmod 700 "${bundle}"
             cp "${DEPLOY_PATH}/.env" "${bundle}/.env"
@@ -289,6 +294,10 @@ jobs:
 
           if [[ "$(cat "${bundle}/.image")" != "${image_ref}" ]]; then
             echo "::error::Saved environment/configuration pair does not match the running image."
+            exit 1
+          fi
+          if ! diff -qr "${config_source}" "${bundle}/config" >/dev/null; then
+            echo "::error::Saved configuration snapshot does not match the running mount."
             exit 1
           fi
           chmod 700 "${bundle}"
@@ -313,8 +322,25 @@ jobs:
         run: |
           set -euo pipefail
           test -f candidate/compose.yaml
-          test -f candidate/config/routes.json
-          release_key="${SOURCE_REVISION}-${IMAGE_DIGEST#sha256:}"
+          test -f "${DEPLOY_PATH}/config/routes.json"
+          test -d "${DEPLOY_PATH}/config/schema"
+          state_root="${DEPLOY_PATH}/.deploy-state"
+          stage_dir=$(mktemp -d "${state_root}/.stage.XXXXXX")
+          trap 'rm -rf -- "${stage_dir}"' EXIT
+          mkdir "${stage_dir}/config"
+          cp -a "${DEPLOY_PATH}/config/." "${stage_dir}/config/"
+          if [[ -n "$(find "${stage_dir}/config" -type l -print -quit)" ]]; then
+            echo "::error::Symbolic links are not allowed in the deployment config bundle."
+            exit 1
+          fi
+          config_hash=$(cd "${stage_dir}/config" \
+            && find . -type f -print0 | sort -z | xargs -0 sha256sum \
+            | sha256sum | cut -d' ' -f1)
+          if [[ ! "${config_hash}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not calculate a valid deployment config hash."
+            exit 1
+          fi
+          release_key="${SOURCE_REVISION}-${IMAGE_DIGEST#sha256:}-${config_hash}"
           release_dir="${DEPLOY_PATH}/.deploy-state/${release_key}"
           mkdir -p "${release_dir}"
           chmod 700 "${release_dir}"
@@ -325,9 +351,18 @@ jobs:
             cp candidate/compose.yaml "${release_dir}/compose.yaml"
           fi
           if [[ -e "${release_dir}/config" ]]; then
-            diff -qr candidate/config "${release_dir}/config"
+            diff -qr "${stage_dir}/config" "${release_dir}/config"
           else
-            cp -a candidate/config "${release_dir}/config"
+            mv "${stage_dir}/config" "${release_dir}/config"
+          fi
+          if [[ -f "${release_dir}/.image" ]]; then
+            if [[ "$(cat "${release_dir}/.image")" != "${IMAGE_NAME}@${IMAGE_DIGEST}" ]]; then
+              echo "::error::Saved config snapshot is paired with a different image."
+              exit 1
+            fi
+          elif [[ -f "${release_dir}/.ready" ]]; then
+            echo "::error::Ready deployment snapshot has no paired image reference."
+            exit 1
           fi
 
           if [[ ! -f "${release_dir}/.env" ]]; then
