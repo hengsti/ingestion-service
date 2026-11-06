@@ -1,0 +1,8 @@
+services:
+  ingest:
+    image: ${DEPLOY_IMAGE:?set DEPLOY_IMAGE to a registry digest}
+    volumes:
+      - type: bind
+        source: ${DEPLOY_CONFIG_DIR:?set DEPLOY_CONFIG_DIR to the versioned config bundle}
+        target: /app/config
+        read_only: true

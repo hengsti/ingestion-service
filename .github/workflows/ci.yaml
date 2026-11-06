@@ -5,6 +5,12 @@ on:
     branches: ["master"]
   pull_request:
     branches: ["master"]
+  workflow_call:
+    inputs:
+      revision:
+        description: Source revision to validate
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -26,6 +32,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.revision || github.sha }}
 
       - name: Install Rust 1.87.0
         uses: dtolnay/rust-toolchain@1.87.0
@@ -72,6 +80,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.revision || github.sha }}
 
       - name: Install Rust 1.87.0
         uses: dtolnay/rust-toolchain@1.87.0
@@ -94,8 +104,8 @@ jobs:
     name: Validate compose.yaml
     runs-on: ubuntu-latest
     env:
-      GHCR_OWNER: ci
-      INGEST_TAG: ci
+      INGEST_IMAGE: ghcr.io/ci/ingestion-service@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      INGEST_CONFIG_DIR: ./config
       RUST_LOG: info
       MQTT_HOST: ci
       MQTT_PORT: "1883"
@@ -111,6 +121,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.revision || github.sha }}
 
       - name: Render compose.yaml
         run: docker compose -f compose.yaml config --quiet
