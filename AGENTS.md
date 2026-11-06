@@ -84,12 +84,15 @@ dispatch does not guarantee per-device processing order across workers.
   bytes past the head and skip corruption; #39 owns the fail-closed reader contract.
   A crash before commit can replay writes:
   do not claim exactly-once or lossless end-to-end delivery.
-- **Overflow paths differ:** a full input worker queue drops the message before the
-  pipeline, increments `ingest_event_queue_full_total`, and does not publish DLQ.
-  WAL capacity pressure retains the current event and waits for reclaim, including through
-  subsequent writer-queue contention. An initially full queue and terminal writer failures
-  inside `PersistStage` still mark DLQ. MQTT acknowledgements remain independent of WAL
-  persistence. Do not replace bounded queues with unbounded buffering.
+- **Overflow stays bounded:** a full input worker queue returns the original job and
+  increments `ingest_event_queue_full_total` as admission pressure, not a drop count.
+  MQTT retains at most one unadmitted input and pauses transport polling while workers
+  progress; a real reconnect discards pending QoS 1 input so broker replay owns it.
+  WAL capacity pressure waits for reclaim; initial and subsequent writer-queue contention
+  retain the encoded event until writer progress. Terminal writer failures defer input,
+  not quarantine it. Subscriber ACK eligibility requires durable output or quarantine.
+  Queue eligible PUBACKs in receive order even when workers complete out of order.
+  Do not replace bounded queues with unbounded buffering.
 - **Journal ownership and budgets:** WAL and quarantine use separate, exclusively locked
   directories and required byte limits. Count recovered segments, pending reservations,
   metadata headroom, and pending deletions; release reclaimed bytes only after directory

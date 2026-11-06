@@ -293,6 +293,20 @@ async fn main() -> Result<()> {
     let mut forwarder_task_handled = false;
 
     tokio::select! {
+        () = async {
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            if let Some(dir) = std::env::var_os("INGEST_TEST_HOOK_DIR").map(std::path::PathBuf::from) {
+                while !dir.join("shutdown.request").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                return;
+            }
+            std::future::pending::<()>().await;
+        } => {
+            info!("test shutdown requested");
+            let _ = shutdown_tx.send(true);
+        }
+
         res = tokio::signal::ctrl_c() => {
             match res {
                 Ok(()) => info!("shutdown signal received"),

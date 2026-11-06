@@ -133,6 +133,8 @@ impl WalSubscription {
             // `BufReader` (no per-record reopen) and the reusable `Vec` (no
             // per-record allocation). `dir` is an `Arc<Path>`, so the clone is a
             // refcount bump, not a path allocation.
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            crate::test_hooks::barrier("before_read").await?;
             let journal = Arc::clone(&self.journal);
             let reader = self.cur_reader.take();
             let payload = std::mem::take(&mut self.payload_buf);
@@ -313,7 +315,12 @@ impl WalSubscription {
                             break;
                         }
                     };
-                    match fs::remove_file(&path) {
+                    let removal = (|| {
+                        #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                        crate::test_hooks::io_step(dir, "delete")?;
+                        fs::remove_file(&path)
+                    })();
+                    match removal {
                         Ok(()) => {
                             maintenance.pending_deleted_bytes = maintenance
                                 .pending_deleted_bytes

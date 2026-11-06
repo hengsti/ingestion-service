@@ -88,6 +88,7 @@ impl PipelineStage for PersistStage {
             };
 
             let mut capacity_warned = false;
+            let mut queue_warned = false;
             #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
             crate::test_hooks::barrier("before_append").await?;
             loop {
@@ -96,9 +97,7 @@ impl PipelineStage for PersistStage {
                 notified.as_mut().enable();
                 let writer_notified = self.wal.writer_notified();
                 tokio::pin!(writer_notified);
-                if capacity_warned {
-                    writer_notified.as_mut().enable();
-                }
+                writer_notified.as_mut().enable();
                 match self.wal.append_durable(event).await {
                     Ok(()) => {
                         #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
@@ -126,9 +125,14 @@ impl PipelineStage for PersistStage {
                             return Ok(StageFlow::Stop);
                         }
                     }
-                    Err(AppendDurableError::Full(rejected)) if capacity_warned => {
+                    Err(AppendDurableError::Full(rejected)) => {
                         event = rejected;
-                        // Failed queue admission releases its reservation and wakes capacity waiters.
+                        if !queue_warned {
+                            counter!("ingest_queue_full_total", "route" => route_id.clone())
+                                .increment(1);
+                            warn!(topic = %ctx.topic(), "wal queue full; waiting for writer progress");
+                            queue_warned = true;
+                        }
                         if wait_for_progress(writer_notified.as_mut(), forwarder_stopped.as_mut())
                             .await
                         {
@@ -138,16 +142,6 @@ impl PipelineStage for PersistStage {
                                 .record(start.elapsed().as_secs_f64());
                             return Ok(StageFlow::Stop);
                         }
-                    }
-                    Err(AppendDurableError::Full(_)) => {
-                        counter!("ingest_queue_full_total", "route" => route_id.clone())
-                            .increment(1);
-                        warn!(topic = %ctx.topic(), "wal queue full; deferring message");
-                        ctx.mark_deferred(DeferredReason::PersistenceFailure);
-                        histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "queue_full")
-                        .record(start.elapsed().as_secs_f64());
-
-                        return Ok(StageFlow::Stop);
                     }
                     Err(AppendDurableError::Closed(_)) => {
                         counter!("ingest_queue_closed_total", "route" => route_id.clone())
@@ -523,40 +517,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_defers_when_wal_queue_is_saturated() {
-        let dir = tempdir().unwrap();
+    async fn test_persist_waits_for_initial_writer_queue_contention() -> anyhow::Result<()> {
+        let dir = tempdir()?;
         let (wal, _sub) = open_wal(dir.path(), 1).await;
         let encoder = Arc::new(crate::infrastructure::sink::influx::InfluxEncoder);
         let stage = PersistStage::new(wal.clone(), encoder);
 
-        // Keep the WAL channel under pressure with best-effort non-durable appends
-        // from a separate producer so this durable append can observe `Full`.
-        let flood_wal = wal.clone();
-        let _flood = std::thread::spawn(move || {
-            for i in 0..100_000u64 {
-                let _ = flood_wal.try_append(WalEvent {
-                    topic: format!("smarthome/dev-{i}/status"),
-                    ts_ms: i as i64,
-                    payload: format!(
-                        "device_status,device_id=dev-{i},device_class=test rssi=-50i {i}"
-                    ),
-                });
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *wal.test_io_hook.lock().expect("WAL hook lock") = Some(Arc::new(move |step| {
+            if step == TestIoStep::Write {
+                if let Some(tx) = entered_tx.lock().expect("entered lock").take() {
+                    let _ = tx.send(());
+                    release_rx
+                        .lock()
+                        .expect("release lock")
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("writer release");
+                }
             }
-        });
+            Ok(())
+        }));
+        let event = WalEvent {
+            topic: "queue".into(),
+            ts_ms: 1,
+            payload: "value".into(),
+        };
+        wal.try_append(event.clone()).expect("writer append");
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await??;
+        wal.try_append(event).expect("fill writer queue");
 
-        let mut saturated = None;
-        for _ in 0..1_000 {
-            let mut ctx = ctx_with_record();
-            let result = stage.run(&mut ctx).await;
-            if ctx.deferred_reason() == Some(DeferredReason::PersistenceFailure) {
-                saturated = Some((result, ctx));
-                break;
-            }
-        }
-
-        let (result, ctx) = saturated.expect("WAL queue should saturate under producer contention");
-        assert!(matches!(result, Ok(StageFlow::Stop)));
+        let mut ctx = ctx_with_record();
+        let mut run = stage.run(&mut ctx);
+        let while_full = tokio::time::timeout(Duration::from_millis(100), run.as_mut()).await;
+        release_tx.send(())?;
+        assert!(
+            while_full.is_err(),
+            "transient writer contention must retain the event"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), run.as_mut()).await?,
+            Ok(StageFlow::Continue)
+        ));
+        drop(run);
         assert!(!ctx.should_quarantine());
+        assert!(ctx.output_stored());
+        Ok(())
     }
 
     #[tokio::test]

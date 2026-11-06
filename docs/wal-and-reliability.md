@@ -59,7 +59,7 @@ independently of thread liveness.
 
 When capacity is full, the persist stage retains its current event and waits for a successful
 reclaim rather than treating storage pressure as a schema rejection. If the writer queue is
-full during a retry, that event remains pending until the writer progresses. Worker queues
+full on the first attempt or during a retry, that event remains pending until the writer progresses. Worker queues
 remain bounded; a long outage can fill them and prevent graceful shutdown until the sink recovers.
 QoS 1 messages are acknowledged only after durable output WAL or quarantine persistence. Queue
 admission failures and failed quarantine appends leave messages unacknowledged; persistent broker

@@ -71,9 +71,14 @@ docker compose -f .\tests\compose.integration.yaml -p ingest-it up -d --wait
 cargo test --all-features --locked --test broker_integration -- --ignored --test-threads=1
 ```
 
-The firmware baseline selector is `test_firmware_sensor_happy_path`. The same suite probes
-status/Zigbee publications, all three driver barriers, and a broker restart with a resumed
-durable session. This establishes the harness, not the complete crash/saturation matrix.
+The firmware baseline selector is `test_firmware_sensor_happy_path`. The suite also covers
+typed status/Zigbee output, firmware SSE, arbitrary-topic contract changes, three crash
+windows repeated three times, stale receipts/queued ACKs with packet-ID reuse, tiny queues,
+journal capacity and write/sync failures, durable rejection, fail-closed reader gaps,
+resumed A-to-B subscriptions, broker backlog restart, and sink outage/auth/missing-bucket
+recovery. A mixed type-conflict batch demonstrates partial Influx acceptance without cursor
+advance and replays the whole batch into a fresh scenario-owned bucket. No existing bucket,
+journal, or quarantine record is deleted to repair it.
 
 `ingest-it` is a local example, not a shared CI project. For simultaneous runs use separate
 projects and set `INGEST_IT_PROJECT` to the exact project used by Compose:
@@ -114,16 +119,35 @@ outage budget, filesystem quota, or ARM64 capacity.
 The generated bundle reuses `config/routes.json`, its schemas, and the existing synthetic
 Zigbee fixture. Only test mappings add a scalar string `test_id`; no production per-event tags
 are introduced. Recovery publications use distinct device identities or millisecond timestamps
-so Influx point merging cannot hide an omitted event. Deliberately colliding points require a
-separate Influx-semantics oracle, not this baseline's query.
+and compare actual output/quarantine ID sets, allowing duplicates but failing omissions or
+unexpected IDs. The separate collision test deliberately shares a point identity and verifies
+field merge plus last-value overwrite; Influx is not an event ledger. QoS 0 is observed as a
+durable policy rejection, not claimed replayable; the retained snapshot test clears only its
+own retained topic after stopping ingest.
 
 Publisher PUBACK proves broker receipt only. The debug test build traces ingest's incoming
 packet IDs/connection generations and outgoing subscriber PUBACK **after rumqttc's transport
 flush**, then waits for actual EMQX inflight state to clear. Trace output contains no payloads
-or credentials and is capped at 64 KiB. Three file barriers prepare deterministic crash probes:
+or credentials and is capped at 64 KiB. Workers still execute concurrently; ACK selection
+uses the earliest pending receive job ID, as MQTT 3.1.1 requires receive-order PUBACKs even
+when completions arrive out of order. This scans existing pending state without adding
+another queue or copying payloads; later ACKs wait for the earliest durable completion.
+Three file barriers prepare deterministic crash probes:
 `before_append`, `after_sync` (before ACK eligibility), and `before_sink`. The sink barrier
 can hold writes while the source sends its ACK; the driver observes that ACK before proceeding.
+Additional barriers cover quarantine, reading, writer I/O and ACK queueing. A `<name>.arm`
+file arms a barrier and `<name>.release` releases it; `<journal>_<step>.fail` injects a
+write, sync or deletion failure, and `dlq.fail` disables supplementary publication.
 Barrier waits expire rather than hang indefinitely.
+
+The shutdown test reduces only the debug build's shared MQTT request capacity to two using
+`INGEST_TEST_MQTT_REQUEST_CAPACITY` (bounded to 1..10). It first establishes subscriptions
+and queues five QoS 1 inputs while ingest is stopped; this avoids assuming live durable-stream
+prefetch advances while all PUBACKs are held. It pauses transport polling after those five
+admissions with `INGEST_TEST_DISPATCH_BARRIER_AT`, fills the queue with supplementary DLQ
+requests, and observes a waiting ACK before signaling `shutdown.request`. The ordinary
+shutdown path must exit successfully within 15 seconds and broker replay must recover all IDs.
+This does not claim saturation of the separate 100-entry receipt channel.
 
 Hooks compile only with **both** `integration-test-hooks` and debug assertions.
 `--all-features` enables them for these debug tests; normal builds without the feature and all
@@ -132,8 +156,11 @@ HTTP endpoint. Process termination/restart probes are not evidence of physical p
 
 On failure the tracked ingest process is killed/reaped and its generated bundle, journals,
 broker settings/client snapshots, bounded logs and packet trace remain under
-`target/broker-integration/ingest-it-*`. CI uploads this evidence. Successful scenarios remove
-their temporary process state; the external Compose stack remains available for inspection.
+`target/broker-integration/ingest-it-*`. Successful scenarios preserve bounded broker settings,
+queries, trace, logs, metrics when the process is live, journal metadata and available cursor
+files under `target/broker-integration/passed-*`, then remove their disposable process state
+and their own persistent MQTT session. CI uploads evidence on both success and failure.
+The external Compose stack remains available for inspection.
 After a successful local run, remove **only that test project**:
 
 ```powershell

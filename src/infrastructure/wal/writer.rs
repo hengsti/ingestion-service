@@ -301,6 +301,8 @@ fn writer_loop(
         if dirty && Instant::now() >= flush_deadline {
             if let Err(e) = flush_and_sync(
                 &mut writer,
+                #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                &dir,
                 #[cfg(test)]
                 &test_io_hook,
             ) {
@@ -360,6 +362,8 @@ fn writer_loop(
             if dirty {
                 if let Err(e) = flush_and_sync(
                     &mut writer,
+                    #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                    &dir,
                     #[cfg(test)]
                     &test_io_hook,
                 ) {
@@ -444,6 +448,8 @@ fn writer_loop(
         if let Err(e) = write_record(
             &mut writer,
             &encode_buf,
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            &dir,
             #[cfg(test)]
             &test_io_hook,
         ) {
@@ -485,6 +491,8 @@ fn writer_loop(
     if dirty {
         if let Err(e) = flush_and_sync(
             &mut writer,
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            &dir,
             #[cfg(test)]
             &test_io_hook,
         ) {
@@ -507,15 +515,19 @@ fn writer_loop(
 fn write_record(
     writer: &mut BufWriter<File>,
     bytes: &[u8],
+    #[cfg(all(feature = "integration-test-hooks", debug_assertions))] dir: &Path,
     #[cfg(test)] test_io_hook: &TestIoHookSlot,
 ) -> std::io::Result<()> {
     #[cfg(test)]
     run_test_io_hook(test_io_hook, TestIoStep::Write)?;
+    #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+    crate::test_hooks::io_step(dir, "write")?;
     writer.write_all(bytes)
 }
 
 fn flush_and_sync(
     writer: &mut BufWriter<File>,
+    #[cfg(all(feature = "integration-test-hooks", debug_assertions))] dir: &Path,
     #[cfg(test)] test_io_hook: &TestIoHookSlot,
 ) -> std::io::Result<()> {
     #[cfg(test)]
@@ -523,6 +535,8 @@ fn flush_and_sync(
     writer.flush()?;
     #[cfg(test)]
     run_test_io_hook(test_io_hook, TestIoStep::Sync)?;
+    #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+    crate::test_hooks::io_step(dir, "sync")?;
     writer.get_ref().sync_data()
 }
 
