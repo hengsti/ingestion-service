@@ -10,12 +10,12 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::infrastructure::{
     sink::{
-        point::{line_protocol_size_upper_bound, Point},
+        point::{line_protocol_size_upper_bound, write_line_protocol},
         Encoder, Sink, SinkError,
     },
     wal::types::WalEvent,
 };
-use crate::model::messages::telemetry::{TelemetryRecord, TelemetryValue};
+use crate::model::messages::telemetry::TelemetryRecord;
 
 /// Renders canonical messages as InfluxDB line protocol, pairing 1:1 with
 /// [`InfluxSink`] (both are constructed together for a given output sink).
@@ -27,25 +27,8 @@ impl Encoder for InfluxEncoder {
     }
 
     fn encode(&self, record: &TelemetryRecord, out: &mut String) {
-        telemetry_to_point(record).write_line_protocol(out);
+        write_line_protocol(record, out);
     }
-}
-
-fn telemetry_to_point(record: &TelemetryRecord) -> Point {
-    let mut point = Point::build(&record.measurement);
-    for (key, value) in &record.tags {
-        point = point.tag(key, value);
-    }
-    for (key, value) in &record.fields {
-        point = match value {
-            TelemetryValue::Float(value) => point.field_f64(key, *value),
-            TelemetryValue::Integer(value) => point.field_i64(key, *value),
-            TelemetryValue::Unsigned(value) => point.field_u64(key, *value),
-            TelemetryValue::Boolean(value) => point.field_bool(key, *value),
-            TelemetryValue::String(value) => point.field_str(key, value),
-        };
-    }
-    point.timestamp_ms(record.timestamp_ms).build()
 }
 
 /// Writes WAL payload batches to the InfluxDB v2 write API with bounded retries.
@@ -248,18 +231,18 @@ mod tests {
             measurement: "weather, station".to_owned(),
             timestamp_ms: 1_700_000_000_000,
             tags: BTreeMap::from([
-                ("device_id".to_owned(), "dev-1".to_owned()),
                 ("room key".to_owned(), "lab,west".to_owned()),
+                ("device_id".to_owned(), "dev-1".to_owned()),
             ]),
             fields: BTreeMap::from([
-                ("bool".to_owned(), TelemetryValue::Boolean(false)),
-                ("float".to_owned(), TelemetryValue::Float(1.5)),
-                ("int".to_owned(), TelemetryValue::Integer(-2)),
+                ("uint".to_owned(), TelemetryValue::Unsigned(3)),
                 (
                     "string".to_owned(),
                     TelemetryValue::String("a\\b\"c".to_owned()),
                 ),
-                ("uint".to_owned(), TelemetryValue::Unsigned(3)),
+                ("int".to_owned(), TelemetryValue::Integer(-2)),
+                ("float".to_owned(), TelemetryValue::Float(1.5)),
+                ("bool".to_owned(), TelemetryValue::Boolean(false)),
             ]),
             source_topic: "home/dev-1/weather".to_owned(),
             retained: false,
@@ -273,6 +256,28 @@ mod tests {
             r#"weather\,\ station,device_id=dev-1,room\ key=lab\,west bool=false,float=1.5,int=-2i,string="a\\b\"c",uint=3u 1700000000000"#
         );
         assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_telemetry_encoding_without_tags_preserves_zero_timestamp_and_empty_string() {
+        let record = TelemetryRecord {
+            route_id: "typed-test".to_owned(),
+            device_id: "dev-1".to_owned(),
+            measurement: "weather".to_owned(),
+            timestamp_ms: 0,
+            tags: BTreeMap::new(),
+            fields: BTreeMap::from([
+                ("string".to_owned(), TelemetryValue::String(String::new())),
+                ("bool".to_owned(), TelemetryValue::Boolean(true)),
+            ]),
+            source_topic: "home/dev-1/weather".to_owned(),
+            retained: false,
+        };
+        let mut line = String::new();
+
+        InfluxEncoder.encode(&record, &mut line);
+
+        assert_eq!(line, r#"weather bool=true,string="" 0"#);
     }
 
     #[test]

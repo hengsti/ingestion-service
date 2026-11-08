@@ -256,11 +256,12 @@ Add or update tests in the relevant WAL module and `tests/batcher.rs`.
 
 ## Change InfluxDB Mapping
 
-The current Influx encoder builds line protocol through `PointBuilder` in `src/infrastructure/sink/point.rs`.
+The current Influx encoder renders borrowed `TelemetryRecord` values directly through
+`write_line_protocol` in `src/infrastructure/sink/point.rs`, without an owned intermediate point.
 
 Rules:
 
-- Tags and fields are sorted by key before rendering.
+- Tags and fields render in their existing `BTreeMap` key order without copying or sorting.
 - Measurement, tag keys, tag values, and field keys are escaped.
 - String fields are quoted and escaped.
 - Integers are suffixed with `i`.
