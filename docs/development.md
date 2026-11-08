@@ -302,7 +302,7 @@ The CD workflow:
 - Validates the exact source revision before building or redeploying an ARM64 image.
 - Publishes a version tag and full-source-SHA tag, then deploys the registry digest;
   it does not publish or deploy `latest` or short SHA tags.
-- Snapshots and preflights the complete host config bundle with the candidate image,
+- Snapshots and preflights the release revision's repository config bundle with the candidate image,
   waits for durable-intake readiness, and restores the previous image/config pair on
   failure without removing WAL or quarantine volumes.
 

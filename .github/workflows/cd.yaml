@@ -410,7 +410,7 @@ jobs:
               exit 1
             fi
             if grep -q 'INGEST_ROUTES_FILE' "${PREVIOUS_BUNDLE}/compose.yaml" \
-              && ! diff -qr "${DEPLOY_PATH}/config" "${PREVIOUS_BUNDLE}/config" >/dev/null 2>&1; then
+              && ! diff -qr candidate/config "${PREVIOUS_BUNDLE}/config" >/dev/null 2>&1; then
               echo "::error::Cannot preflight changed configuration with this historical image."
               exit 1
             fi
@@ -419,11 +419,11 @@ jobs:
             exit 0
           fi
 
-          test -f "${DEPLOY_PATH}/config/routes.json"
+          test -f candidate/config/routes.json
           stage_dir=$(mktemp -d "${state_root}/.stage.XXXXXX")
           trap 'rm -rf -- "${stage_dir}"' EXIT
           mkdir "${stage_dir}/config"
-          cp -a "${DEPLOY_PATH}/config/." "${stage_dir}/config/"
+          cp -a candidate/config/. "${stage_dir}/config/"
           if [[ -n "$(find "${stage_dir}/config" -type l -print -quit)" ]]; then
             echo "::error::Symbolic links are not allowed in the deployment config bundle."
             exit 1

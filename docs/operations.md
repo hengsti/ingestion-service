@@ -28,8 +28,8 @@ docker compose exec ingest wget -qO- http://localhost:8085/readyz
 
 The service only uses `expose`, so nothing is published on the host. To reach the API
 from the host, add an override file with `ports`. The default config mount is the local
-`./config`; for the release deployment, the host config bundle lives at
-`/opt/smarthome-ingest/config`. See [Releasing and Deploying](releasing.md) for immutable
+`./config`; CD snapshots the route/schema bundle from the exact release revision.
+See [Releasing and Deploying](releasing.md) for immutable
 image/config snapshots, preflight, readiness, and rollback. This repository does not
 include its Compose file in a surrounding Server stack.
 

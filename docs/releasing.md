@@ -25,8 +25,8 @@ and Compose checks, but cannot run that newer broker suite.
    tags with OCI source/revision labels.
 4. CD resolves the pushed image to its registry digest and deploys that digest,
    not a mutable tag. It stages the Compose file from the same source revision
-   and the host-side config bundle, then runs `--check-config` against the exact
-   mounted bundle before replacing the running service.
+   and the route/schema bundle from that same revision, then runs `--check-config`
+   against the exact mounted bundle before replacing the running service.
 
 The workflow does not publish or deploy `latest`.
 
@@ -50,30 +50,35 @@ pre-cutover baseline. CD refuses the rollback if no compatible pair exists.
 This matters across the unified-route cutover: a pre-cutover image needs its
 legacy settings and may not support `--check-config`.
 
-Selecting the running image stages the current host configuration and `.env`.
-Changes to either create a new pair and require preflight, so rotating a token
+Selecting the running image uses its revision's configuration and the current `.env`.
+Environment changes create a new pair and require preflight, so rotating a token
 does not modify the pair retained for rollback. An unchanged deployment whose
 image lacks `--check-config` reuses its saved pair; changing its environment
 or applicable configuration is refused because it cannot be preflighted.
 
 ## Configuration and rollback behavior
 
-`DEPLOY_PATH` is the arbitrary deployment directory configured for the runner.
-For example, `/opt/smarthome-ingest` may contain `compose.yaml`, `.env`, and
-`config/`. Keep the complete runtime bundle in `${DEPLOY_PATH}/config/`, with
-`routes.json` and its referenced schema files. Schema paths are relative to the
-bundle; the shipped bundle uses `schemas/`. CD uses the host-side bundle as-is;
-it does not merge files from the checked-in repository `config/` or fall back
-to that directory. The host bundle must be readable by the deployment runner.
+`DEPLOY_PATH` is the standalone ingest deployment directory, for example
+`/opt/smarthome-ingest`, containing this repository's `compose.yaml` and an
+untracked `.env` with runtime connection settings and secrets.
+
+This repository's CI, CD, `compose.yaml`, and `config/` define the application
+deployment contract. CD does not read a surrounding Server stack or import its
+routing overrides. The operator updates production integration, networking and
+routing separately when this contract changes.
+
+Each release uses the service Compose file and complete route/schema bundle from
+its exact validated source revision. Route/schema changes belong in `config/`
+and require a new release revision; CD does not deploy a separate host-side copy.
 
 The deployment runner stores release pairs under
 `${DEPLOY_PATH}/.deploy-state/<source-SHA>-<image-digest>-<config-environment-hash>/`.
 Each new pair contains the resolved Compose configuration from the selected
-source, a copy of the exact host-side route/schema bundle mounted read-only,
+source, a copy of that revision's repository route/schema bundle mounted read-only,
 and the environment file. Resolving Compose freezes effective settings,
 including values inherited from the runner, for preflight and rollback. The
 candidate image's existing `--check-config` validates a new pair before
-activation. Config or effective environment changes with the same image create
+activation. Effective environment changes with the same image create
 a separate pair; workflow-managed image and config-path entries are excluded
 from the environment-file hash. Previously captured baseline and config-only
 snapshot names remain usable for rollback, but snapshots with an original
