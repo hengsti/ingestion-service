@@ -92,7 +92,7 @@ The service starts:
 
 ## 4. Publish a Sensor Payload
 
-Publish this JSON to `smarthome/esp32-1/bme680`:
+Publish this JSON at MQTT QoS 1 to `smarthome/esp32-1/bme680` (for example, use `mosquitto_pub -q 1`):
 
 ```json
 {
