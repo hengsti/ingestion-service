@@ -377,20 +377,12 @@ impl WalSubscription {
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let head = self.head.load();
-
-        // The writer rotated into a newer segment: the current one is fully
-        // written and synced, so move on and read the next segment.
-        if head.segment_id > self.cur_segment_id {
-            self.cur_segment_id += 1;
-            self.cur_byte_offset = 0;
-            self.cur_reader = None;
-            return true;
-        }
-        if head.segment_id == self.cur_segment_id && head.byte_offset > self.cur_byte_offset {
-            // Head has advanced within the current segment. This means durable
-            // bytes are available now, so continue without waiting for another
-            // notify edge that might already have raced.
+        let reader_offset = WalOffset {
+            segment_id: self.cur_segment_id,
+            byte_offset: self.cur_byte_offset,
+        };
+        // A newer head can leave unread bytes in this segment; only EOF advances it.
+        if self.head.load() > reader_offset {
             return true;
         }
 
@@ -401,14 +393,7 @@ impl WalSubscription {
             // yet before terminating — this guarantees a graceful shutdown
             // delivers every committed record instead of dropping the tail when
             // the reader hasn't caught up to the writer's final offset.
-            let head = self.head.load();
-            if head.segment_id > self.cur_segment_id {
-                self.cur_segment_id += 1;
-                self.cur_byte_offset = 0;
-                self.cur_reader = None;
-                return true;
-            }
-            return head.byte_offset > self.cur_byte_offset;
+            return self.head.load() > reader_offset;
         }
 
         // Otherwise wait for the next writer notify edge.
@@ -780,6 +765,57 @@ mod tests {
         assert!(sub.next().await.is_err());
         assert_eq!(sub.cur_segment_id, start.segment_id);
         assert_eq!(sub.cur_byte_offset, start.byte_offset);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_read_rotation_keeps_unread_records_before_reclaim() -> Result<()> {
+        let dir = tempdir()?;
+        let mut frame = Vec::new();
+        encode_into(&mut frame, &sample_event(1))?;
+        fs::write(segment::segment_path(dir.path(), 1), &frame)?;
+        let previous_head = WalOffset {
+            segment_id: 1,
+            byte_offset: frame.len() as u64,
+        };
+        let mut sub = new_sub_with_head(
+            dir.path(),
+            WalOffset {
+                segment_id: 1,
+                byte_offset: 0,
+            },
+            previous_head,
+        )?;
+        let first = sub.next().await?.context("first record")?;
+        assert_eq!(first.offset_after, previous_head);
+
+        encode_into(&mut frame, &sample_event(2))?;
+        OpenOptions::new()
+            .append(true)
+            .open(segment::segment_path(dir.path(), 1))?
+            .write_all(&frame)?;
+        encode_into(&mut frame, &sample_event(3))?;
+        fs::write(segment::segment_path(dir.path(), 2), &frame)?;
+
+        // The writer appends and rotates after next_before observes reader == head.
+        assert_eq!(sub.head.load(), previous_head);
+        sub.head.store(WalOffset {
+            segment_id: 2,
+            byte_offset: frame.len() as u64,
+        });
+        assert!(sub.wait_or_advance().await);
+
+        let second = sub.next().await?.context("unread sealed-segment record")?;
+        assert_eq!(second.event.payload, sample_event(2).payload);
+        assert_eq!(second.offset, previous_head);
+        sub.commit(second.offset_after).await?;
+        assert_eq!(remaining_segments(dir.path()), vec![1, 2]);
+
+        let third = sub.next().await?.context("next-segment record")?;
+        assert_eq!(third.event.payload, sample_event(3).payload);
+        assert_eq!(third.offset.segment_id, 2);
+        sub.commit(third.offset_after).await?;
+        assert_eq!(remaining_segments(dir.path()), vec![2]);
         Ok(())
     }
 
