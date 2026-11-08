@@ -127,6 +127,36 @@ fn test_check_config_rejects_missing_setting_without_leaking_token() -> Result<(
 }
 
 #[test]
+fn test_check_config_rejects_invalid_startup_settings_without_side_effects() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut accepted = Vec::new();
+    for (name, value) in [
+        ("METRICS_BIND", "not-a-socket-address"),
+        ("CACHE_BIND", "not-a-socket-address"),
+        ("CACHE_BUFFER", "0"),
+        ("FLUSH_INTERVAL_MS", "0"),
+    ] {
+        let output = preflight_command(&directory, &production_routes())
+            .env(name, value)
+            .arg("--check-config")
+            .output()?;
+
+        if output.status.success() {
+            accepted.push(name);
+        } else {
+            assert!(combined_output(&output).contains(name));
+        }
+        assert!(!directory.path().join("wal").exists());
+        assert!(!directory.path().join("quarantine").exists());
+    }
+    assert!(
+        accepted.is_empty(),
+        "preflight accepted invalid {accepted:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_check_config_rejects_extra_and_unknown_arguments() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let output = preflight_command(&directory, &production_routes())

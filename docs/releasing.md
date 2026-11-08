@@ -5,7 +5,9 @@
 Pull requests and pushes to `master` run formatting, clippy, locked tests, the
 isolated EMQX/InfluxDB integration suite, and Compose validation. The CD workflow
 calls the same CI workflow for the exact source revision it will build or
-redeploy; a successful run for another commit is not a release gate.
+redeploy; a successful run for another commit is not a release gate. Historical
+revisions that predate the broker integration harness run their available Rust
+and Compose checks, but cannot run that newer broker suite.
 
 ## Release a new version
 
@@ -42,31 +44,46 @@ In **Actions -> CD -> Run workflow**, enter either a release tag such as
 revision label, resolves the registry digest, and reruns the validation
 workflow for that revision before deployment.
 
-The source revision selects a matching Compose file and host-local environment
-snapshot. A new image/config pair is preflighted against the current host config
-bundle; an already-ready pair is reused only when its config content hash
-matches. This is required for rollback across the unified-route cutover: a
-pre-cutover image needs its matching legacy environment variables, while a
-post-cutover image rejects them. A revision without a preserved compatible
-environment snapshot cannot be deployed as a rollback.
+Selecting an image other than the running image restores its most recently
+activated, preserved Compose/config/environment pair, including a captured
+pre-cutover baseline. CD refuses the rollback if no compatible pair exists.
+This matters across the unified-route cutover: a pre-cutover image needs its
+legacy settings and may not support `--check-config`.
+
+Selecting the running image stages the current host configuration and `.env`.
+Changes to either create a new pair and require preflight, so rotating a token
+does not modify the pair retained for rollback. An unchanged deployment whose
+image lacks `--check-config` reuses its saved pair; changing its environment
+or applicable configuration is refused because it cannot be preflighted.
 
 ## Configuration and rollback behavior
 
 `DEPLOY_PATH` is the arbitrary deployment directory configured for the runner.
 For example, `/opt/smarthome-ingest` may contain `compose.yaml`, `.env`, and
 `config/`. Keep the complete runtime bundle in `${DEPLOY_PATH}/config/`, with
-`routes.json` and the `schema/` directory. CD uses this host-side bundle as-is;
+`routes.json` and its referenced schema files. Schema paths are relative to the
+bundle; the shipped bundle uses `schemas/`. CD uses the host-side bundle as-is;
 it does not merge files from the checked-in repository `config/` or fall back
 to that directory. The host bundle must be readable by the deployment runner.
 
 The deployment runner stores release pairs under
-`${DEPLOY_PATH}/.deploy-state/<source-SHA>-<image-digest>-<config-hash>/`.
-Each pair contains the versioned Compose file, a copy of the exact host-side
-route/schema bundle mounted read-only, and the environment snapshot. The
-candidate image's existing `--check-config` validates a new pair's snapshot
-before activation. Config changes with the same image create a separate
-deployment pair. The environment file may contain credentials; the workflow
-keeps the state directory mode `700` and environment files mode `600`.
+`${DEPLOY_PATH}/.deploy-state/<source-SHA>-<image-digest>-<config-environment-hash>/`.
+Each new pair contains the resolved Compose configuration from the selected
+source, a copy of the exact host-side route/schema bundle mounted read-only,
+and the environment file. Resolving Compose freezes effective settings,
+including values inherited from the runner, for preflight and rollback. The
+candidate image's existing `--check-config` validates a new pair before
+activation. Config or effective environment changes with the same image create
+a separate pair; workflow-managed image and config-path entries are excluded
+from the environment-file hash. Previously captured baseline and config-only
+snapshot names remain usable for rollback, but snapshots with an original
+Compose file can still inherit runner environment variables. On the first
+capture, CD checks the running container's Compose hash against the host Compose
+file and `.env`, then freezes their effective settings; keep them matched until
+the baseline is captured. Both the resolved Compose file and environment file
+can contain credentials; the workflow keeps the state directory mode `700` and
+new snapshot files mode `600`. Compose gives runner environment variables
+precedence over values in `.env`.
 `.deploy-state/` is ignored by Git, is not uploaded as an artifact, and is not
 automatically pruned. Protect the deployment host and back up this state
 directory according to the operator's secret-retention policy.

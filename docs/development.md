@@ -290,6 +290,10 @@ Steps:
 5. Run `cargo clippy --all-targets --all-features --locked -- -D warnings`.
 6. Run `cargo test --all-features --locked`.
 
+The Compose job also tests deployment snapshot/rollback behavior. Historical
+revisions called by CD run the broker suite only if their source includes its
+complete harness.
+
 ## CD
 
 The CD workflow:

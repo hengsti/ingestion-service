@@ -140,7 +140,7 @@ The service persists messages through a swappable `Sink`/`Encoder` pair (see `do
 | Variable | Required | Default | Description |
 |---|---:|---|---|
 | `BATCH_SIZE` | Yes | None | Maximum WAL entries per sink write |
-| `FLUSH_INTERVAL_MS` | Yes | None | Time trigger for partial WAL batches |
+| `FLUSH_INTERVAL_MS` | Yes | None | Positive time trigger for partial WAL batches |
 
 Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a smaller `FLUSH_INTERVAL_MS` for lower end-to-end latency.
 
@@ -200,10 +200,10 @@ The service divides `INPUT_QUEUE_CAPACITY` by worker count to create one bounded
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `CACHE_BIND` | Yes | None | Cache API bind address, for example `0.0.0.0:8085` |
+| `CACHE_BIND` | Yes | None | Cache API bind address, for example `0.0.0.0:8085` or `localhost:8085` |
 | `CACHE_TTL_MS` | Yes | None | Age threshold used to mark cached device states as stale |
-| `CACHE_BUFFER` | Yes | None | Maximum cached devices and SSE broadcast buffer size |
-| `METRICS_BIND` | Yes | None | Prometheus endpoint bind address, for example `0.0.0.0:9090` |
+| `CACHE_BUFFER` | Yes | None | Positive maximum cached devices and SSE broadcast buffer size |
+| `METRICS_BIND` | Yes | None | Prometheus socket address with a numeric IP, for example `0.0.0.0:9090` |
 
 `CACHE_BUFFER` is used for two limits:
 

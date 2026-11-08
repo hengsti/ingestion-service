@@ -250,7 +250,13 @@ jobs:
 
           config_source=$(docker inspect "${SERVICE_NAME}" \
             --format '{{range .Mounts}}{{if eq .Destination "/app/config"}}{{.Source}}{{end}}{{end}}')
-          if [[ -z "${config_source}" || ! -d "${config_source}" ]]; then
+          if [[ -z "${config_source}" ]]; then
+            if grep -q 'INGEST_ROUTES_FILE' "${DEPLOY_PATH}/compose.yaml" \
+              || ! grep -q 'MQTT_TOPIC_' "${DEPLOY_PATH}/compose.yaml"; then
+              echo "::error::Cannot resolve the running config mount; refusing rollout."
+              exit 1
+            fi
+          elif [[ ! -d "${config_source}" ]]; then
             echo "::error::Cannot resolve the running config mount; refusing rollout."
             exit 1
           fi
@@ -282,12 +288,39 @@ jobs:
               echo "::error::Active deployment snapshot is missing; refusing rollout."
               exit 1
             fi
+            capture_dir=$(mktemp -d "${state_root}/.capture.XXXXXX")
+            trap 'rm -rf -- "${capture_dir}"' EXIT
+            cp "${DEPLOY_PATH}/.env" "${capture_dir}/.env"
+            cp "${DEPLOY_PATH}/compose.yaml" "${capture_dir}/source-compose.yaml"
+            chmod 600 "${capture_dir}/.env"
+            running_hash=$(docker inspect "${SERVICE_NAME}" \
+              --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+            if ! current_hash=$(docker compose \
+              --project-directory "${DEPLOY_PATH}" \
+              --env-file "${capture_dir}/.env" \
+              -f "${capture_dir}/source-compose.yaml" config --hash "${SERVICE_NAME}" \
+              | awk -v service="${SERVICE_NAME}" '$1 == service { print $2 }'); then
+              echo "::error::Cannot verify the running deployment configuration."
+              exit 1
+            fi
+            if [[ ! "${running_hash}" =~ ^[0-9a-f]{64}$ || "${current_hash}" != "${running_hash}" ]]; then
+              echo "::error::Host Compose settings do not match the running container; refusing baseline capture."
+              exit 1
+            fi
+            docker compose \
+              --project-directory "${DEPLOY_PATH}" \
+              --env-file "${capture_dir}/.env" \
+              -f "${capture_dir}/source-compose.yaml" config --format json \
+              | sed -E 's/("(MQTT_USERNAME|MQTT_PASSWORD)"[[:space:]]*:[[:space:]]*)null/\1""/g' \
+              > "${capture_dir}/compose.yaml"
+            chmod 600 "${capture_dir}/compose.yaml"
             mkdir -p "${bundle}/config"
             chmod 700 "${bundle}"
-            cp "${DEPLOY_PATH}/.env" "${bundle}/.env"
-            chmod 600 "${bundle}/.env"
-            cp "${DEPLOY_PATH}/compose.yaml" "${bundle}/compose.yaml"
-            cp -a "${config_source}/." "${bundle}/config/"
+            mv "${capture_dir}/.env" "${bundle}/.env"
+            mv "${capture_dir}/compose.yaml" "${bundle}/compose.yaml"
+            if [[ -n "${config_source}" ]]; then
+              cp -a "${config_source}/." "${bundle}/config/"
+            fi
             printf '%s\n' "${image_ref}" > "${bundle}/.image"
             touch "${bundle}/.baseline"
           fi
@@ -296,7 +329,12 @@ jobs:
             echo "::error::Saved environment/configuration pair does not match the running image."
             exit 1
           fi
-          if ! diff -qr "${config_source}" "${bundle}/config" >/dev/null; then
+          if [[ -n "${config_source}" ]] \
+            && ! diff -qr "${config_source}" "${bundle}/config" >/dev/null; then
+            echo "::error::Saved configuration snapshot does not match the running mount."
+            exit 1
+          elif [[ -z "${config_source}" \
+            && -n "$(find "${bundle}/config" -mindepth 1 -print -quit)" ]]; then
             echo "::error::Saved configuration snapshot does not match the running mount."
             exit 1
           fi
@@ -319,12 +357,69 @@ jobs:
       - name: Stage validated deployment pair
         id: release
         shell: bash
+        env:
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
+          PREVIOUS_BUNDLE: ${{ steps.previous.outputs.bundle }}
         run: |
           set -euo pipefail
-          test -f candidate/compose.yaml
-          test -f "${DEPLOY_PATH}/config/routes.json"
-          test -d "${DEPLOY_PATH}/config/schema"
           state_root="${DEPLOY_PATH}/.deploy-state"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${IMAGE_TAG_INPUT}" \
+            && "${PREVIOUS_IMAGE}" != "${IMAGE_NAME}@${IMAGE_DIGEST}" ]]; then
+            image_key="${SOURCE_REVISION}-${IMAGE_DIGEST#sha256:}"
+            release_dir=""
+            release_marker=""
+            for bundle in "${state_root}/${image_key}" "${state_root}/${image_key}-"*; do
+              [[ -d "${bundle}" && "${bundle##*/}" =~ ^${image_key}(-[0-9a-f]{64})?$ ]] || continue
+              if [[ -f "${bundle}/.ready" ]]; then
+                marker="${bundle}/.ready"
+              elif [[ -f "${bundle}/.baseline" ]]; then
+                marker="${bundle}/.baseline"
+              else
+                continue
+              fi
+              if [[ ! -f "${bundle}/.env" || ! -f "${bundle}/compose.yaml" \
+                || ! -d "${bundle}/config" || ! -f "${bundle}/.image" \
+                || "$(cat "${bundle}/.image")" != "${IMAGE_NAME}@${IMAGE_DIGEST}" ]]; then
+                echo "::warning::Ignoring an incomplete or mismatched deployment snapshot."
+                continue
+              fi
+              if [[ -z "${release_marker}" || "${marker}" -nt "${release_marker}" ]]; then
+                release_dir="${bundle}"
+                release_marker="${marker}"
+              fi
+            done
+            if [[ -z "${release_dir}" ]]; then
+              echo "::error::No preserved deployment snapshot matches the selected image."
+              exit 1
+            fi
+            echo "bundle=${release_dir}" >> "${GITHUB_OUTPUT}"
+            echo "preflight_required=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          test -f candidate/compose.yaml
+          test -f candidate/src/main.rs
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${IMAGE_TAG_INPUT}" \
+            && "${PREVIOUS_IMAGE}" == "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            && -n "${PREVIOUS_BUNDLE}" ]] \
+            && ! grep -Fq -- '"--check-config"' candidate/src/main.rs; then
+            if ! cmp -s "${DEPLOY_PATH}/.env" "${PREVIOUS_BUNDLE}/.env"; then
+              echo "::error::Cannot preflight changed settings with this historical image."
+              exit 1
+            fi
+            if grep -q 'INGEST_ROUTES_FILE' "${PREVIOUS_BUNDLE}/compose.yaml" \
+              && ! diff -qr "${DEPLOY_PATH}/config" "${PREVIOUS_BUNDLE}/config" >/dev/null 2>&1; then
+              echo "::error::Cannot preflight changed configuration with this historical image."
+              exit 1
+            fi
+            echo "bundle=${PREVIOUS_BUNDLE}" >> "${GITHUB_OUTPUT}"
+            echo "preflight_required=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          test -f "${DEPLOY_PATH}/config/routes.json"
           stage_dir=$(mktemp -d "${state_root}/.stage.XXXXXX")
           trap 'rm -rf -- "${stage_dir}"' EXIT
           mkdir "${stage_dir}/config"
@@ -340,15 +435,48 @@ jobs:
             echo "::error::Could not calculate a valid deployment config hash."
             exit 1
           fi
-          release_key="${SOURCE_REVISION}-${IMAGE_DIGEST#sha256:}-${config_hash}"
+
+          awk '!/^[[:space:]]*(INGEST_IMAGE|INGEST_CONFIG_DIR)=/' \
+            "${DEPLOY_PATH}/.env" > "${stage_dir}/.env"
+          if ! grep -Eq 'MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH' candidate/compose.yaml; then
+            awk '!/^[[:space:]]*(MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH)=/' \
+              "${stage_dir}/.env" > "${stage_dir}/.filtered-env"
+            mv -f "${stage_dir}/.filtered-env" "${stage_dir}/.env"
+          fi
+          chmod 600 "${stage_dir}/.env"
+          export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          export INGEST_CONFIG_DIR="${DEPLOY_PATH}/config"
+          # Keep absent optional credentials from inheriting later runner values.
+          docker compose \
+            --project-directory "${DEPLOY_PATH}" \
+            --env-file "${stage_dir}/.env" \
+            -f candidate/compose.yaml config --format json \
+            | sed -E 's/("(MQTT_USERNAME|MQTT_PASSWORD)"[[:space:]]*:[[:space:]]*)null/\1""/g' \
+            > "${stage_dir}/compose.yaml"
+          chmod 600 "${stage_dir}/compose.yaml"
+          env_hash=$(sha256sum "${stage_dir}/.env" | cut -d' ' -f1)
+          compose_hash=$(sha256sum "${stage_dir}/compose.yaml" | cut -d' ' -f1)
+          pair_hash=$(printf '%s\n%s\n%s\n' "${config_hash}" "${env_hash}" "${compose_hash}" \
+            | sha256sum | cut -d' ' -f1)
+          release_key="${SOURCE_REVISION}-${IMAGE_DIGEST#sha256:}-${pair_hash}"
           release_dir="${DEPLOY_PATH}/.deploy-state/${release_key}"
           mkdir -p "${release_dir}"
           chmod 700 "${release_dir}"
 
+          if [[ -f "${release_dir}/.ready" || -f "${release_dir}/.baseline" ]]; then
+            if [[ ! -f "${release_dir}/.env" || ! -f "${release_dir}/compose.yaml" \
+              || ! -d "${release_dir}/config" || ! -f "${release_dir}/.image" ]]; then
+              echo "::error::Saved deployment snapshot is incomplete."
+              exit 1
+            fi
+          fi
           if [[ -e "${release_dir}/compose.yaml" ]]; then
-            cmp candidate/compose.yaml "${release_dir}/compose.yaml"
+            if ! cmp -s "${stage_dir}/compose.yaml" "${release_dir}/compose.yaml"; then
+              echo "::error::Saved Compose configuration does not match its snapshot."
+              exit 1
+            fi
           else
-            cp candidate/compose.yaml "${release_dir}/compose.yaml"
+            mv "${stage_dir}/compose.yaml" "${release_dir}/compose.yaml"
           fi
           if [[ -e "${release_dir}/config" ]]; then
             diff -qr "${stage_dir}/config" "${release_dir}/config"
@@ -365,36 +493,16 @@ jobs:
             exit 1
           fi
 
-          if [[ ! -f "${release_dir}/.env" ]]; then
-            cp "${DEPLOY_PATH}/.env" "${release_dir}/.env"
-            if ! grep -Eq 'MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH' candidate/compose.yaml; then
-              temp_env=$(mktemp "${release_dir}/.env.XXXXXX")
-              awk '!/^[[:space:]]*(MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH)=/' \
-                "${release_dir}/.env" > "${temp_env}"
-              mv -f "${temp_env}" "${release_dir}/.env"
+          printf 'INGEST_IMAGE=%s\nINGEST_CONFIG_DIR=%s\n' \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}" "${release_dir}/config" >> "${stage_dir}/.env"
+          if [[ -f "${release_dir}/.env" ]]; then
+            if ! cmp -s "${stage_dir}/.env" "${release_dir}/.env"; then
+              echo "::error::Saved deployment environment does not match its snapshot."
+              exit 1
             fi
+          else
+            mv "${stage_dir}/.env" "${release_dir}/.env"
           fi
-          chmod 600 "${release_dir}/.env"
-
-          temp_env=$(mktemp "${release_dir}/.env.XXXXXX")
-          awk -v image="${IMAGE_NAME}@${IMAGE_DIGEST}" -v config="${release_dir}/config" '
-            BEGIN { image_seen = 0; config_seen = 0 }
-            /^[[:space:]]*INGEST_IMAGE=/ {
-              if (!image_seen++) print "INGEST_IMAGE=" image
-              next
-            }
-            /^[[:space:]]*INGEST_CONFIG_DIR=/ {
-              if (!config_seen++) print "INGEST_CONFIG_DIR=" config
-              next
-            }
-            { print }
-            END {
-              if (!image_seen) print "INGEST_IMAGE=" image
-              if (!config_seen) print "INGEST_CONFIG_DIR=" config
-            }
-          ' "${release_dir}/.env" > "${temp_env}"
-          chmod 600 "${temp_env}"
-          mv -f "${temp_env}" "${release_dir}/.env"
 
           if [[ -f "${release_dir}/.ready" || -f "${release_dir}/.baseline" ]]; then
             preflight_required=false
@@ -527,6 +635,7 @@ jobs:
               -f "${PREVIOUS_BUNDLE}/compose.yaml" \
               -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
               exec -T "${SERVICE_NAME}" wget -q --spider http://localhost:8085/readyz; then
+              touch "${PREVIOUS_BUNDLE}/.ready"
               active_temp=$(mktemp "${DEPLOY_PATH}/.deploy-state/active.XXXXXX")
               printf '%s\n' "$(basename "${PREVIOUS_BUNDLE}")" > "${active_temp}"
               chmod 600 "${active_temp}"
