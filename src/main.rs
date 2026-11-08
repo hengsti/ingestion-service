@@ -113,6 +113,27 @@ async fn recv_worker_job(
     }
 }
 
+async fn drain_workers(
+    workers: &mut JoinSet<Result<()>>,
+    stop_persistence: &watch::Sender<bool>,
+    deadline: tokio::time::Instant,
+) {
+    let _ = stop_persistence.send(true);
+    let drain = async {
+        while let Some(res) = workers.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => error!(error = %err, "worker failed during shutdown"),
+                Err(err) => error!(error = %err, "worker join failed during shutdown"),
+            }
+        }
+    };
+    if tokio::time::timeout_at(deadline, drain).await.is_err() {
+        warn!("worker drain deadline reached; unfinished input remains unacknowledged");
+        workers.shutdown().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if run_config_check_command()? {
@@ -197,7 +218,8 @@ async fn main() -> Result<()> {
     let batch_size = cfg.batch_size;
     let flush_interval_ms = cfg.flush_interval_ms;
     let forwarder_alive_task = forwarder_alive.clone();
-    let (forwarder_stopped_tx, forwarder_stopped_rx) = watch::channel(false);
+    let (persistence_stop_tx, persistence_stop_rx) = watch::channel(false);
+    let forwarder_stopped_tx = persistence_stop_tx.clone();
 
     let mut forwarder_task = tokio::spawn(async move {
         let _liveness = ForwarderLivenessGuard(forwarder_alive_task);
@@ -218,8 +240,7 @@ async fn main() -> Result<()> {
             .add_stage(ValidateOutputStage::new(encoder.clone()))
             .add_stage(CacheUpdateStage::new(app_state.clone()))
             .add_stage(
-                PersistStage::new(wal.clone(), encoder)
-                    .with_forwarder_stopped(forwarder_stopped_rx),
+                PersistStage::new(wal.clone(), encoder).with_stop_signal(persistence_stop_rx),
             )
             .add_stage(ObserveStage::new())
             .with_failure_stage(DlqPublishStage::new(
@@ -403,13 +424,8 @@ async fn main() -> Result<()> {
 
     drop(job_txs);
 
-    while let Some(res) = workers.join_next().await {
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => error!(error = %err, "worker failed during shutdown"),
-            Err(err) => error!(error = %err, "worker join failed during shutdown"),
-        }
-    }
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    drain_workers(&mut workers, &persistence_stop_tx, drain_deadline).await;
 
     // Drop both `Arc<Wal>` handles (pipeline's and main's) so the writer
     // closes its channel, flushes, and lets the forwarder drain.
@@ -418,7 +434,7 @@ async fn main() -> Result<()> {
     drop(wal);
 
     if !forwarder_task_handled {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut forwarder_task).await {
+        match tokio::time::timeout_at(drain_deadline, &mut forwarder_task).await {
             Ok(Ok(Ok(()))) => info!("wal forwarder drained cleanly"),
             Ok(Ok(Err(err))) => {
                 error!(error = %err, "wal forwarder failed during drain");
@@ -429,7 +445,9 @@ async fn main() -> Result<()> {
                 fatal_err.get_or_insert(err.into());
             }
             Err(_) => {
-                warn!("wal forwarder drain timed out after 5s; aborting and exiting");
+                warn!(
+                    "wal forwarder drain deadline reached; uncommitted entries remain for replay"
+                );
                 forwarder_task.abort();
             }
         }
@@ -437,8 +455,7 @@ async fn main() -> Result<()> {
 
     info!("ingestion service stopped");
 
-    // A fatal source or forwarder error exits non-zero after workers and the WAL
-    // have drained.
+    // A fatal source or forwarder error exits non-zero after the drain attempt.
     match fatal_err {
         Some(err) => Err(err),
         None => Ok(()),
@@ -508,6 +525,54 @@ mod tests {
         drop(IngestWorkerLivenessGuard(ready.clone()));
 
         assert!(!ready.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn worker_drain_releases_persistence_waits() {
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let mut workers = JoinSet::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_task = completed.clone();
+        workers.spawn(async move {
+            stop_rx.changed().await?;
+            assert!(*stop_rx.borrow());
+            completed_task.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            drain_workers(
+                &mut workers,
+                &stop_tx,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("shutdown must release workers waiting for persistence capacity");
+        assert!(workers.is_empty());
+        assert!(completed.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn worker_drain_aborts_remaining_work_at_deadline() {
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let mut workers = JoinSet::new();
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let liveness = IngestWorkerLivenessGuard(worker_alive.clone());
+        workers.spawn(async move {
+            let _liveness = liveness;
+            std::future::pending::<Result<()>>().await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            drain_workers(&mut workers, &stop_tx, tokio::time::Instant::now()),
+        )
+        .await
+        .expect("shutdown must not wait indefinitely for workers");
+        assert!(workers.is_empty());
+        assert!(!worker_alive.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

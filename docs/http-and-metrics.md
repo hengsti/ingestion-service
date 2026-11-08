@@ -126,7 +126,7 @@ Route-labeled histograms appear when first recorded.
 | `ingest_messages_enqueued_total` | `route` | Records durably appended to the WAL |
 | `ingest_queue_full_total` / `ingest_queue_closed_total` | `route` | WAL append failures |
 | `ingest_durability_ack_failed_total` | `route` | WAL acknowledgement failures |
-| `ingest_persist_duration_seconds` | `route`, `result` | Persistence-stage duration |
+| `ingest_persist_duration_seconds` | `route`, `result` | Persistence-stage duration; `result=stopped` covers pressure waits stopped by shutdown or forwarder termination (previously `forwarder_stopped`) |
 | `ingest_pipeline_outcomes_total` | `route`, `outcome` | Local terminal results: `output_stored`, `rejection_stored`, or `deferred`; not database delivery |
 | `ingest_stage_outcomes_total` | `route`, `stage`, `outcome` | Completed stage invocations: `continue`, `stop`, `error` |
 | `ingest_pipeline_duration_seconds` | `route` | Duration of pipelines reaching the observe stage |

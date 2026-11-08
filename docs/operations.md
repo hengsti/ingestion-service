@@ -218,10 +218,10 @@ Steps:
 5. Confirm `wal_forwarder_committed_total` increases.
 
 Do not delete WAL files while the service is running. Deleting segments can make the cursor point outside available segments and cause startup failure.
-When the WAL budget is full, workers wait for reclaim and graceful shutdown can wait indefinitely
-until the sink recovers. Queue pressure withholds new input acknowledgements; neither durable
-local intake nor persistent broker sessions alone guarantee end-to-end delivery outside the
-configured broker and storage bounds.
+When the WAL budget is full, workers wait for reclaim. Shutdown releases these waits and gives
+workers and the forwarder a shared five-second drain deadline. Queue pressure withholds new
+input acknowledgements; neither durable local intake nor persistent broker sessions alone
+guarantee end-to-end delivery outside the configured broker and storage bounds.
 
 ## Handle Rejected Input
 
@@ -355,12 +355,19 @@ that evidence is collected.
 
 ## Restart Safely
 
-Use a normal stop signal. The service drains worker queues, drops WAL senders, flushes and syncs the writer, and gives the forwarder up to 5 seconds to write its final batch.
+Use a normal stop signal. After stopping the source, the service releases persistence pressure
+waits and gives queued workers and the forwarder a shared five-second drain deadline. Workers
+can still persist while capacity is available. After workers finish or are aborted at the
+deadline, dropping WAL senders lets the writer flush and sync and the forwarder attempt its
+final partial batch within the remaining time.
+
+Unfinished QoS 1 input stays unacknowledged for broker redelivery, subject to the persistent
+session and broker limits. The deadline bounds async draining, not filesystem sync latency.
 
 If shutdown logs show:
 
 ```text
-wal forwarder drain timed out after 5s; aborting and exiting
+wal forwarder drain deadline reached; uncommitted entries remain for replay
 ```
 
 then uncommitted WAL entries should replay on next start, subject to the WAL files still being present.

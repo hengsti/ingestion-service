@@ -25,7 +25,7 @@ use crate::{
 pub struct PersistStage {
     wal: Arc<Wal>,
     encoder: Arc<dyn Encoder>,
-    forwarder_stopped: Option<watch::Receiver<bool>>,
+    stop_signal: Option<watch::Receiver<bool>>,
 }
 
 impl PersistStage {
@@ -33,22 +33,22 @@ impl PersistStage {
         Self {
             wal,
             encoder,
-            forwarder_stopped: None,
+            stop_signal: None,
         }
     }
 
-    /// Stops capacity waits when the WAL forwarder terminates.
-    pub fn with_forwarder_stopped(mut self, stopped: watch::Receiver<bool>) -> Self {
-        self.forwarder_stopped = Some(stopped);
+    /// Stops pressure waits when shutdown starts or the WAL forwarder terminates.
+    pub fn with_stop_signal(mut self, stopped: watch::Receiver<bool>) -> Self {
+        self.stop_signal = Some(stopped);
         self
     }
 }
 
 async fn wait_for_progress(
     notification: impl Future<Output = ()>,
-    forwarder_stopped: Option<&mut watch::Receiver<bool>>,
+    stop_signal: Option<&mut watch::Receiver<bool>>,
 ) -> bool {
-    match forwarder_stopped {
+    match stop_signal {
         Some(receiver) if *receiver.borrow() => true,
         Some(receiver) => tokio::select! {
             _ = notification => false,
@@ -72,7 +72,7 @@ impl PipelineStage for PersistStage {
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
             let start = Instant::now();
-            let mut forwarder_stopped = self.forwarder_stopped.clone();
+            let mut stop_signal = self.stop_signal.clone();
 
             let route_id = ctx.route()?.metric_label();
             let record = ctx.telemetry_record()?;
@@ -117,10 +117,10 @@ impl PipelineStage for PersistStage {
                             capacity_warned = true;
                         }
                         event = rejected;
-                        if wait_for_progress(notified.as_mut(), forwarder_stopped.as_mut()).await {
-                            warn!(topic = %ctx.topic(), "wal forwarder stopped; deferring message");
+                        if wait_for_progress(notified.as_mut(), stop_signal.as_mut()).await {
+                            warn!(topic = %ctx.topic(), "wal persistence wait stopped; deferring message");
                             ctx.mark_deferred(DeferredReason::PersistenceFailure);
-                            histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "forwarder_stopped")
+                            histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "stopped")
                                 .record(start.elapsed().as_secs_f64());
                             return Ok(StageFlow::Stop);
                         }
@@ -133,12 +133,10 @@ impl PipelineStage for PersistStage {
                             warn!(topic = %ctx.topic(), "wal queue full; waiting for writer progress");
                             queue_warned = true;
                         }
-                        if wait_for_progress(writer_notified.as_mut(), forwarder_stopped.as_mut())
-                            .await
-                        {
-                            warn!(topic = %ctx.topic(), "wal forwarder stopped; deferring message");
+                        if wait_for_progress(writer_notified.as_mut(), stop_signal.as_mut()).await {
+                            warn!(topic = %ctx.topic(), "wal persistence wait stopped; deferring message");
                             ctx.mark_deferred(DeferredReason::PersistenceFailure);
-                            histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "forwarder_stopped")
+                            histogram!("ingest_persist_duration_seconds", "route" => route_id.clone(), "result" => "stopped")
                                 .record(start.elapsed().as_secs_f64());
                             return Ok(StageFlow::Stop);
                         }
@@ -190,7 +188,8 @@ mod tests {
             types::{WalEvent, WalOptions},
         },
         model::messages::telemetry::{TelemetryRecord, TelemetryValue},
-        pipeline::outcome::DeferredReason,
+        pipeline::outcome::{DeferredReason, PipelineOutcome},
+        pipeline::runner::PipelineRunner,
         pipeline::{context::PipelineContext, stage::StageFlow},
     };
 
@@ -277,6 +276,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_still_persists_when_wal_has_capacity() {
+        let dir = tempdir().unwrap();
+        let (wal, mut sub) = open_wal(dir.path(), 16).await;
+        let (_stop_tx, stop_rx) = watch::channel(true);
+        let stage = PersistStage::new(
+            wal,
+            Arc::new(crate::infrastructure::sink::influx::InfluxEncoder),
+        )
+        .with_stop_signal(stop_rx);
+        let mut ctx = ctx_with_record();
+
+        assert!(matches!(stage.run(&mut ctx).await, Ok(StageFlow::Continue)));
+        assert!(ctx.output_stored());
+        assert_eq!(
+            recv_one(&mut sub, 500)
+                .await
+                .expect("durable event")
+                .payload,
+            expected_line_protocol()
+        );
+    }
+
+    #[tokio::test]
     async fn test_wal_capacity_persist_waits_for_reclaim_without_routing_to_dlq(
     ) -> anyhow::Result<()> {
         let dir = tempdir()?;
@@ -338,9 +360,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wal_capacity_wait_stops_when_forwarder_exits() -> anyhow::Result<()> {
+    async fn test_wal_capacity_wait_stops_without_acknowledging_or_losing_wal() -> anyhow::Result<()>
+    {
         let dir = tempdir()?;
-        let (wal, _sub) = Wal::open(WalOptions {
+        let (wal, mut sub) = Wal::open(WalOptions {
             dir: dir.path().to_path_buf(),
             max_bytes: 3 * 1024 * 1024,
             segment_bytes: 1024 * 1024,
@@ -369,29 +392,48 @@ mod tests {
         .await
         .expect("fill remaining capacity");
 
-        let (forwarder_stopped_tx, forwarder_stopped_rx) = tokio::sync::watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(false);
         let stage = PersistStage::new(
             wal,
             Arc::new(crate::infrastructure::sink::influx::InfluxEncoder),
         )
-        .with_forwarder_stopped(forwarder_stopped_rx);
+        .with_stop_signal(stop_rx);
         let mut ctx = ctx_with_record();
-        let mut run = stage.run(&mut ctx);
+        let pipeline = PipelineRunner::new().add_stage(stage);
+        let mut run = Box::pin(pipeline.run(&mut ctx));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), run.as_mut())
                 .await
                 .is_err()
         );
 
-        forwarder_stopped_tx.send(true)?;
+        stop_tx.send(true)?;
         let result = tokio::time::timeout(Duration::from_secs(1), run.as_mut()).await?;
         drop(run);
 
-        assert!(matches!(result, Ok(StageFlow::Stop)));
+        assert_eq!(
+            result,
+            PipelineOutcome::Deferred(DeferredReason::PersistenceFailure)
+        );
         assert_eq!(
             ctx.deferred_reason(),
             Some(DeferredReason::PersistenceFailure)
         );
+        assert!(!ctx.output_stored());
+        assert!(!ctx.should_quarantine());
+        assert!(!result.is_ack_eligible());
+
+        drop(pipeline);
+        for expected_ts in [1, 1, 2] {
+            let entry = tokio::time::timeout(Duration::from_secs(1), sub.next())
+                .await??
+                .context("existing WAL record must remain readable")?;
+            assert_eq!(entry.event.ts_ms, expected_ts);
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(1), sub.next())
+            .await??
+            .is_none());
+        assert!(crate::infrastructure::wal::cursor::read_cursor(dir.path())?.is_none());
         Ok(())
     }
 

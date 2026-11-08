@@ -182,7 +182,9 @@ processes, filesystem allocation overhead, or a shared disk can still exhaust fr
 and monitor the underlying storage separately.
 
 When WAL capacity is exhausted, a pipeline worker keeps its current event and waits for committed
-segments to be reclaimed. If the sink does not recover, graceful shutdown can wait indefinitely.
+segments to be reclaimed. Shutdown releases these pressure waits and gives workers and the
+forwarder a shared five-second drain deadline; unfinished input remains unacknowledged and
+uncommitted WAL entries remain available for replay.
 For QoS 1 messages, MQTT acknowledgement is deferred until the output WAL or quarantine append is
 durable. A full input queue leaves the message unacknowledged; persistent broker sessions are
 required for redelivery after a disconnect. QoS 0 and clean-session operation do not provide

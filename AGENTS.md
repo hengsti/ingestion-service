@@ -101,9 +101,9 @@ dispatch does not guarantee per-device processing order across workers.
   latest-state cache, and that update occurs before WAL persistence. Preserve HTTP/SSE
   envelopes; cached state does not prove successful persistence or sink delivery. When
   full, reject an uncached device update that is not newer than the oldest retained entry.
-- **Shutdown must drain:** preserve queued-worker draining and the forwarder's final
-  partial-batch flush. WAL recovery, cursor commits, and segment deletion must not
-  discard uncommitted data.
+- **Shutdown attempts a bounded drain:** release persistence pressure waits, then give
+  queued workers and the forwarder's final partial-batch flush a shared five-second
+  deadline. Unfinished input stays unacknowledged; preserve uncommitted WAL data for replay.
 - **Readiness is durable intake, not database delivery:** `/healthz` remains liveness.
   `/readyz` requires reconciled subscriptions, available bounded admission, both writable
   journals with capacity, live workers/forwarder and no reader or cursor-commit fault.

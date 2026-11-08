@@ -109,7 +109,9 @@ route cutover does not change delivery-outcome behavior tracked separately in #3
 
 ## Shutdown
 
-On Ctrl+C, HTTP failure, or fatal source error, the service stops accepting work, drains
-queued worker jobs, closes the WAL writer, and gives the forwarder up to five seconds to
-flush its final partial batch. An uncommitted WAL batch remains available for replay if the
-service is restarted and the WAL files are preserved.
+On a stop signal or fatal task failure, the service stops accepting work and joins the source.
+It releases persistence pressure waits and attempts to drain queued worker jobs and the
+forwarder's final partial batch within a shared five-second deadline. Workers still attempt
+durable appends when capacity is available; unfinished workers are aborted at the deadline.
+Dropping WAL senders closes the writer. Unfinished input stays unacknowledged, and uncommitted
+WAL entries remain available for replay if the service is restarted with the WAL files preserved.
