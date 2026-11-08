@@ -5,4 +5,5 @@
 /.github/*.json
 TODO.md
 .env
+.deploy-state/
 docs/superpowers/

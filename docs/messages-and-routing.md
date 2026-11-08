@@ -3,8 +3,30 @@
 The route bundle is the contract between MQTT publishers and the ingest pipeline.
 Set `INGEST_ROUTES_FILE` to the v1 JSON bundle; the shipped configuration is
 [`config/routes.json`](../config/routes.json). MQTT subscribes to the bundle's exact
-filters. Route selection does not infer a message type from a topic suffix or publisher.
-Schema and schema-resource paths are relative to the bundle file.
+filters. Every subscribed topic, including firmware sensor and status topics, is a
+configured route. Route selection does not infer a message type from a topic suffix or
+publisher. Schema and schema-resource paths are relative to the bundle file.
+
+## Synthetic climate walkthrough
+
+The tracked [`config/examples/climate`](../config/examples/climate/README.md) bundle is the
+copyable synthetic example. Its README includes a payload; `routes.json` selects
+`example/climate/+`, extracts the device ID from topic segment 2, freezes receive time,
+maps `/temp_c` and `/rel_hum_perc` as floats, and selects `dew_point`. Missing
+`/site_label` maps to the default `"unassigned"`; missing `/sensor_label` is omitted.
+`cache: false` is explicit. The raw and output schemas are in that bundle's `schemas/`
+directory, and the same bundle is covered by configuration-preflight tests.
+
+Run the same static preflight used for startup after changing the example:
+
+```bash
+INGEST_ROUTES_FILE=./config/examples/climate/routes.json ./target/release/smarthome-ingest --check-config
+```
+
+The shipped firmware examples are in [`config/routes.json`](../config/routes.json):
+`firmware-sensor` subscribes to `smarthome/+/bme680`, writes `bme680`, and opts into
+cache; `firmware-status` subscribes to `smarthome/+/status`, writes `device_status`,
+and opts out. Their raw and output schemas live under `config/schemas/`.
 
 ## Route processing
 
@@ -48,6 +70,36 @@ The same pipeline accepts routes for other device formats and topic layouts. A Z
 other JSON payload needs only a route entry with a filter, raw schema, identity, mappings,
 optional calculations/output schema, and measurement. There are no firmware-only runtime
 branches.
+
+## Firmware compatibility and migration
+
+The unified route model replaces `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other
+non-DLQ `MQTT_TOPIC_*` routing variables, and `ENFORCE_TOPIC_DEVICE_MATCH`; these
+settings are rejected with a migration hint. Move every desired filter and identity rule
+into the versioned route bundle, including the firmware routes, then follow the
+[stopped-ingest filter/session migration procedure](operations.md#route-changes-and-subscription-migration).
+Do not clear a persistent broker session to force a route update. A resumed MQTT 3.1.1
+session cannot enumerate unknown old filters, and reconnect does not reconcile them
+without trusted filter history. Already queued or in-flight publications for a removed
+filter can still arrive and be rejected.
+Where the previous firmware deployment used the default `smarthome/+/sensor` filter,
+the shipped sensor route now uses `smarthome/+/bme680`; verify the actual old filters
+rather than assuming every deployment used that default.
+
+The firmware routes preserve the `bme680` and `device_status` measurement names and
+existing tag/field names and types. Documented additions/deltas are the reserved
+`device_id` tag and `mqtt_retained` field on every route, `altitude_m` on `bme680`,
+present optional booleans (including `replayed: false`), and the frozen receive time
+when `time_valid` is false. A valid payload timestamp of zero is rejected rather than
+replaced with server time. When `warmed_up` is false, both IAQ outputs are omitted.
+See the canonical [unified-route compatibility decision in issue #19](https://github.com/hengsti/ingestion-service/issues/19).
+
+HomeKit continues to read cached `device_id`, `last_seen_ms`, and
+`value.{temp_c, rel_hum_perc, iaq_score, iaq_text}`. A retained sensor publication
+delivered by the broker can seed the process-local cache after subscription; cache
+contents are not persisted across process restarts and do not prove WAL or InfluxDB
+delivery. The `route` metric label replaces the old `kind=sensor|status` label; see
+[HTTP API and Metrics](http-and-metrics.md#dashboard-and-alert-compatibility).
 
 ## InfluxDB output
 

@@ -953,6 +953,7 @@ mod tests {
             outcome.is_err(),
             "writer failure must not look like clean EOF"
         );
+        assert!(!wal.capacity_handle().is_writable());
         Ok(())
     }
 

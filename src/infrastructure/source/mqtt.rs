@@ -20,6 +20,7 @@ use super::{AckKey, AckReceipt, DlqPublisher, IngestDispatcher, IngestJob, Sourc
 mod subscriptions;
 
 use crate::config::{Config, MqttSourceConfig};
+use crate::infrastructure::operations::Operations;
 use crate::infrastructure::router::RouteSet;
 use crate::infrastructure::wal::capacity::Capacity;
 use subscriptions::{filter_plan, BrokerIdentity, SubscriptionManifest};
@@ -46,16 +47,24 @@ pub struct MqttSource {
     subscribe_pending: bool,
     expected_suback: Option<u16>,
     ready: Arc<AtomicBool>,
+    operations: Arc<Operations>,
     ack_tx: mpsc::Sender<AckReceipt>,
     ack_rx: mpsc::Receiver<AckReceipt>,
     generation: u64,
     next_job_id: u64,
     pending_acks: HashMap<AckKey, Publish>,
     ready_acks: VecDeque<AckKey>,
-    pending_qos0: Option<IngestJob>,
+    pending_input: Option<IngestJob>,
     wal_capacity: Arc<Capacity>,
     quarantine_capacity: Arc<Capacity>,
     reconnect_pending: bool,
+}
+
+impl Drop for MqttSource {
+    fn drop(&mut self) {
+        self.ready.store(false, Ordering::Relaxed);
+        self.operations.update_admission(0, 0, 0);
+    }
 }
 
 struct Reconciliation {
@@ -67,6 +76,20 @@ struct Reconciliation {
 }
 
 impl MqttSource {
+    #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+    async fn trace_receipt(&mut self, receipt: &AckReceipt) -> Result<()> {
+        let current = receipt.key.generation == self.generation
+            && self.pending_acks.contains_key(&receipt.key);
+        crate::test_hooks::trace(format!(
+            "{} {} {} {}",
+            if current { "receipt" } else { "receipt_stale" },
+            receipt.key.generation,
+            receipt.key.packet_id,
+            receipt.outcome.is_ack_eligible(),
+        ))
+        .await
+    }
+
     /// Queues one batched subscription for all filters. Uses the non-blocking
     /// `try_` variant because the request channel is drained by this same
     /// task's `poll()`; if the channel is full, the request stays pending and
@@ -90,10 +113,23 @@ impl MqttSource {
 
     fn try_ack_ready(&mut self) {
         while let Some(key) = self.ready_acks.front().copied() {
-            if key.generation != self.generation {
+            if key.generation != self.generation || !self.pending_acks.contains_key(&key) {
                 self.ready_acks.pop_front();
                 self.pending_acks.remove(&key);
                 continue;
+            }
+
+            // MQTT-4.6.0-2 requires receive-order PUBACKs, not worker-completion order.
+            let Some(key) = self
+                .pending_acks
+                .keys()
+                .min_by_key(|key| key.job_id)
+                .copied()
+            else {
+                break;
+            };
+            if !self.ready_acks.contains(&key) {
+                break;
             }
 
             match self
@@ -102,7 +138,6 @@ impl MqttSource {
                 .map(|publish| self.client.try_ack(publish))
             {
                 Some(Ok(())) => {
-                    self.ready_acks.pop_front();
                     self.pending_acks.retain(|pending_key, _| {
                         pending_key.generation != key.generation
                             || pending_key.packet_id != key.packet_id
@@ -142,6 +177,14 @@ impl MqttSource {
         false
     }
 
+    #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+    async fn trace_ack_queue(&mut self) -> Result<()> {
+        if !self.ready_acks.is_empty() {
+            crate::test_hooks::trace(format!("ack_backpressure {}", self.ready_acks.len())).await?;
+        }
+        crate::test_hooks::barrier("ack_queued").await
+    }
+
     fn has_intake_capacity(&self, dispatcher: &IngestDispatcher) -> bool {
         dispatcher.all_workers_open()
             && dispatcher.has_available_worker()
@@ -149,18 +192,31 @@ impl MqttSource {
     }
 
     fn has_storage_capacity(&self) -> bool {
-        self.wal_capacity.has_room_for_max_record()
+        self.wal_capacity.is_writable()
+            && self.quarantine_capacity.is_writable()
+            && self.wal_capacity.has_room_for_max_record()
             && self.quarantine_capacity.has_room_for_max_record()
     }
 
-    fn try_dispatch_pending_qos0(&mut self, dispatcher: &IngestDispatcher) -> bool {
-        let Some(job) = self.pending_qos0.take() else {
+    fn publish_admission(&self, dispatcher: &IngestDispatcher) {
+        self.operations.bind_dispatcher(dispatcher);
+        self.operations
+            .pending_acks
+            .store(self.pending_acks.len(), Ordering::Relaxed);
+        self.operations.admission_paused.store(
+            self.reconnect_pending || self.pending_input.is_some(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn try_dispatch_pending_input(&mut self, dispatcher: &IngestDispatcher) -> bool {
+        let Some(job) = self.pending_input.take() else {
             return true;
         };
         match dispatcher.dispatch(job) {
             Ok(()) => true,
             Err(job) => {
-                self.pending_qos0 = Some(job);
+                self.pending_input = Some(job);
                 false
             }
         }
@@ -236,6 +292,7 @@ impl MqttSource {
         self.reconciliation = None;
         if self.has_intake_capacity(dispatcher) {
             self.ready.store(true, Ordering::Relaxed);
+            self.publish_admission(dispatcher);
             info!(topics = self.filters.len(), "MQTT subscriptions reconciled");
         } else {
             self.reset_connection()?;
@@ -245,12 +302,19 @@ impl MqttSource {
 
     fn reset_connection(&mut self) -> Result<()> {
         self.ready.store(false, Ordering::Relaxed);
+        self.operations
+            .admission_paused
+            .store(true, Ordering::Relaxed);
+        self.operations.pending_acks.store(0, Ordering::Relaxed);
         self.invalidate_acknowledgements()?;
+        if self.pending_input.as_ref().is_some_and(|job| job.qos != 0) {
+            self.pending_input = None;
+        }
         self.reconciliation = None;
         self.subscribe_pending = false;
         self.expected_suback = None;
 
-        let (client, eventloop) = AsyncClient::new(self.options.clone(), MQTT_REQUEST_CAPACITY);
+        let (client, eventloop) = AsyncClient::new(self.options.clone(), mqtt_request_capacity());
         *self
             .publisher_client
             .lock()
@@ -303,7 +367,7 @@ impl MqttSource {
 
         if !self.has_storage_capacity() {
             if publish.qos == QoS::AtMostOnce {
-                self.pending_qos0 = Some(job);
+                self.pending_input = Some(job);
             }
             self.reset_connection()?;
             return Ok(());
@@ -316,10 +380,15 @@ impl MqttSource {
                 }
             }
             Err(unadmitted) => {
-                if publish.qos == QoS::AtMostOnce {
-                    self.pending_qos0 = Some(unadmitted);
+                self.pending_input = Some(unadmitted);
+                match key {
+                    Some(key) => {
+                        // Keep one publication so a replay burst cannot invalidate
+                        // every in-flight completion before the workers finish.
+                        self.pending_acks.insert(key, publish);
+                    }
+                    None => self.reset_connection()?,
                 }
-                self.reset_connection()?;
             }
         }
         Ok(())
@@ -334,17 +403,24 @@ impl Source for MqttSource {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
         Box::pin(async move {
             loop {
+                if !self.reconnect_pending
+                    && self.pending_input.is_some()
+                    && self.has_intake_capacity(&dispatcher)
+                {
+                    self.try_dispatch_pending_input(&dispatcher);
+                }
+                self.publish_admission(&dispatcher);
                 if *shutdown_rx.borrow() {
-                    if self.pending_qos0.is_some()
+                    if self.pending_input.is_some()
                         && (!self.has_intake_capacity(&dispatcher)
-                            || !self.try_dispatch_pending_qos0(&dispatcher))
+                            || !self.try_dispatch_pending_input(&dispatcher))
                     {
-                        warn!("unadmitted MQTT QoS 0 message could not be quarantined before shutdown");
+                        warn!("unadmitted MQTT input could not be drained before shutdown");
                     }
                     break;
                 }
 
-                if self.reconnect_pending {
+                if self.reconnect_pending || self.pending_input.is_some() {
                     tokio::select! {
                         changed = shutdown_rx.changed() => {
                             if changed.is_err() || *shutdown_rx.borrow() {
@@ -355,13 +431,18 @@ impl Source for MqttSource {
                             let Some(receipt) = receipt else {
                                 break;
                             };
+                            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                            self.trace_receipt(&receipt).await?;
                             if self.handle_ack_receipt(receipt) {
                                 self.reset_connection()?;
+                            } else {
+                                #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                                self.trace_ack_queue().await?;
                             }
                         }
                         () = tokio::time::sleep(RECONNECT_DELAY) => {
                             if self.has_intake_capacity(&dispatcher)
-                                && self.try_dispatch_pending_qos0(&dispatcher)
+                                && self.try_dispatch_pending_input(&dispatcher)
                             {
                                 self.reconnect_pending = false;
                             }
@@ -381,8 +462,13 @@ impl Source for MqttSource {
                         let Some(receipt) = receipt else {
                             break;
                         };
+                        #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                        self.trace_receipt(&receipt).await?;
                         if self.handle_ack_receipt(receipt) {
                             self.reset_connection()?;
+                        } else {
+                            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                            self.trace_ack_queue().await?;
                         }
                     }
                     event = self.eventloop.poll() => {
@@ -399,6 +485,8 @@ impl Source for MqttSource {
                             Event::Incoming(Incoming::ConnAck(connack)) => {
                                 info!("MQTT connected");
                                 self.invalidate_acknowledgements()?;
+                                #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                                crate::test_hooks::trace(format!("connack {} {}", self.generation, connack.session_present)).await?;
                                 self.ready.store(false, Ordering::Relaxed);
                                 if !connack.session_present {
                                     self.fresh_session_filters = Some(Vec::new());
@@ -474,6 +562,18 @@ impl Source for MqttSource {
                             _ => {}
                         }
 
+                        #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                        match &event {
+                            Event::Incoming(Incoming::Publish(publish)) => {
+                                crate::test_hooks::trace(format!("publish {} {}", self.generation, publish.pkid)).await?;
+                            }
+                            Event::Outgoing(Outgoing::PubAck(packet_id)) => {
+                                // rumqttc yields this event after network.flush(); confirm receipt with broker state.
+                                crate::test_hooks::trace(format!("puback {} {}", self.generation, packet_id)).await?;
+                            }
+                            _ => {}
+                        }
+
                         if self.subscribe_pending {
                             self.try_subscribe();
                         }
@@ -488,11 +588,36 @@ impl Source for MqttSource {
 
                         if let Event::Incoming(Incoming::Publish(publish)) = event {
                             self.dispatch_publish(publish, &dispatcher)?;
+                            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+                            if std::env::var("INGEST_TEST_DISPATCH_BARRIER_AT")
+                                .ok()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                == Some(self.pending_acks.len())
+                            {
+                                crate::test_hooks::barrier("after_dispatch").await?;
+                                // Keep transport polling paused while observing the full
+                                // shared request queue and its first waiting acknowledgement.
+                                let oldest = self.pending_acks.keys().min_by_key(|key| key.job_id).copied();
+                                while let Some(receipt) = self.ack_rx.recv().await {
+                                    let oldest_complete = Some(receipt.key) == oldest;
+                                    self.trace_receipt(&receipt).await?;
+                                    if self.handle_ack_receipt(receipt) {
+                                        self.reset_connection()?;
+                                        break;
+                                    }
+                                    if oldest_complete {
+                                        self.trace_ack_queue().await?;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         self.try_ack_ready();
                     }
                 }
             }
+            self.ready.store(false, Ordering::Relaxed);
+            self.operations.update_admission(0, 0, 0);
             Ok(())
         })
     }
@@ -522,6 +647,8 @@ impl DlqPublisher for MqttDlqPublisher {
         err: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            crate::test_hooks::fault("dlq")?;
             let dlq = json!({
                 "received_at": chrono::Utc::now().to_rfc3339(),
                 "src_topic": src_topic,
@@ -551,10 +678,8 @@ impl DlqPublisher for MqttDlqPublisher {
 /// guarantees it's populated when `input_source == InputSourceKind::Mqtt`).
 pub async fn build(
     cfg: &Config,
-    ready: Arc<AtomicBool>,
     routes: &RouteSet,
-    wal_capacity: Arc<Capacity>,
-    quarantine_capacity: Arc<Capacity>,
+    operations: Arc<Operations>,
 ) -> Result<(Box<dyn Source>, Arc<dyn DlqPublisher>)> {
     let mqtt_cfg = cfg
         .mqtt
@@ -581,7 +706,7 @@ pub async fn build(
     let mut mqttoptions = mqtt_options(mqtt_cfg);
     mqttoptions.set_keep_alive(Duration::from_secs(30));
 
-    let (client, eventloop) = AsyncClient::new(mqttoptions.clone(), MQTT_REQUEST_CAPACITY);
+    let (client, eventloop) = AsyncClient::new(mqttoptions.clone(), mqtt_request_capacity());
     let publisher = MqttDlqPublisher::new(client.clone());
     let publisher_client = publisher.client.clone();
     let (ack_tx, ack_rx) = mpsc::channel(MAX_INFLIGHT_MESSAGES);
@@ -602,16 +727,17 @@ pub async fn build(
         fresh_session_filters: None,
         subscribe_pending: false,
         expected_suback: None,
-        ready,
+        ready: operations.source_ready.clone(),
         ack_tx,
         ack_rx,
         generation: 0,
         next_job_id: 0,
         pending_acks: HashMap::new(),
         ready_acks: VecDeque::new(),
-        pending_qos0: None,
-        wal_capacity,
-        quarantine_capacity,
+        pending_input: None,
+        wal_capacity: operations.wal.clone(),
+        quarantine_capacity: operations.quarantine.clone(),
+        operations,
         reconnect_pending: false,
     });
     let publisher: Arc<dyn DlqPublisher> = Arc::new(publisher);
@@ -628,6 +754,18 @@ fn mqtt_options(mqtt_cfg: &MqttSourceConfig) -> MqttOptions {
         options.set_credentials(username, password);
     }
     options
+}
+
+fn mqtt_request_capacity() -> usize {
+    #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+    if let Some(capacity) = std::env::var("INGEST_TEST_MQTT_REQUEST_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|capacity| (1..=MQTT_REQUEST_CAPACITY).contains(capacity))
+    {
+        return capacity;
+    }
+    MQTT_REQUEST_CAPACITY
 }
 
 #[cfg(test)]
@@ -791,6 +929,12 @@ mod tests {
         .expect("subscription manifest");
         let (ack_tx, ack_rx) = mpsc::channel(MAX_INFLIGHT_MESSAGES);
         let publisher_client = Arc::new(Mutex::new(client.clone()));
+        let operations = Arc::new(Operations::new(
+            ready.clone(),
+            Arc::new(crate::infrastructure::operations::ForwarderState::default()),
+            capacity.clone(),
+            capacity.clone(),
+        ));
 
         (
             MqttSource {
@@ -805,13 +949,14 @@ mod tests {
                 subscribe_pending: false,
                 expected_suback: None,
                 ready,
+                operations,
                 ack_tx,
                 ack_rx,
                 generation: 0,
                 next_job_id: 0,
                 pending_acks: HashMap::new(),
                 ready_acks: VecDeque::new(),
-                pending_qos0: None,
+                pending_input: None,
                 wal_capacity: capacity.clone(),
                 quarantine_capacity: capacity,
                 reconnect_pending: false,
@@ -1059,6 +1204,39 @@ mod tests {
     }
 
     #[test]
+    fn test_durable_readiness_pending_ack_and_admission_reset_on_reconnect_and_exit() -> Result<()>
+    {
+        let options = TestMqttOptions::new("test-state", "localhost", 1883);
+        let (client, eventloop) = AsyncClient::new(options.clone(), 10);
+        let (mut source, _directory) = test_source(
+            options,
+            client,
+            eventloop,
+            Arc::new(AtomicBool::new(true)),
+            Vec::new(),
+            u64::MAX,
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let dispatcher = IngestDispatcher::new(vec![tx]);
+        source.dispatch_publish(test_publish(QoS::AtLeastOnce, 7), &dispatcher)?;
+        source.publish_admission(&dispatcher);
+        let operations = source.operations.clone();
+        assert_eq!(operations.pending_acks.load(Ordering::Relaxed), 1);
+        assert!(!operations.admission_available());
+        assert!(rx.try_recv().is_ok());
+        assert!(operations.admission_available());
+
+        source.reset_connection()?;
+        assert_eq!(operations.pending_acks.load(Ordering::Relaxed), 0);
+        assert!(!operations.admission_available());
+        assert!(!operations.source_ready.load(Ordering::Relaxed));
+        operations.source_ready.store(true, Ordering::Relaxed);
+        drop(source);
+        assert!(!operations.source_ready.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
     fn deferred_pipeline_result_does_not_queue_puback() {
         let mut options = TestMqttOptions::new("test-mqtt-deferred", "localhost", 1883);
         options.set_manual_acks(true);
@@ -1242,7 +1420,6 @@ mod tests {
             Vec::new(),
             u64::MAX,
         );
-        let old_client = source.client.clone();
         let (tx, mut rx) = mpsc::channel(1);
         let dispatcher = IngestDispatcher::new(vec![tx]);
         assert!(dispatcher
@@ -1259,16 +1436,25 @@ mod tests {
 
         source.dispatch_publish(test_publish(QoS::AtLeastOnce, 12), &dispatcher)?;
 
-        assert!(source.pending_acks.is_empty());
-        assert!(source.reconnect_pending);
-        assert!(!ready.load(Ordering::Relaxed));
-        assert!(old_client
-            .try_ack(&test_publish(QoS::AtLeastOnce, 12))
-            .is_err());
+        assert_eq!(source.pending_acks.len(), 1);
+        assert!(source.pending_input.is_some());
+        assert!(!source.reconnect_pending);
+        assert!(source.ready_acks.is_empty());
         assert_eq!(
             rx.recv().await.map(|job| job.topic),
             Some("occupied".to_string())
         );
+        assert!(source.try_dispatch_pending_input(&dispatcher));
+        let job = rx.recv().await.context("retained QoS 1 job")?;
+        assert!(
+            job.acknowledgement
+                .context("QoS 1 receipt")?
+                .complete(PipelineOutcome::OutputStored)
+                .await
+        );
+        let receipt = source.ack_rx.recv().await.context("durable receipt")?;
+        assert!(!source.handle_ack_receipt(receipt));
+        assert!(source.pending_acks.is_empty());
         Ok(())
     }
 
@@ -1348,7 +1534,7 @@ mod tests {
         source.dispatch_publish(test_publish(QoS::AtMostOnce, 0), &dispatcher)?;
 
         let pending = source
-            .pending_qos0
+            .pending_input
             .as_ref()
             .expect("unadmitted QoS 0 must be retained for quarantine");
         assert_eq!(pending.qos, 0);
@@ -1356,7 +1542,7 @@ mod tests {
         assert!(source.reconnect_pending);
 
         assert_eq!(rx.try_recv()?.topic, "occupied");
-        assert!(source.try_dispatch_pending_qos0(&dispatcher));
+        assert!(source.try_dispatch_pending_input(&dispatcher));
         assert_eq!(rx.try_recv()?.topic, "topic");
         Ok(())
     }
@@ -1378,7 +1564,7 @@ mod tests {
 
         source.dispatch_publish(test_publish(QoS::AtMostOnce, 0), &dispatcher)?;
 
-        assert!(source.pending_qos0.is_some());
+        assert!(source.pending_input.is_some());
         assert!(source.reconnect_pending);
         assert!(rx.try_recv().is_err());
         Ok(())
@@ -1448,6 +1634,56 @@ mod tests {
         }));
         assert!(source.ready_acks.is_empty());
         assert!(source.pending_acks.contains_key(&current_key));
+    }
+
+    #[test]
+    fn test_mqtt_source_out_of_order_completions_ack_in_receive_order() -> Result<()> {
+        let options = TestMqttOptions::new("test-ordered-ack", "localhost", 1883);
+        let (client, eventloop) = AsyncClient::new(options.clone(), 1);
+        let (mut source, _dir) = test_source(
+            options,
+            client,
+            eventloop,
+            Arc::new(AtomicBool::new(true)),
+            Vec::new(),
+            u64::MAX,
+        );
+        let (tx, mut rx) = mpsc::channel(2);
+        let dispatcher = IngestDispatcher::new(vec![tx]);
+        source.dispatch_publish(test_publish(QoS::AtLeastOnce, 41), &dispatcher)?;
+        source.dispatch_publish(test_publish(QoS::AtLeastOnce, 7), &dispatcher)?;
+        let first = rx
+            .try_recv()?
+            .acknowledgement
+            .context("first ACK handle")?
+            .key;
+        let second = rx
+            .try_recv()?
+            .acknowledgement
+            .context("second ACK handle")?
+            .key;
+
+        source.handle_ack_receipt(AckReceipt {
+            key: second,
+            outcome: PipelineOutcome::OutputStored,
+        });
+
+        assert_eq!(
+            source.pending_acks.len(),
+            2,
+            "later completion must not ACK past unfinished input"
+        );
+        source.handle_ack_receipt(AckReceipt {
+            key: first,
+            outcome: PipelineOutcome::OutputStored,
+        });
+        assert!(
+            !source.pending_acks.contains_key(&first),
+            "first receipt must take the sole request slot"
+        );
+        assert!(source.pending_acks.contains_key(&second));
+        assert_eq!(source.ready_acks.front(), Some(&second));
+        Ok(())
     }
 
     #[test]

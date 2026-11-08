@@ -10,3 +10,10 @@
 - [Operations Guide](operations.md)
 - [Development Guide](development.md)
 - [Releasing and Deploying](releasing.md)
+
+## Examples and roadmap
+
+- [Synthetic climate route and schemas](../config/examples/climate/README.md)
+- [Shipped firmware routes](../config/routes.json)
+- [Epic #23](https://github.com/hengsti/ingestion-service/issues/23) and
+  [unified route contract #19](https://github.com/hengsti/ingestion-service/issues/19)

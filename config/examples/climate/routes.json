@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "id": "example-climate",
+      "topic": "example/climate/+",
+      "schema": "schemas/climate.schema.json",
+      "output_schema": "schemas/climate.output.schema.json",
+      "device_id": {
+        "topic_segment": 2
+      },
+      "measurement": "climate",
+      "fields": {
+        "temp_c": {
+          "pointer": "/temp_c",
+          "type": "float"
+        },
+        "rel_hum_perc": {
+          "pointer": "/rel_hum_perc",
+          "type": "float"
+        },
+        "site_label": {
+          "pointer": "/site_label",
+          "type": "string",
+          "default": "unassigned"
+        },
+        "sensor_label": {
+          "pointer": "/sensor_label",
+          "type": "string",
+          "optional": true
+        }
+      },
+      "timestamp": {
+        "source": "received_at"
+      },
+      "calculations": [
+        "dew_point"
+      ],
+      "cache": false
+    }
+  ]
+}

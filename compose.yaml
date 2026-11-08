@@ -2,7 +2,7 @@
 # All ${VAR} values must be set in the project root .env (never committed).
 services:
   ingest:
-    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER (image owner)}/ingestion-service:${INGEST_TAG:?set INGEST_TAG (release tag or sha-<commit>)}
+    image: ${INGEST_IMAGE:?set INGEST_IMAGE (immutable image reference)}
     container_name: ingest
     restart: unless-stopped
     expose:
@@ -10,7 +10,7 @@ services:
     volumes:
       - wal:/data/wal # must match WAL_DIR
       - quarantine:/data/quarantine # must match QUARANTINE_DIR
-      - ./config:/app/config:ro
+      - ${INGEST_CONFIG_DIR:-./config}:/app/config:ro
     environment:
       RUST_LOG: ${RUST_LOG:?set RUST_LOG (e.g. info)}
 

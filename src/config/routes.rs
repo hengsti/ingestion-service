@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -226,10 +226,8 @@ impl RouteBundle {
             if path.as_os_str().is_empty() {
                 bail!("schema_resources entry '{uri}' must have a nonempty file path");
             }
-            if path.is_absolute() {
-                bail!("schema_resources entry '{uri}' must use a relative file path");
-            }
-            *path = bundle_dir.join(&*path);
+            *path =
+                resolve_bundle_path(path, bundle_dir, &format!("schema_resources entry '{uri}'"))?;
         }
 
         Ok(())
@@ -434,10 +432,22 @@ fn resolve_bundle_path(path: &Path, bundle_dir: &Path, label: &str) -> Result<Pa
         bail!("{label} path must not be empty");
     }
     if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(bundle_dir.join(path))
+        bail!("{label} path must be relative to the bundle directory");
     }
+
+    let mut depth = 0;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("{label} path must not escape the bundle directory");
+            }
+        }
+    }
+
+    Ok(bundle_dir.join(path))
 }
 
 /// Loads and validates a v1 route bundle from a JSON file.
@@ -1016,6 +1026,31 @@ mod tests {
         let mut resource = valid_bundle();
         resource["schema_resources"] = json!({
             "https://schemas.example.test/resource": ""
+        });
+        assert!(load_value(&resource).is_err());
+    }
+
+    #[test]
+    fn test_route_config_rejects_schema_paths_outside_bundle() {
+        let absolute = std::env::temp_dir().join("schema.json");
+        for field in ["schema", "output_schema"] {
+            let mut bundle = valid_bundle();
+            bundle["routes"][0][field] = json!(absolute);
+            assert!(
+                load_value(&bundle).is_err(),
+                "accepted absolute {field} path"
+            );
+
+            bundle["routes"][0][field] = json!("../../outside.json");
+            assert!(
+                load_value(&bundle).is_err(),
+                "accepted escaping {field} path"
+            );
+        }
+
+        let mut resource = valid_bundle();
+        resource["schema_resources"] = json!({
+            "https://schemas.example.test/resource": "../../outside.json"
         });
         assert!(load_value(&resource).is_err());
     }

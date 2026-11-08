@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Existing image tag to redeploy (e.g. v1.2.3). Leave empty to build fresh."
+        description: "Existing release or full-SHA image to redeploy. Leave empty to build fresh."
         required: false
         default: ""
 
@@ -16,8 +16,8 @@ permissions:
   packages: write
 
 concurrency:
-  group: cd-ingestion-${{ github.ref }}
-  cancel-in-progress: true
+  group: cd-ingestion-deploy
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -26,70 +26,173 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  build_and_push:
-    name: Build and push Docker image
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.image_tag == '')
-    runs-on: [self-hosted, linux, ARM64, ingestion]
+  resolve_source:
+    name: Resolve source revision and existing image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     outputs:
-      image_tag: ${{ steps.vars.outputs.image_tag }}
+      revision: ${{ steps.resolve.outputs.revision }}
+      image_digest: ${{ steps.resolve.outputs.image_digest }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
 
     steps:
-      - name: Checkout
+      - name: Checkout tagged source
+        if: github.event_name == 'push'
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
 
       - name: Check tag matches Cargo.toml version
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push'
         shell: bash
         run: |
           version=$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)
           if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
-            echo "::error file=Cargo.toml::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}. Bump the version, commit, and re-tag."
+            echo "::error file=Cargo.toml::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}."
             exit 1
           fi
 
-      - name: Compute image tag
+      - name: Resolve source revision and existing image
+        id: resolve
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          image_digest=""
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            revision="${GITHUB_SHA}"
+            image_tag="${GITHUB_REF_NAME}"
+          elif [[ -z "${IMAGE_TAG_INPUT}" ]]; then
+            revision="${GITHUB_SHA}"
+            image_tag="sha-${GITHUB_SHA}"
+          else
+            if [[ ! "${IMAGE_TAG_INPUT}" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z.-]+)?$ \
+              && ! "${IMAGE_TAG_INPUT}" =~ ^sha-[0-9a-f]{40}$ ]]; then
+              echo "::error::Use a release version (vX.Y.Z) or a full 40-character SHA image tag."
+              exit 1
+            fi
+
+            echo "${GHCR_TOKEN}" | docker login ghcr.io \
+              --username "${GITHUB_REPOSITORY_OWNER}" \
+              --password-stdin
+            docker pull --platform linux/arm64 "${IMAGE_NAME}:${IMAGE_TAG_INPUT}"
+
+            revision=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG_INPUT}" \
+              --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+            if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Image has no valid org.opencontainers.image.revision label."
+              exit 1
+            fi
+            if [[ "${IMAGE_TAG_INPUT}" == sha-* && "${IMAGE_TAG_INPUT#sha-}" != "${revision}" ]]; then
+              echo "::error::SHA image tag does not match its source revision label."
+              exit 1
+            fi
+
+            while IFS= read -r repo_digest; do
+              if [[ "${repo_digest}" == "${IMAGE_NAME}@sha256:"* ]]; then
+                image_digest="${repo_digest#*@}"
+                break
+              fi
+            done < <(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG_INPUT}" \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}')
+
+            if [[ ! "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not resolve the image to a registry digest."
+              exit 1
+            fi
+            image_tag="${IMAGE_TAG_INPUT}"
+          fi
+
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+          echo "image_digest=${image_digest}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag=${image_tag}" >> "${GITHUB_OUTPUT}"
+
+  validate:
+    name: Validate exact source revision
+    needs: resolve_source
+    uses: ./.github/workflows/ci.yaml
+    with:
+      revision: ${{ needs.resolve_source.outputs.revision }}
+
+  build_and_push:
+    name: Build and push ARM64 image
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.image_tag == '')
+    needs: [resolve_source, validate]
+    runs-on: [self-hosted, linux, ARM64, ingestion]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve_source.outputs.revision }}
+
+      - name: Compute image tags
         id: vars
         shell: bash
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          SOURCE_REVISION: ${{ needs.resolve_source.outputs.revision }}
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "image_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
-            echo "image_tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
-          fi
+          {
+            echo 'tags<<EOF'
+            if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+              echo "${IMAGE_NAME}:${GITHUB_REF_NAME}"
+            fi
+            echo "${IMAGE_NAME}:sha-${SOURCE_REVISION}"
+            echo EOF
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            --username "${{ github.repository_owner }}" \
+            --password-stdin
 
       - name: Build and push ARM64 image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           platforms: linux/arm64
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          tags: ${{ steps.vars.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.resolve_source.outputs.revision }}
 
   deploy:
     name: Deploy ingest service
-    needs: build_and_push
-    if: always() && (needs.build_and_push.result == 'success' || needs.build_and_push.result == 'skipped')
+    needs: [resolve_source, validate, build_and_push]
+    if: >-
+      always() &&
+      needs.resolve_source.result == 'success' &&
+      needs.validate.result == 'success' &&
+      (needs.build_and_push.result == 'success' || needs.build_and_push.result == 'skipped')
     runs-on: [self-hosted, linux, ARM64, ingestion]
     environment: CD
     permissions:
       contents: read
       packages: read
+    env:
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      IMAGE_DIGEST: ${{ needs.resolve_source.outputs.image_digest || needs.build_and_push.outputs.image_digest }}
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/ingestion-service
+      SOURCE_REVISION: ${{ needs.resolve_source.outputs.revision }}
 
     steps:
       - name: Log in to GHCR
@@ -99,25 +202,456 @@ jobs:
             --username "${{ github.repository_owner }}" \
             --password-stdin
 
-      - name: Update deploy tag
-        working-directory: ${{ vars.DEPLOY_PATH }}
-        env:
-          IMAGE_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || needs.build_and_push.outputs.image_tag }}
+      - name: Checkout deployment workflow files
+        uses: actions/checkout@v5
+        with:
+          path: workflow-source
+
+      - name: Checkout validated release
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve_source.outputs.revision }}
+          path: candidate
+
+      - name: Capture current deployment pair
+        id: previous
         shell: bash
         run: |
-          if grep -q '^INGEST_TAG=' .env; then
-            sed -i "s/^INGEST_TAG=.*/INGEST_TAG=${IMAGE_TAG}/" .env
-          else
-            echo "INGEST_TAG=${IMAGE_TAG}" >> .env
+          set -euo pipefail
+          test -d "${DEPLOY_PATH}"
+          test -f "${DEPLOY_PATH}/.env"
+          test -f "${DEPLOY_PATH}/compose.yaml"
+          state_root="${DEPLOY_PATH}/.deploy-state"
+          mkdir -p "${state_root}"
+          chmod 700 "${state_root}"
+
+          if ! docker inspect "${SERVICE_NAME}" >/dev/null 2>&1; then
+            echo "bundle=" >> "${GITHUB_OUTPUT}"
+            echo "image=" >> "${GITHUB_OUTPUT}"
+            echo "key=" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
-      - name: Pull new image
-        working-directory: ${{ vars.DEPLOY_PATH }}
-        run: docker compose pull ingest
+          image_id=$(docker inspect "${SERVICE_NAME}" --format '{{.Image}}')
+          image_revision=$(docker image inspect "${image_id}" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          if [[ ! "${image_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Running image has no valid source revision label; refusing rollout."
+            exit 1
+          fi
 
-      - name: Recreate ingest only
-        working-directory: ${{ vars.DEPLOY_PATH }}
-        run: docker compose up -d --no-deps ingest
+          image_ref=$(docker image inspect "${image_id}" \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            | awk -v prefix="${IMAGE_NAME}@" 'index($0, prefix) == 1 { print; exit }')
+          if [[ ! "${image_ref}" =~ ^${IMAGE_NAME}@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Cannot resolve the running image to its registry digest; refusing rollout."
+            exit 1
+          fi
 
-      - name: Prune dangling images
-        run: docker image prune -f
+          config_source=$(docker inspect "${SERVICE_NAME}" \
+            --format '{{range .Mounts}}{{if eq .Destination "/app/config"}}{{.Source}}{{end}}{{end}}')
+          if [[ -z "${config_source}" ]]; then
+            if grep -q 'INGEST_ROUTES_FILE' "${DEPLOY_PATH}/compose.yaml" \
+              || ! grep -q 'MQTT_TOPIC_' "${DEPLOY_PATH}/compose.yaml"; then
+              echo "::error::Cannot resolve the running config mount; refusing rollout."
+              exit 1
+            fi
+          elif [[ ! -d "${config_source}" ]]; then
+            echo "::error::Cannot resolve the running config mount; refusing rollout."
+            exit 1
+          fi
+
+          image_digest="${image_ref#*@}"
+          image_key="${image_revision}-${image_digest#sha256:}"
+          active_file="${state_root}/active"
+          active_key=""
+          if [[ -f "${active_file}" ]]; then
+            active_key=$(cat "${active_file}")
+            if [[ ! "${active_key}" =~ ^${image_key}(-[0-9a-f]{64})?$ ]]; then
+              echo "::error::Active deployment marker does not match the running image."
+              exit 1
+            fi
+            key="${active_key}"
+          else
+            key="${image_key}"
+          fi
+          bundle="${state_root}/${key}"
+
+          if [[ -e "${bundle}" ]]; then
+            if [[ ! -f "${bundle}/.env" || ! -f "${bundle}/compose.yaml" || ! -d "${bundle}/config" \
+              || ! -f "${bundle}/.image" ]]; then
+              echo "::error::Deployment snapshot is incomplete; refusing rollout."
+              exit 1
+            fi
+          else
+            if [[ -n "${active_key}" ]]; then
+              echo "::error::Active deployment snapshot is missing; refusing rollout."
+              exit 1
+            fi
+            capture_dir=$(mktemp -d "${state_root}/.capture.XXXXXX")
+            trap 'rm -rf -- "${capture_dir}"' EXIT
+            cp "${DEPLOY_PATH}/.env" "${capture_dir}/.env"
+            cp "${DEPLOY_PATH}/compose.yaml" "${capture_dir}/source-compose.yaml"
+            chmod 600 "${capture_dir}/.env"
+            running_hash=$(docker inspect "${SERVICE_NAME}" \
+              --format '{{index .Config.Labels "com.docker.compose.config-hash"}}')
+            if ! current_hash=$(docker compose \
+              --project-directory "${DEPLOY_PATH}" \
+              --env-file "${capture_dir}/.env" \
+              -f "${capture_dir}/source-compose.yaml" config --hash "${SERVICE_NAME}" \
+              | awk -v service="${SERVICE_NAME}" '$1 == service { print $2 }'); then
+              echo "::error::Cannot verify the running deployment configuration."
+              exit 1
+            fi
+            if [[ ! "${running_hash}" =~ ^[0-9a-f]{64}$ || "${current_hash}" != "${running_hash}" ]]; then
+              echo "::error::Host Compose settings do not match the running container; refusing baseline capture."
+              exit 1
+            fi
+            docker compose \
+              --project-directory "${DEPLOY_PATH}" \
+              --env-file "${capture_dir}/.env" \
+              -f "${capture_dir}/source-compose.yaml" config --format json \
+              | sed -E 's/("(MQTT_USERNAME|MQTT_PASSWORD)"[[:space:]]*:[[:space:]]*)null/\1""/g' \
+              > "${capture_dir}/compose.yaml"
+            chmod 600 "${capture_dir}/compose.yaml"
+            mkdir -p "${bundle}/config"
+            chmod 700 "${bundle}"
+            mv "${capture_dir}/.env" "${bundle}/.env"
+            mv "${capture_dir}/compose.yaml" "${bundle}/compose.yaml"
+            if [[ -n "${config_source}" ]]; then
+              cp -a "${config_source}/." "${bundle}/config/"
+            fi
+            printf '%s\n' "${image_ref}" > "${bundle}/.image"
+            touch "${bundle}/.baseline"
+          fi
+
+          if [[ "$(cat "${bundle}/.image")" != "${image_ref}" ]]; then
+            echo "::error::Saved environment/configuration pair does not match the running image."
+            exit 1
+          fi
+          if [[ -n "${config_source}" ]] \
+            && ! diff -qr "${config_source}" "${bundle}/config" >/dev/null; then
+            echo "::error::Saved configuration snapshot does not match the running mount."
+            exit 1
+          elif [[ -z "${config_source}" \
+            && -n "$(find "${bundle}/config" -mindepth 1 -print -quit)" ]]; then
+            echo "::error::Saved configuration snapshot does not match the running mount."
+            exit 1
+          fi
+          chmod 700 "${bundle}"
+          chmod 600 "${bundle}/.env"
+          if [[ ! -f "${bundle}/.ready" && ! -f "${bundle}/.baseline" ]]; then
+            touch "${bundle}/.baseline"
+          fi
+          if [[ ! -f "${active_file}" ]]; then
+            active_temp=$(mktemp "${state_root}/active.XXXXXX")
+            printf '%s\n' "${key}" > "${active_temp}"
+            chmod 600 "${active_temp}"
+            mv -f "${active_temp}" "${active_file}"
+          fi
+
+          echo "bundle=${bundle}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image_ref}" >> "${GITHUB_OUTPUT}"
+          echo "key=${key}" >> "${GITHUB_OUTPUT}"
+
+      - name: Stage validated deployment pair
+        id: release
+        shell: bash
+        env:
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
+          PREVIOUS_BUNDLE: ${{ steps.previous.outputs.bundle }}
+        run: |
+          set -euo pipefail
+          state_root="${DEPLOY_PATH}/.deploy-state"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${IMAGE_TAG_INPUT}" \
+            && "${PREVIOUS_IMAGE}" != "${IMAGE_NAME}@${IMAGE_DIGEST}" ]]; then
+            image_key="${SOURCE_REVISION}-${IMAGE_DIGEST#sha256:}"
+            release_dir=""
+            release_marker=""
+            for bundle in "${state_root}/${image_key}" "${state_root}/${image_key}-"*; do
+              [[ -d "${bundle}" && "${bundle##*/}" =~ ^${image_key}(-[0-9a-f]{64})?$ ]] || continue
+              if [[ -f "${bundle}/.ready" ]]; then
+                marker="${bundle}/.ready"
+              elif [[ -f "${bundle}/.baseline" ]]; then
+                marker="${bundle}/.baseline"
+              else
+                continue
+              fi
+              if [[ ! -f "${bundle}/.env" || ! -f "${bundle}/compose.yaml" \
+                || ! -d "${bundle}/config" || ! -f "${bundle}/.image" \
+                || "$(cat "${bundle}/.image")" != "${IMAGE_NAME}@${IMAGE_DIGEST}" ]]; then
+                echo "::warning::Ignoring an incomplete or mismatched deployment snapshot."
+                continue
+              fi
+              if [[ -z "${release_marker}" || "${marker}" -nt "${release_marker}" ]]; then
+                release_dir="${bundle}"
+                release_marker="${marker}"
+              fi
+            done
+            if [[ -z "${release_dir}" ]]; then
+              echo "::error::No preserved deployment snapshot matches the selected image."
+              exit 1
+            fi
+            echo "bundle=${release_dir}" >> "${GITHUB_OUTPUT}"
+            echo "preflight_required=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          test -f candidate/compose.yaml
+          test -f candidate/src/main.rs
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${IMAGE_TAG_INPUT}" \
+            && "${PREVIOUS_IMAGE}" == "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            && -n "${PREVIOUS_BUNDLE}" ]] \
+            && ! grep -Fq -- '"--check-config"' candidate/src/main.rs; then
+            if ! cmp -s "${DEPLOY_PATH}/.env" "${PREVIOUS_BUNDLE}/.env"; then
+              echo "::error::Cannot preflight changed settings with this historical image."
+              exit 1
+            fi
+            if grep -q 'INGEST_ROUTES_FILE' "${PREVIOUS_BUNDLE}/compose.yaml" \
+              && ! diff -qr "${DEPLOY_PATH}/config" "${PREVIOUS_BUNDLE}/config" >/dev/null 2>&1; then
+              echo "::error::Cannot preflight changed configuration with this historical image."
+              exit 1
+            fi
+            echo "bundle=${PREVIOUS_BUNDLE}" >> "${GITHUB_OUTPUT}"
+            echo "preflight_required=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          test -f "${DEPLOY_PATH}/config/routes.json"
+          stage_dir=$(mktemp -d "${state_root}/.stage.XXXXXX")
+          trap 'rm -rf -- "${stage_dir}"' EXIT
+          mkdir "${stage_dir}/config"
+          cp -a "${DEPLOY_PATH}/config/." "${stage_dir}/config/"
+          if [[ -n "$(find "${stage_dir}/config" -type l -print -quit)" ]]; then
+            echo "::error::Symbolic links are not allowed in the deployment config bundle."
+            exit 1
+          fi
+          config_hash=$(cd "${stage_dir}/config" \
+            && find . -type f -print0 | sort -z | xargs -0 sha256sum \
+            | sha256sum | cut -d' ' -f1)
+          if [[ ! "${config_hash}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not calculate a valid deployment config hash."
+            exit 1
+          fi
+
+          awk '!/^[[:space:]]*(INGEST_IMAGE|INGEST_CONFIG_DIR)=/' \
+            "${DEPLOY_PATH}/.env" > "${stage_dir}/.env"
+          if ! grep -Eq 'MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH' candidate/compose.yaml; then
+            awk '!/^[[:space:]]*(MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH)=/' \
+              "${stage_dir}/.env" > "${stage_dir}/.filtered-env"
+            mv -f "${stage_dir}/.filtered-env" "${stage_dir}/.env"
+          fi
+          chmod 600 "${stage_dir}/.env"
+          export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          export INGEST_CONFIG_DIR="${DEPLOY_PATH}/config"
+          # Keep absent optional credentials from inheriting later runner values.
+          docker compose \
+            --project-directory "${DEPLOY_PATH}" \
+            --env-file "${stage_dir}/.env" \
+            -f candidate/compose.yaml config --format json \
+            | sed -E 's/("(MQTT_USERNAME|MQTT_PASSWORD)"[[:space:]]*:[[:space:]]*)null/\1""/g' \
+            > "${stage_dir}/compose.yaml"
+          chmod 600 "${stage_dir}/compose.yaml"
+          env_hash=$(sha256sum "${stage_dir}/.env" | cut -d' ' -f1)
+          compose_hash=$(sha256sum "${stage_dir}/compose.yaml" | cut -d' ' -f1)
+          pair_hash=$(printf '%s\n%s\n%s\n' "${config_hash}" "${env_hash}" "${compose_hash}" \
+            | sha256sum | cut -d' ' -f1)
+          release_key="${SOURCE_REVISION}-${IMAGE_DIGEST#sha256:}-${pair_hash}"
+          release_dir="${DEPLOY_PATH}/.deploy-state/${release_key}"
+          mkdir -p "${release_dir}"
+          chmod 700 "${release_dir}"
+
+          if [[ -f "${release_dir}/.ready" || -f "${release_dir}/.baseline" ]]; then
+            if [[ ! -f "${release_dir}/.env" || ! -f "${release_dir}/compose.yaml" \
+              || ! -d "${release_dir}/config" || ! -f "${release_dir}/.image" ]]; then
+              echo "::error::Saved deployment snapshot is incomplete."
+              exit 1
+            fi
+          fi
+          if [[ -e "${release_dir}/compose.yaml" ]]; then
+            if ! cmp -s "${stage_dir}/compose.yaml" "${release_dir}/compose.yaml"; then
+              echo "::error::Saved Compose configuration does not match its snapshot."
+              exit 1
+            fi
+          else
+            mv "${stage_dir}/compose.yaml" "${release_dir}/compose.yaml"
+          fi
+          if [[ -e "${release_dir}/config" ]]; then
+            diff -qr "${stage_dir}/config" "${release_dir}/config"
+          else
+            mv "${stage_dir}/config" "${release_dir}/config"
+          fi
+          if [[ -f "${release_dir}/.image" ]]; then
+            if [[ "$(cat "${release_dir}/.image")" != "${IMAGE_NAME}@${IMAGE_DIGEST}" ]]; then
+              echo "::error::Saved config snapshot is paired with a different image."
+              exit 1
+            fi
+          elif [[ -f "${release_dir}/.ready" ]]; then
+            echo "::error::Ready deployment snapshot has no paired image reference."
+            exit 1
+          fi
+
+          printf 'INGEST_IMAGE=%s\nINGEST_CONFIG_DIR=%s\n' \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}" "${release_dir}/config" >> "${stage_dir}/.env"
+          if [[ -f "${release_dir}/.env" ]]; then
+            if ! cmp -s "${stage_dir}/.env" "${release_dir}/.env"; then
+              echo "::error::Saved deployment environment does not match its snapshot."
+              exit 1
+            fi
+          else
+            mv "${stage_dir}/.env" "${release_dir}/.env"
+          fi
+
+          if [[ -f "${release_dir}/.ready" || -f "${release_dir}/.baseline" ]]; then
+            preflight_required=false
+          else
+            preflight_required=true
+          fi
+          echo "bundle=${release_dir}" >> "${GITHUB_OUTPUT}"
+          echo "preflight_required=${preflight_required}" >> "${GITHUB_OUTPUT}"
+
+      - name: Pull candidate image by digest
+        run: docker pull "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+      - name: Preflight the staged configuration
+        if: steps.release.outputs.preflight_required == 'true'
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ steps.release.outputs.bundle }}
+        run: |
+          export DEPLOY_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          export DEPLOY_CONFIG_DIR="${RELEASE_DIR}/config"
+          export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          export INGEST_CONFIG_DIR="${RELEASE_DIR}/config"
+          docker compose \
+            --project-directory "${DEPLOY_PATH}" \
+            --env-file "${RELEASE_DIR}/.env" \
+            -f "${RELEASE_DIR}/compose.yaml" \
+            -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+            run --rm --no-deps "${SERVICE_NAME}" /app/smarthome-ingest --check-config
+
+      - name: Activate candidate environment
+        id: activate
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ steps.release.outputs.bundle }}
+        run: |
+          temp_env=$(mktemp "${DEPLOY_PATH}/.env.XXXXXX")
+          cp "${RELEASE_DIR}/.env" "${temp_env}"
+          chmod 600 "${temp_env}"
+          mv -f "${temp_env}" "${DEPLOY_PATH}/.env"
+          echo "updated=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Recreate ingest and verify readiness
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ steps.release.outputs.bundle }}
+        run: |
+          export DEPLOY_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          export DEPLOY_CONFIG_DIR="${RELEASE_DIR}/config"
+          export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          export INGEST_CONFIG_DIR="${RELEASE_DIR}/config"
+          docker compose \
+            --project-directory "${DEPLOY_PATH}" \
+            --env-file "${RELEASE_DIR}/.env" \
+            -f "${RELEASE_DIR}/compose.yaml" \
+            -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+            up -d --no-deps "${SERVICE_NAME}"
+          for attempt in {1..60}; do
+            if docker compose \
+              --project-directory "${DEPLOY_PATH}" \
+              --env-file "${RELEASE_DIR}/.env" \
+              -f "${RELEASE_DIR}/compose.yaml" \
+              -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+              exec -T "${SERVICE_NAME}" wget -q --spider http://localhost:8085/readyz; then
+              printf '%s\n' "${IMAGE_NAME}@${IMAGE_DIGEST}" > "${RELEASE_DIR}/.image"
+              touch "${RELEASE_DIR}/.ready"
+              active_temp=$(mktemp "${DEPLOY_PATH}/.deploy-state/active.XXXXXX")
+              printf '%s\n' "$(basename "${RELEASE_DIR}")" > "${active_temp}"
+              chmod 600 "${active_temp}"
+              mv -f "${active_temp}" "${DEPLOY_PATH}/.deploy-state/active"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Ingest did not become ready before the deployment timeout."
+          exit 1
+
+      - name: Collect bounded deployment logs
+        if: failure() || cancelled()
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ steps.release.outputs.bundle }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cd-deploy"
+          if [[ -n "${RELEASE_DIR}" && -f "${RELEASE_DIR}/compose.yaml" ]]; then
+            export DEPLOY_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+            export DEPLOY_CONFIG_DIR="${RELEASE_DIR}/config"
+            export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+            export INGEST_CONFIG_DIR="${RELEASE_DIR}/config"
+            docker compose \
+              --project-directory "${DEPLOY_PATH}" \
+              --env-file "${RELEASE_DIR}/.env" \
+              -f "${RELEASE_DIR}/compose.yaml" \
+              -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+              logs --no-color --tail 100 "${SERVICE_NAME}" \
+              | tail -c 65536 > "${RUNNER_TEMP}/cd-deploy/ingest.log"
+          fi
+
+      - name: Restore previous image, configuration, and environment
+        if: (failure() || cancelled()) && steps.activate.outputs.updated == 'true' && steps.previous.outputs.bundle != ''
+        shell: bash
+        env:
+          PREVIOUS_BUNDLE: ${{ steps.previous.outputs.bundle }}
+          PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
+        run: |
+          temp_env=$(mktemp "${DEPLOY_PATH}/.env.XXXXXX")
+          cp "${PREVIOUS_BUNDLE}/.env" "${temp_env}"
+          chmod 600 "${temp_env}"
+          mv -f "${temp_env}" "${DEPLOY_PATH}/.env"
+
+          export DEPLOY_IMAGE="${PREVIOUS_IMAGE}"
+          export DEPLOY_CONFIG_DIR="${PREVIOUS_BUNDLE}/config"
+          export INGEST_IMAGE="${PREVIOUS_IMAGE}"
+          export INGEST_CONFIG_DIR="${PREVIOUS_BUNDLE}/config"
+          docker compose \
+            --project-directory "${DEPLOY_PATH}" \
+            --env-file "${PREVIOUS_BUNDLE}/.env" \
+            -f "${PREVIOUS_BUNDLE}/compose.yaml" \
+            -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+            pull "${SERVICE_NAME}"
+          docker compose \
+            --project-directory "${DEPLOY_PATH}" \
+            --env-file "${PREVIOUS_BUNDLE}/.env" \
+            -f "${PREVIOUS_BUNDLE}/compose.yaml" \
+            -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+            up -d --no-deps "${SERVICE_NAME}"
+          for attempt in {1..60}; do
+            if docker compose \
+              --project-directory "${DEPLOY_PATH}" \
+              --env-file "${PREVIOUS_BUNDLE}/.env" \
+              -f "${PREVIOUS_BUNDLE}/compose.yaml" \
+              -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+              exec -T "${SERVICE_NAME}" wget -q --spider http://localhost:8085/readyz; then
+              touch "${PREVIOUS_BUNDLE}/.ready"
+              active_temp=$(mktemp "${DEPLOY_PATH}/.deploy-state/active.XXXXXX")
+              printf '%s\n' "$(basename "${PREVIOUS_BUNDLE}")" > "${active_temp}"
+              chmod 600 "${active_temp}"
+              mv -f "${active_temp}" "${DEPLOY_PATH}/.deploy-state/active"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Previous deployment did not become ready after rollback."
+          exit 1
+
+      - name: Preserve deployment diagnostics
+        if: always() && (failure() || cancelled())
+        uses: actions/upload-artifact@v4
+        with:
+          name: cd-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cd-deploy/
+          retention-days: 7
+          if-no-files-found: warn

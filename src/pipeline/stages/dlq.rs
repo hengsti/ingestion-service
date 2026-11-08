@@ -45,6 +45,8 @@ impl PipelineStage for DlqPublishStage {
                 return Ok(StageFlow::Stop);
             };
 
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            crate::test_hooks::barrier("before_quarantine").await?;
             self.quarantine
                 .append_durable(Rejection {
                     topic: ctx.topic(),
@@ -56,6 +58,8 @@ impl PipelineStage for DlqPublishStage {
                     qos: ctx.qos(),
                 })
                 .await?;
+            #[cfg(all(feature = "integration-test-hooks", debug_assertions))]
+            crate::test_hooks::barrier("after_quarantine").await?;
 
             let payload = ctx.payload_for_dlq();
             let start = Instant::now();

@@ -10,6 +10,7 @@ use smarthome_ingest::{
     config::routes,
     infrastructure::{
         cache::state::CacheState,
+        operations::{ForwarderState, Operations},
         quarantine::Quarantine,
         router::RouteSet,
         sink::{influx::InfluxEncoder, Encoder},
@@ -29,6 +30,22 @@ use smarthome_ingest::{
         },
     },
 };
+
+/// Builds operational snapshots for HTTP fixtures without starting external services.
+pub fn http_operations(
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    forwarder_alive: bool,
+    wal: Arc<smarthome_ingest::infrastructure::wal::capacity::Capacity>,
+    quarantine: Arc<smarthome_ingest::infrastructure::wal::capacity::Capacity>,
+) -> Arc<Operations> {
+    let forwarder = Arc::new(ForwarderState::default());
+    forwarder
+        .liveness_handle()
+        .store(forwarder_alive, std::sync::atomic::Ordering::Relaxed);
+    let operations = Arc::new(Operations::new(ready, forwarder, wal, quarantine));
+    operations.update_admission(1, 1, 0);
+    operations
+}
 
 /// A client whose internal eventloop is dropped so that publish fails gracefully.
 /// The DLQ stage handles the send error with a warning log and returns Ok(Stop).

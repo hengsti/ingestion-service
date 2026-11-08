@@ -218,10 +218,8 @@ impl Config {
             .parse::<usize>()
             .context("BATCH_SIZE must be a valid usize")?;
 
-        let flush_interval_ms = env_var("FLUSH_INTERVAL_MS")
-            .context("FLUSH_INTERVAL_MS must be set")?
-            .parse::<u64>()
-            .context("FLUSH_INTERVAL_MS must be a valid u64")?;
+        let flush_interval_ms =
+            required_positive_u64(env_var("FLUSH_INTERVAL_MS"), "FLUSH_INTERVAL_MS")?;
 
         let wal_dir = PathBuf::from(env_var("WAL_DIR").context("WAL_DIR must be set")?);
         let wal_max_bytes = required_positive_u64(env_var("WAL_MAX_BYTES"), "WAL_MAX_BYTES")?;
@@ -260,6 +258,9 @@ impl Config {
         let input_queue_capacity = parse_input_queue_capacity(env_var("INPUT_QUEUE_CAPACITY"))?;
 
         let metrics_bind = env_var("METRICS_BIND").context("METRICS_BIND must be set")?;
+        metrics_bind
+            .parse::<std::net::SocketAddr>()
+            .context("METRICS_BIND must be a socket address like 0.0.0.0:9090")?;
 
         let cache_ttl_ms = env_var("CACHE_TTL_MS")
             .context("CACHE_TTL_MS must be set")?
@@ -267,11 +268,15 @@ impl Config {
             .context("CACHE_TTL_MS must be a valid u64")?;
 
         let cache_bind = env_var("CACHE_BIND").context("CACHE_BIND must be set")?;
+        validate_cache_bind(&cache_bind)?;
 
         let cache_buffer = env_var("CACHE_BUFFER")
             .context("CACHE_BUFFER must be set")?
             .parse::<usize>()
             .context("CACHE_BUFFER must be a valid usize")?;
+        if cache_buffer == 0 {
+            bail!("CACHE_BUFFER must be greater than zero");
+        }
 
         Ok(Self {
             input_source,
@@ -331,6 +336,36 @@ fn env_var(k: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
+
+fn validate_cache_bind(address: &str) -> Result<()> {
+    if address.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let Some((host, port)) = address.rsplit_once(':') else {
+        bail!("CACHE_BIND must be a host or IP address with a numeric port");
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.contains(':')
+        || host.is_empty()
+        || host.len() > 253
+        || port.parse::<u16>().is_err()
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        bail!("CACHE_BIND must be a host or IP address with a numeric port");
+    }
+
+    Ok(())
+}
+
 fn mqtt_session(clean_session: Option<String>, client_id: String) -> Result<(bool, String)> {
     let clean_session = match clean_session {
         Some(v) => v
@@ -360,6 +395,13 @@ fn parse_input_queue_capacity(value: Option<String>) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cache_bind_accepts_ip_and_hostname_socket_addresses() {
+        for address in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080"] {
+            assert!(validate_cache_bind(address).is_ok(), "{address}");
+        }
+    }
 
     #[test]
     fn input_source_kind_parse_accepts_mqtt_case_insensitive() {
