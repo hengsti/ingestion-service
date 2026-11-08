@@ -173,7 +173,8 @@ Release build: `cargo build --release --locked`. Container build:
 
 - The binary reads process environment through `Config::from_env`; it does not load
   `.env` itself. Most runtime settings are required. Existing defaults include the
-  WAL segment/queue sizes, input queue capacity, and `MQTT_CLEAN_SESSION=true`.
+  WAL segment/queue sizes, input queue capacity, and `MQTT_CLEAN_SESSION=false`.
+  `MQTT_CLEAN_SESSION=true` is rejected; durable intake requires a persistent session.
   `WAL_QUEUE_CAPACITY` must be positive. Compose supplies its own values; do not
   confuse them with code defaults.
 - `INGEST_ROUTES_FILE` supplies the route bundle; MQTT subscriptions derive only from

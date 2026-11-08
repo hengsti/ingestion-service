@@ -89,9 +89,12 @@ rather than assuming every deployment used that default.
 The firmware routes preserve the `bme680` and `device_status` measurement names and
 existing tag/field names and types. Documented additions/deltas are the reserved
 `device_id` tag and `mqtt_retained` field on every route, `altitude_m` on `bme680`,
-present optional booleans (including `replayed: false`), and the frozen receive time
-when `time_valid` is false. A valid payload timestamp of zero is rejected rather than
-replaced with server time. When `warmed_up` is false, both IAQ outputs are omitted.
+`time_iso` as a string field on both firmware measurements, present optional booleans
+(including `replayed: false`), and the frozen receive time when `time_valid` is false.
+A valid payload timestamp of zero is rejected rather than replaced with server time.
+When `warmed_up` is false, both IAQ outputs are omitted. The validated payload `time_iso`
+is copied unchanged and also appears in the sensor cache; point timestamps still follow
+the configured `time_ms`/`time_valid` policy, including receive-time fallback.
 See the canonical [unified-route compatibility decision in issue #19](https://github.com/hengsti/ingestion-service/issues/19).
 
 HomeKit continues to read cached `device_id`, `last_seen_ms`, and
