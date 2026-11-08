@@ -10,7 +10,12 @@ services:
     volumes:
       - wal:/data/wal # must match WAL_DIR
       - quarantine:/data/quarantine # must match QUARANTINE_DIR
-      - ${INGEST_CONFIG_DIR:-./config}:/app/config:ro
+      - type: bind
+        source: ${INGEST_CONFIG_DIR:-./config}
+        target: /app/config
+        read_only: true
+        bind:
+          create_host_path: false
     environment:
       RUST_LOG: ${RUST_LOG:?set RUST_LOG (e.g. info)}
 

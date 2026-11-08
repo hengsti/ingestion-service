@@ -28,7 +28,7 @@ docker compose exec ingest wget -qO- http://localhost:8085/readyz
 
 The service only uses `expose`, so nothing is published on the host. To reach the API
 from the host, add an override file with `ports`. The default config mount is the local
-`./config`; CD snapshots the route/schema bundle from the exact release revision.
+`./config`; production uses the Server-owned directory selected by `INGEST_CONFIG_DIR`.
 See [Releasing and Deploying](releasing.md) for immutable
 image/config snapshots, preflight, readiness, and rollback. This repository does not
 include its Compose file in a surrounding Server stack.
@@ -43,6 +43,26 @@ QoS 1 grants and unsubscribe acknowledgements are received. A reconnect is not p
 reconciliation. Do not remove manifest files or clear a broker session while the service
 is running. This procedure implements the
 [broker reconciliation contract in issue #40](https://github.com/hengsti/ingestion-service/issues/40).
+
+With CD, use the active resolved Compose file (the tracked host file can predate the release):
+
+```bash
+cd /opt/smarthome-stack/smarthome-ingest
+release_dir="$(pwd)/.deploy-state/$(cat .deploy-state/active)"
+docker compose --project-directory "$(pwd)" --env-file .env -f "$release_dir/compose.yaml" \
+  run --rm --no-deps ingest /app/smarthome-ingest --check-config
+# Only after validation succeeds; restart uses the same image and mounts.
+docker compose --project-directory "$(pwd)" --env-file .env -f "$release_dir/compose.yaml" restart ingest
+docker compose --project-directory "$(pwd)" --env-file .env -f "$release_dir/compose.yaml" \
+  exec -T ingest wget -q --spider http://localhost:8085/readyz
+```
+
+Keep a backup before editing. Include every referenced schema and keep the directory readable
+by the container's non-root user. Do not edit during CD or between validation and restart.
+No image build or publication is needed. There is no live reload; failed validation leaves the
+running process on its previously loaded routes. See the
+[snapshot-mount migration](releasing.md#migrate-an-existing-snapshot-mount) before using this
+procedure with a deployment created by older CD.
 
 An existing persistent broker session created before the subscription manifest was introduced
 cannot be enumerated over MQTT 3.1.1. Before upgrading such a session:

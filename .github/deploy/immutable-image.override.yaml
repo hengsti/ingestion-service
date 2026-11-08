@@ -3,6 +3,8 @@ services:
     image: ${DEPLOY_IMAGE:?set DEPLOY_IMAGE to a registry digest}
     volumes:
       - type: bind
-        source: ${DEPLOY_CONFIG_DIR:?set DEPLOY_CONFIG_DIR to the versioned config bundle}
+        source: ${DEPLOY_CONFIG_DIR:?set DEPLOY_CONFIG_DIR to the selected runtime config directory}
         target: /app/config
         read_only: true
+        bind:
+          create_host_path: false

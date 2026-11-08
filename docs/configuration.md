@@ -223,7 +223,7 @@ are ignored by the cache but continue through the pipeline.
 | Variable | Required | Used for |
 |---|---:|---|
 | `INGEST_IMAGE` | Yes | Immutable image reference; deployment uses a registry digest |
-| `INGEST_CONFIG_DIR` | No | Complete route/schema bundle mounted read-only at `/app/config`; defaults to `./config` |
+| `INGEST_CONFIG_DIR` | No | Existing Server-owned route/schema directory mounted read-only at `/app/config`; defaults to `./config` |
 | `INFLUX_TOKEN` | Yes | Passed to the container. Never commit it |
 | `MQTT_HOST` | Yes | Broker hostname |
 | `MQTT_PORT` | Yes | Broker port |
@@ -239,10 +239,12 @@ so the code defaults apply. The image `HEALTHCHECK` is used as-is.
 
 Compose mounts the complete `INGEST_CONFIG_DIR` read-only at `/app/config` and sets
 `INGEST_ROUTES_FILE=/app/config/routes.json`. For deployment, keep the full bundle under
-`/opt/smarthome-ingest/config` as described in [Releasing and Deploying](releasing.md); all schema
-files referenced by `routes.json` must be present in that same bundle. CD snapshots the bundle,
-preflights the candidate image against it, and rolls back the image/config pair together. The
-workflow never merges the repository's config files into the host bundle.
+`/opt/smarthome-stack/smarthome-ingest/config` as described in
+[Releasing and Deploying](releasing.md); all referenced schema files must be present in that
+bundle. CD honors this selection, preflights the actual directory against the candidate image
+on every deployment, and saves recovery copies without mounting them as runtime configuration.
+The workflow never installs repository examples over operator files. Missing directories fail
+instead of being silently created by Docker.
 
 CI renders the file with `docker compose config` and compares its `environment` keys with the variables read in `src/config.rs`. A variable that the code does not read, or a missing required variable, fails the build. Update `compose.yaml`, `src/config.rs`, and this page together.
 

@@ -229,6 +229,7 @@ jobs:
             echo "bundle=" >> "${GITHUB_OUTPUT}"
             echo "image=" >> "${GITHUB_OUTPUT}"
             echo "key=" >> "${GITHUB_OUTPUT}"
+            echo "config_dir=" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
@@ -329,15 +330,6 @@ jobs:
             echo "::error::Saved environment/configuration pair does not match the running image."
             exit 1
           fi
-          if [[ -n "${config_source}" ]] \
-            && ! diff -qr "${config_source}" "${bundle}/config" >/dev/null; then
-            echo "::error::Saved configuration snapshot does not match the running mount."
-            exit 1
-          elif [[ -z "${config_source}" \
-            && -n "$(find "${bundle}/config" -mindepth 1 -print -quit)" ]]; then
-            echo "::error::Saved configuration snapshot does not match the running mount."
-            exit 1
-          fi
           chmod 700 "${bundle}"
           chmod 600 "${bundle}/.env"
           if [[ ! -f "${bundle}/.ready" && ! -f "${bundle}/.baseline" ]]; then
@@ -353,6 +345,43 @@ jobs:
           echo "bundle=${bundle}" >> "${GITHUB_OUTPUT}"
           echo "image=${image_ref}" >> "${GITHUB_OUTPUT}"
           echo "key=${key}" >> "${GITHUB_OUTPUT}"
+          echo "config_dir=${config_source}" >> "${GITHUB_OUTPUT}"
+
+      - name: Select runtime configuration
+        id: runtime
+        shell: bash
+        env:
+          PREVIOUS_CONFIG_DIR: ${{ steps.previous.outputs.config_dir }}
+        run: |
+          set -euo pipefail
+          config_dir=$(docker compose \
+            --project-directory "${DEPLOY_PATH}" \
+            --env-file "${DEPLOY_PATH}/.env" \
+            -f "${GITHUB_WORKSPACE}/workflow-source/compose.yaml" config --format json \
+            | python3 -c 'import json, sys; print(next(m["source"] for m in json.load(sys.stdin)["services"]["ingest"]["volumes"] if m["target"] == "/app/config"))')
+          # Older CD wrote its snapshot path into .env; migrate that managed path.
+          case "${config_dir}" in
+            "${DEPLOY_PATH}/.deploy-state/"*) config_dir="${DEPLOY_PATH}/config" ;;
+          esac
+          if [[ ! -d "${config_dir}" ]]; then
+            echo "::error::Runtime config directory is missing: ${config_dir}"
+            exit 1
+          fi
+          entries=$(find "${config_dir}" -mindepth 1 -print -quit)
+          if [[ -z "${entries}" \
+            && -n "${PREVIOUS_CONFIG_DIR}" && "${PREVIOUS_CONFIG_DIR}" != "${config_dir}" ]]; then
+            cp -a "${PREVIOUS_CONFIG_DIR}/." "${config_dir}/"
+          fi
+          if [[ ! -s "${config_dir}/routes.json" ]]; then
+            echo "::error::Runtime config requires a nonempty routes.json; repository examples are never installed by CD."
+            exit 1
+          fi
+          symlinks=$(find "${config_dir}" -type l -print -quit)
+          if [[ -n "${symlinks}" ]]; then
+            echo "::error::Symbolic links are not allowed in the runtime config bundle."
+            exit 1
+          fi
+          echo "config_dir=${config_dir}" >> "${GITHUB_OUTPUT}"
 
       - name: Stage validated deployment pair
         id: release
@@ -360,10 +389,12 @@ jobs:
         env:
           IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
           PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
-          PREVIOUS_BUNDLE: ${{ steps.previous.outputs.bundle }}
+          RUNTIME_CONFIG_DIR: ${{ steps.runtime.outputs.config_dir }}
         run: |
           set -euo pipefail
           state_root="${DEPLOY_PATH}/.deploy-state"
+          source_compose=candidate/compose.yaml
+          source_env="${DEPLOY_PATH}/.env"
 
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${IMAGE_TAG_INPUT}" \
             && "${PREVIOUS_IMAGE}" != "${IMAGE_NAME}@${IMAGE_DIGEST}" ]]; then
@@ -394,40 +425,15 @@ jobs:
               echo "::error::No preserved deployment snapshot matches the selected image."
               exit 1
             fi
-            echo "bundle=${release_dir}" >> "${GITHUB_OUTPUT}"
-            echo "preflight_required=false" >> "${GITHUB_OUTPUT}"
-            exit 0
+            source_compose="${release_dir}/compose.yaml"
+            source_env="${release_dir}/.env"
           fi
 
-          test -f candidate/compose.yaml
-          test -f candidate/src/main.rs
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${IMAGE_TAG_INPUT}" \
-            && "${PREVIOUS_IMAGE}" == "${IMAGE_NAME}@${IMAGE_DIGEST}" \
-            && -n "${PREVIOUS_BUNDLE}" ]] \
-            && ! grep -Fq -- '"--check-config"' candidate/src/main.rs; then
-            if ! cmp -s "${DEPLOY_PATH}/.env" "${PREVIOUS_BUNDLE}/.env"; then
-              echo "::error::Cannot preflight changed settings with this historical image."
-              exit 1
-            fi
-            if grep -q 'INGEST_ROUTES_FILE' "${PREVIOUS_BUNDLE}/compose.yaml" \
-              && ! diff -qr candidate/config "${PREVIOUS_BUNDLE}/config" >/dev/null 2>&1; then
-              echo "::error::Cannot preflight changed configuration with this historical image."
-              exit 1
-            fi
-            echo "bundle=${PREVIOUS_BUNDLE}" >> "${GITHUB_OUTPUT}"
-            echo "preflight_required=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          test -f candidate/config/routes.json
+          test -f "${source_compose}"
           stage_dir=$(mktemp -d "${state_root}/.stage.XXXXXX")
           trap 'rm -rf -- "${stage_dir}"' EXIT
           mkdir "${stage_dir}/config"
-          cp -a candidate/config/. "${stage_dir}/config/"
-          if [[ -n "$(find "${stage_dir}/config" -type l -print -quit)" ]]; then
-            echo "::error::Symbolic links are not allowed in the deployment config bundle."
-            exit 1
-          fi
+          cp -a "${RUNTIME_CONFIG_DIR}/." "${stage_dir}/config/"
           config_hash=$(cd "${stage_dir}/config" \
             && find . -type f -print0 | sort -z | xargs -0 sha256sum \
             | sha256sum | cut -d' ' -f1)
@@ -437,20 +443,26 @@ jobs:
           fi
 
           awk '!/^[[:space:]]*(INGEST_IMAGE|INGEST_CONFIG_DIR)=/' \
-            "${DEPLOY_PATH}/.env" > "${stage_dir}/.env"
-          if ! grep -Eq 'MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH' candidate/compose.yaml; then
+            "${source_env}" > "${stage_dir}/.env"
+          if ! grep -Eq 'MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH' "${source_compose}"; then
             awk '!/^[[:space:]]*(MQTT_TOPIC_SENSOR|MQTT_TOPIC_STATUS|ENFORCE_TOPIC_DEVICE_MATCH)=/' \
               "${stage_dir}/.env" > "${stage_dir}/.filtered-env"
             mv -f "${stage_dir}/.filtered-env" "${stage_dir}/.env"
           fi
           chmod 600 "${stage_dir}/.env"
           export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
-          export INGEST_CONFIG_DIR="${DEPLOY_PATH}/config"
+          export INGEST_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
+          export DEPLOY_IMAGE="${INGEST_IMAGE}"
+          export DEPLOY_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
+          printf 'INGEST_IMAGE=%s\nINGEST_CONFIG_DIR="%s"\n' \
+            "${INGEST_IMAGE}" "${INGEST_CONFIG_DIR}" >> "${stage_dir}/.env"
           # Keep absent optional credentials from inheriting later runner values.
           docker compose \
             --project-directory "${DEPLOY_PATH}" \
             --env-file "${stage_dir}/.env" \
-            -f candidate/compose.yaml config --format json \
+            -f "${source_compose}" \
+            -f "${GITHUB_WORKSPACE}/workflow-source/.github/deploy/immutable-image.override.yaml" \
+            config --format json \
             | sed -E 's/("(MQTT_USERNAME|MQTT_PASSWORD)"[[:space:]]*:[[:space:]]*)null/\1""/g' \
             > "${stage_dir}/compose.yaml"
           chmod 600 "${stage_dir}/compose.yaml"
@@ -493,8 +505,6 @@ jobs:
             exit 1
           fi
 
-          printf 'INGEST_IMAGE=%s\nINGEST_CONFIG_DIR=%s\n' \
-            "${IMAGE_NAME}@${IMAGE_DIGEST}" "${release_dir}/config" >> "${stage_dir}/.env"
           if [[ -f "${release_dir}/.env" ]]; then
             if ! cmp -s "${stage_dir}/.env" "${release_dir}/.env"; then
               echo "::error::Saved deployment environment does not match its snapshot."
@@ -504,27 +514,21 @@ jobs:
             mv "${stage_dir}/.env" "${release_dir}/.env"
           fi
 
-          if [[ -f "${release_dir}/.ready" || -f "${release_dir}/.baseline" ]]; then
-            preflight_required=false
-          else
-            preflight_required=true
-          fi
           echo "bundle=${release_dir}" >> "${GITHUB_OUTPUT}"
-          echo "preflight_required=${preflight_required}" >> "${GITHUB_OUTPUT}"
 
       - name: Pull candidate image by digest
         run: docker pull "${IMAGE_NAME}@${IMAGE_DIGEST}"
 
       - name: Preflight the staged configuration
-        if: steps.release.outputs.preflight_required == 'true'
         shell: bash
         env:
           RELEASE_DIR: ${{ steps.release.outputs.bundle }}
+          RUNTIME_CONFIG_DIR: ${{ steps.runtime.outputs.config_dir }}
         run: |
           export DEPLOY_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
-          export DEPLOY_CONFIG_DIR="${RELEASE_DIR}/config"
+          export DEPLOY_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
           export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
-          export INGEST_CONFIG_DIR="${RELEASE_DIR}/config"
+          export INGEST_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
           docker compose \
             --project-directory "${DEPLOY_PATH}" \
             --env-file "${RELEASE_DIR}/.env" \
@@ -548,11 +552,12 @@ jobs:
         shell: bash
         env:
           RELEASE_DIR: ${{ steps.release.outputs.bundle }}
+          RUNTIME_CONFIG_DIR: ${{ steps.runtime.outputs.config_dir }}
         run: |
           export DEPLOY_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
-          export DEPLOY_CONFIG_DIR="${RELEASE_DIR}/config"
+          export DEPLOY_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
           export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
-          export INGEST_CONFIG_DIR="${RELEASE_DIR}/config"
+          export INGEST_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
           docker compose \
             --project-directory "${DEPLOY_PATH}" \
             --env-file "${RELEASE_DIR}/.env" \
@@ -584,13 +589,14 @@ jobs:
         shell: bash
         env:
           RELEASE_DIR: ${{ steps.release.outputs.bundle }}
+          RUNTIME_CONFIG_DIR: ${{ steps.runtime.outputs.config_dir }}
         run: |
           mkdir -p "${RUNNER_TEMP}/cd-deploy"
           if [[ -n "${RELEASE_DIR}" && -f "${RELEASE_DIR}/compose.yaml" ]]; then
             export DEPLOY_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
-            export DEPLOY_CONFIG_DIR="${RELEASE_DIR}/config"
+            export DEPLOY_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
             export INGEST_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
-            export INGEST_CONFIG_DIR="${RELEASE_DIR}/config"
+            export INGEST_CONFIG_DIR="${RUNTIME_CONFIG_DIR}"
             docker compose \
               --project-directory "${DEPLOY_PATH}" \
               --env-file "${RELEASE_DIR}/.env" \
@@ -606,6 +612,7 @@ jobs:
         env:
           PREVIOUS_BUNDLE: ${{ steps.previous.outputs.bundle }}
           PREVIOUS_IMAGE: ${{ steps.previous.outputs.image }}
+          PREVIOUS_CONFIG_DIR: ${{ steps.previous.outputs.config_dir }}
         run: |
           temp_env=$(mktemp "${DEPLOY_PATH}/.env.XXXXXX")
           cp "${PREVIOUS_BUNDLE}/.env" "${temp_env}"
@@ -613,9 +620,9 @@ jobs:
           mv -f "${temp_env}" "${DEPLOY_PATH}/.env"
 
           export DEPLOY_IMAGE="${PREVIOUS_IMAGE}"
-          export DEPLOY_CONFIG_DIR="${PREVIOUS_BUNDLE}/config"
+          export DEPLOY_CONFIG_DIR="${PREVIOUS_CONFIG_DIR:-${DEPLOY_PATH}/config}"
           export INGEST_IMAGE="${PREVIOUS_IMAGE}"
-          export INGEST_CONFIG_DIR="${PREVIOUS_BUNDLE}/config"
+          export INGEST_CONFIG_DIR="${DEPLOY_CONFIG_DIR}"
           docker compose \
             --project-directory "${DEPLOY_PATH}" \
             --env-file "${PREVIOUS_BUNDLE}/.env" \
