@@ -391,52 +391,58 @@ async fn forwarder_retries_auth_and_destination_failures_with_unchanged_payload(
 
 #[tokio::test]
 async fn forwarder_replays_mixed_type_conflict_batch_after_http_400() {
-    // The 400 models a type conflict after partial acceptance; retry the full body.
-    let (url, received) =
-        spawn_scripted_mock_influx(vec![StatusCode::BAD_REQUEST, StatusCode::NO_CONTENT]).await;
-    let sink = make_sink(&url);
-    let (wal, sub, tmp) = common::open_temp_wal().await;
+    for batch_size in [1, 2] {
+        // The 400 models a type conflict after partial acceptance; retry the full body.
+        let (url, received) =
+            spawn_scripted_mock_influx(vec![StatusCode::BAD_REQUEST, StatusCode::NO_CONTENT]).await;
+        let sink = make_sink(&url);
+        let (wal, sub, tmp) = common::open_temp_wal().await;
 
-    let valid = status_event("dev-conflict");
-    let conflicting = WalEvent {
-        payload: "device_status,device_id=dev-conflict rssi=\"wrong-type\" 1700000000000"
-            .to_string(),
-        ..status_event("dev-conflict")
-    };
-    let expected_body = format!("{}\n{}", valid.payload, conflicting.payload);
-    wal.append_durable(valid)
-        .await
-        .expect("persist valid event");
-    wal.append_durable(conflicting)
-        .await
-        .expect("persist conflicting event");
-    let handle = tokio::spawn(run_forwarder(sub, sink, 2, 60_000));
+        let valid = status_event("dev-conflict");
+        let conflicting = WalEvent {
+            payload: "device_status,device_id=dev-conflict rssi=\"wrong-type\" 1700000000000"
+                .to_string(),
+            ..status_event("dev-conflict")
+        };
+        let expected_body = format!("{}\n{}", valid.payload, conflicting.payload);
+        wal.append_durable(valid)
+            .await
+            .expect("persist valid event");
+        wal.append_durable(conflicting)
+            .await
+            .expect("persist conflicting event");
+        let handle = tokio::spawn(run_forwarder(sub, sink, batch_size, 60_000));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while post_count(&received) < 2 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while post_count(&received) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(wal);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("forwarder shutdown timed out")
+            .expect("forwarder task panicked")
+            .expect("forwarder returned an error");
+
+        let posts = received.lock().unwrap();
+        assert!(
+            posts.len() >= 2,
+            "HTTP 400 must leave the batch pending for repair"
+        );
+        // The immediate startup tick may split the records into separate batches.
+        assert_eq!(
+            posts[1], posts[0],
+            "retry must include the complete batch, including points already accepted"
+        );
+        assert_eq!(
+            posts[1..].join("\n"),
+            expected_body,
+            "successful batches must contain every record once and in order"
+        );
+        assert!(
+            read_cursor(tmp.path()).unwrap().is_some(),
+            "cursor commits only after the complete replay succeeds"
+        );
     }
-
-    drop(wal);
-    tokio::time::timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("forwarder shutdown timed out")
-        .expect("forwarder task panicked")
-        .expect("forwarder returned an error");
-
-    let posts = received.lock().unwrap();
-    assert_eq!(
-        posts.len(),
-        2,
-        "HTTP 400 must leave the batch pending for repair"
-    );
-    assert_eq!(posts[0], expected_body);
-    assert_eq!(
-        posts[1], expected_body,
-        "retry must include the complete batch, including points already accepted"
-    );
-    assert!(
-        read_cursor(tmp.path()).unwrap().is_some(),
-        "cursor commits only after the complete replay succeeds"
-    );
 }
