@@ -279,7 +279,8 @@ If you add or remove tags or fields, update:
 
 ## CI
 
-The CI workflow runs on pushes and pull requests targeting `master`.
+The CI workflow runs on every pull request and on pushes to `master`. CD reuses
+it to validate the exact source revision selected for release or rollback.
 
 Steps:
 
@@ -290,9 +291,9 @@ Steps:
 5. Run `cargo clippy --all-targets --all-features --locked -- -D warnings`.
 6. Run `cargo test --all-features --locked`.
 
-The Compose job also tests deployment snapshot/rollback behavior. Historical
-revisions called by CD run the broker suite only if their source includes its
-complete harness.
+Two parallel jobs run the isolated EMQX/InfluxDB tests and validate Compose plus
+its environment contract against `src/config.rs`. Historical revisions called
+by CD run the broker suite only if their source includes its complete harness.
 
 ## CD
 

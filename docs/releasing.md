@@ -2,8 +2,8 @@
 
 ## Validation gates
 
-Pull requests and pushes to `master` run formatting, clippy, locked tests, the
-isolated EMQX/InfluxDB integration suite, and Compose validation. The CD workflow
+CI runs on every pull request and pushes to `master`, checking formatting, clippy,
+locked tests, the isolated EMQX/InfluxDB suite, and Compose validation. The CD workflow
 calls the same CI workflow for the exact source revision it will build or
 redeploy; a successful run for another commit is not a release gate. Historical
 revisions that predate the broker integration harness run their available Rust
