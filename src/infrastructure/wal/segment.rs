@@ -1,9 +1,78 @@
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()
+    }
+
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "WAL directory synchronization is unsupported on this platform",
+        ))
+    }
+}
+
+pub(super) fn create_wal_directory(dir: &Path) -> Result<()> {
+    let mut missing_parents = Vec::new();
+    let mut current = dir;
+    loop {
+        match fs::metadata(current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                missing_parents.push(parent.to_path_buf());
+                current = parent;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("checking WAL directory {}", current.display()));
+            }
+        }
+    }
+
+    fs::create_dir_all(dir).with_context(|| format!("creating WAL directory {}", dir.display()))?;
+    if missing_parents.is_empty() {
+        if let Some(parent) = dir.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            sync_directory(parent)
+                .with_context(|| format!("syncing WAL parent directory {}", parent.display()))?;
+        }
+    } else {
+        for parent in missing_parents.iter().rev() {
+            sync_directory(parent)
+                .with_context(|| format!("syncing WAL parent directory {}", parent.display()))?;
+        }
+    }
+    Ok(())
+}
 
 pub fn segment_filename(id: u64) -> String {
     format!("{id:020}.log")

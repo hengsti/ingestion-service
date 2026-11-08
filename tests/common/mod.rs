@@ -7,9 +7,12 @@ use rumqttc::{AsyncClient, MqttOptions};
 use tempfile::TempDir;
 
 use smarthome_ingest::{
+    config::routes,
     infrastructure::{
         cache::state::CacheState,
-        router::{Route, Router},
+        operations::{ForwarderState, Operations},
+        quarantine::Quarantine,
+        router::RouteSet,
         sink::{influx::InfluxEncoder, Encoder},
         source::{mqtt::MqttDlqPublisher, DlqPublisher},
         wal::{
@@ -18,35 +21,30 @@ use smarthome_ingest::{
             wal::Wal,
         },
     },
-    model::messages::message::MessageType,
     pipeline::{
         runner::PipelineRunner,
         stages::{
             cache_update::CacheUpdateStage, decode::DecodeStage, dlq::DlqPublishStage,
-            observe::ObserveStage, persist::PersistStage, transform::TransformStage,
-            validate_business::ValidateBusinessStage, validate_raw::ValidateRawStage,
+            observe::ObserveStage, persist::PersistStage, telemetry_mapping::TelemetryMappingStage,
+            validate_output::ValidateOutputStage, validate_raw::ValidateRawStage,
         },
     },
 };
 
-const SENSOR_SCHEMA: &str = include_str!("../../schema/sensor.schema.json");
-const STATUS_SCHEMA: &str = include_str!("../../schema/status.schema.json");
-
-pub fn build_router() -> Arc<Router> {
-    let sensor = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
-    let status = Route::new(MessageType::Status, STATUS_SCHEMA, "smarthome/+/status").unwrap();
-    Arc::new(Router::new().add_route(sensor).add_route(status))
-}
-
-pub fn build_non_strict_router() -> Arc<Router> {
-    let sensor = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
-    let status = Route::new(MessageType::Status, STATUS_SCHEMA, "smarthome/+/status").unwrap();
-    Arc::new(
-        Router::new()
-            .strict(false)
-            .add_route(sensor)
-            .add_route(status),
-    )
+/// Builds operational snapshots for HTTP fixtures without starting external services.
+pub fn http_operations(
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    forwarder_alive: bool,
+    wal: Arc<smarthome_ingest::infrastructure::wal::capacity::Capacity>,
+    quarantine: Arc<smarthome_ingest::infrastructure::wal::capacity::Capacity>,
+) -> Arc<Operations> {
+    let forwarder = Arc::new(ForwarderState::default());
+    forwarder
+        .liveness_handle()
+        .store(forwarder_alive, std::sync::atomic::Ordering::Relaxed);
+    let operations = Arc::new(Operations::new(ready, forwarder, wal, quarantine));
+    operations.update_admission(1, 1, 0);
+    operations
 }
 
 /// A client whose internal eventloop is dropped so that publish fails gracefully.
@@ -71,6 +69,7 @@ pub async fn open_temp_wal() -> (Arc<Wal>, WalSubscription, TempDir) {
     let tmp = tempfile::tempdir().expect("create temp WAL dir");
     let (wal, sub) = Wal::open(WalOptions {
         dir: tmp.path().to_path_buf(),
+        max_bytes: 128 * 1024 * 1024,
         segment_bytes: 1024 * 1024,
         queue_capacity: 1_000,
     })
@@ -90,21 +89,51 @@ pub fn influx_encoder() -> Arc<dyn Encoder> {
 /// Returns the runner, the WAL subscription (to assert on persisted events),
 /// the cache state, and the backing `TempDir` (keep alive for the test).
 pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
-    let router = build_router();
+    let routes_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/routes.json");
+    let routes = Arc::new(
+        RouteSet::compile(
+            routes::load(routes_path).expect("load configured routes"),
+            "smarthome/_dlq/ingest",
+        )
+        .expect("compile configured routes"),
+    );
+    build_pipeline_with_routes(routes).await
+}
+
+pub async fn build_pipeline_with_routes(
+    routes: Arc<RouteSet>,
+) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
+    build_pipeline_with_routes_and_encoder(routes, influx_encoder()).await
+}
+
+pub async fn build_pipeline_with_routes_and_encoder(
+    routes: Arc<RouteSet>,
+    encoder: Arc<dyn Encoder>,
+) -> (PipelineRunner, WalSubscription, CacheState, TempDir) {
     let cache = CacheState::new(60_000, 64);
     let (wal, sub, tmp) = open_temp_wal().await;
+    let (quarantine, quarantine_subscription) = Quarantine::open(WalOptions {
+        dir: tmp.path().join("quarantine"),
+        max_bytes: 16 * 1024 * 1024,
+        segment_bytes: 1024 * 1024,
+        queue_capacity: 1_000,
+    })
+    .await
+    .expect("open quarantine journal");
+    drop(quarantine_subscription);
 
     let pipeline = PipelineRunner::new()
         .add_stage(DecodeStage::new())
-        .add_stage(ValidateRawStage::new(router.clone(), false))
-        .add_stage(TransformStage::new(router.clone()))
-        .add_stage(ValidateBusinessStage::new().unwrap())
+        .add_stage(ValidateRawStage::new(routes))
+        .add_stage(TelemetryMappingStage::new())
+        .add_stage(ValidateOutputStage::new(encoder.clone()))
         .add_stage(CacheUpdateStage::new(cache.clone()))
-        .add_stage(PersistStage::new(wal, influx_encoder()))
+        .add_stage(PersistStage::new(wal, encoder))
         .add_stage(ObserveStage::new())
         .with_failure_stage(DlqPublishStage::new(
             dlq_publisher(),
             "smarthome/_dlq/ingest",
+            Arc::new(quarantine),
         ));
 
     (pipeline, sub, cache, tmp)
@@ -113,11 +142,11 @@ pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, T
 /// Pulls the next persisted event from the WAL, returning `None` if none
 /// arrives within `ms` milliseconds (used to assert "nothing was persisted").
 pub async fn recv_event(sub: &mut WalSubscription, ms: u64) -> Option<WalEvent> {
-    tokio::time::timeout(Duration::from_millis(ms), sub.next())
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.event)
+    match tokio::time::timeout(Duration::from_millis(ms), sub.next()).await {
+        Ok(Ok(Some(entry))) => Some(entry.event),
+        Ok(Ok(None)) | Err(_) => None,
+        Ok(Err(error)) => panic!("WAL subscription failed: {error:#}"),
+    }
 }
 
 pub fn valid_sensor_payload(device_id: &str) -> Vec<u8> {

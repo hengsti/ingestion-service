@@ -1,33 +1,66 @@
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::model::messages::message::HandledMessage;
+use crate::{
+    infrastructure::router::CompiledRoute, model::messages::telemetry::TelemetryRecord,
+    pipeline::outcome::DeferredReason,
+};
 
-#[derive(Debug)]
+const MAX_DLQ_REASON_BYTES: usize = 4096;
+
 pub struct PipelineContext {
     topic: String,
     raw_payload: Bytes,
+    received_at_ms: i64,
+    receive_sequence: u64,
+    retained: bool,
+    qos: u8,
     payload_utf8: Option<String>,
     payload_json: Option<Value>,
-    handled_message: Option<HandledMessage>,
-    dlq_reason: Option<String>,
-    ignored_reason: Option<String>,
+    route: Option<Arc<CompiledRoute>>,
+    telemetry_record: Option<TelemetryRecord>,
+    rejection_reason: Option<String>,
+    deferred_reason: Option<DeferredReason>,
+    output_stored: bool,
     started_at: Instant,
 }
 
 impl PipelineContext {
+    /// Creates a context for locally constructed messages with current receive time.
+    #[allow(dead_code)]
     pub fn new(topic: impl Into<String>, raw_payload: impl Into<Bytes>) -> Self {
+        Self::new_with_metadata(
+            topic,
+            raw_payload,
+            chrono::Utc::now().timestamp_millis(),
+            false,
+        )
+    }
+
+    /// Creates a context with metadata captured by the input source.
+    pub fn new_with_metadata(
+        topic: impl Into<String>,
+        raw_payload: impl Into<Bytes>,
+        received_at_ms: i64,
+        retained: bool,
+    ) -> Self {
         Self {
             topic: topic.into(),
             raw_payload: raw_payload.into(),
+            received_at_ms,
+            receive_sequence: 0,
+            retained,
+            qos: 0,
             payload_utf8: None,
             payload_json: None,
-            handled_message: None,
-            dlq_reason: None,
-            ignored_reason: None,
+            route: None,
+            telemetry_record: None,
+            rejection_reason: None,
+            deferred_reason: None,
+            output_stored: false,
             started_at: Instant::now(),
         }
     }
@@ -38,6 +71,36 @@ impl PipelineContext {
 
     pub fn raw_payload(&self) -> &[u8] {
         &self.raw_payload
+    }
+
+    /// Returns the receive time captured at intake.
+    pub fn received_at_ms(&self) -> i64 {
+        self.received_at_ms
+    }
+
+    /// Sets the source-assigned intake order for cache update ordering.
+    pub fn set_receive_sequence(&mut self, receive_sequence: u64) {
+        self.receive_sequence = receive_sequence;
+    }
+
+    /// Returns the source-assigned intake order.
+    pub fn receive_sequence(&self) -> u64 {
+        self.receive_sequence
+    }
+
+    /// Returns whether the broker marked the source message as retained.
+    pub fn retained(&self) -> bool {
+        self.retained
+    }
+
+    /// Returns the transport QoS level captured at intake.
+    pub fn qos(&self) -> u8 {
+        self.qos
+    }
+
+    /// Sets the transport QoS level captured at intake.
+    pub fn set_qos(&mut self, qos: u8) {
+        self.qos = qos;
     }
 
     pub fn started_at(&self) -> Instant {
@@ -65,44 +128,84 @@ impl PipelineContext {
             .ok_or_else(|| anyhow!("payload_json missing in pipeline context"))
     }
 
-    pub fn payload_json_mut(&mut self) -> Result<&mut Value> {
-        self.payload_json
-            .as_mut()
-            .ok_or_else(|| anyhow!("payload_json missing in pipeline context"))
+    /// Stores the compiled route selected during raw validation.
+    pub fn set_route(&mut self, route: Arc<CompiledRoute>) {
+        self.route = Some(route);
     }
 
-    pub fn set_handled_message(&mut self, msg: HandledMessage) {
-        self.handled_message = Some(msg);
+    /// Returns the selected compiled route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if route selection has not completed.
+    pub fn route(&self) -> Result<&CompiledRoute> {
+        self.route
+            .as_deref()
+            .ok_or_else(|| anyhow!("selected route missing in pipeline context"))
     }
 
-    pub fn handled_message(&self) -> Result<&HandledMessage> {
-        self.handled_message
+    /// Returns the selected route identifier, if route selection completed.
+    pub fn route_id(&self) -> Option<&str> {
+        self.route.as_deref().map(CompiledRoute::id)
+    }
+
+    /// Stores the mapped and calculated telemetry record.
+    pub fn set_telemetry_record(&mut self, record: TelemetryRecord) {
+        self.telemetry_record = Some(record);
+    }
+
+    /// Returns the mapped and calculated telemetry record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if mapping has not completed.
+    pub fn telemetry_record(&self) -> Result<&TelemetryRecord> {
+        self.telemetry_record
             .as_ref()
-            .ok_or_else(|| anyhow!("handled_message missing in pipeline context"))
+            .ok_or_else(|| anyhow!("telemetry_record missing in pipeline context"))
     }
 
-    pub fn mark_dlq(&mut self, reason: impl Into<String>) {
-        if self.dlq_reason.is_none() {
-            self.dlq_reason = Some(reason.into());
+    /// Marks the input as invalid and eligible for durable quarantine.
+    pub fn mark_rejection(&mut self, reason: impl Into<String>) {
+        if self.rejection_reason.is_none() {
+            let mut reason = reason.into();
+            if reason.len() > MAX_DLQ_REASON_BYTES {
+                let mut end = MAX_DLQ_REASON_BYTES;
+                while !reason.is_char_boundary(end) {
+                    end -= 1;
+                }
+                reason.truncate(end);
+            }
+            self.rejection_reason = Some(reason);
         }
     }
 
-    pub fn dlq_reason(&self) -> Option<&str> {
-        self.dlq_reason.as_deref()
+    /// Marks an operational failure that must not be stored as an input rejection.
+    pub(crate) fn mark_deferred(&mut self, reason: DeferredReason) {
+        self.deferred_reason = Some(reason);
     }
 
-    pub fn should_publish_dlq(&self) -> bool {
-        self.dlq_reason.is_some()
+    /// Marks that the persistence stage received confirmation of a durable append.
+    pub(crate) fn mark_output_stored(&mut self) {
+        self.output_stored = true;
     }
 
-    pub fn mark_ignored(&mut self, reason: impl Into<String>) {
-        if self.ignored_reason.is_none() {
-            self.ignored_reason = Some(reason.into());
-        }
+    pub(crate) fn deferred_reason(&self) -> Option<DeferredReason> {
+        self.deferred_reason
     }
 
-    pub fn ignored_reason(&self) -> Option<&str> {
-        self.ignored_reason.as_deref()
+    pub(crate) fn output_stored(&self) -> bool {
+        self.output_stored
+    }
+
+    /// Returns the reason the input was marked for quarantine, if any.
+    pub fn rejection_reason(&self) -> Option<&str> {
+        self.rejection_reason.as_deref()
+    }
+
+    /// Returns whether deterministic rejection requires quarantine.
+    pub fn should_quarantine(&self) -> bool {
+        self.rejection_reason.is_some()
     }
 
     pub fn payload_for_dlq(&self) -> String {
@@ -114,5 +217,32 @@ impl PipelineContext {
             Ok(s) => s.to_string(),
             Err(_) => "<non-utf8>".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::outcome::DeferredReason;
+
+    #[test]
+    fn test_mark_rejection_reason_truncates_at_utf8_boundary() {
+        let mut ctx = PipelineContext::new("topic", Vec::<u8>::new());
+        ctx.mark_rejection("é".repeat(3000));
+
+        assert_eq!(ctx.rejection_reason().map(str::len), Some(4096));
+    }
+
+    #[test]
+    fn test_deferred_operational_failure_is_not_a_rejection() {
+        let mut ctx = PipelineContext::new("topic", Vec::<u8>::new());
+
+        ctx.mark_deferred(DeferredReason::PersistenceFailure);
+
+        assert_eq!(
+            ctx.deferred_reason(),
+            Some(DeferredReason::PersistenceFailure)
+        );
+        assert!(!ctx.should_quarantine());
     }
 }

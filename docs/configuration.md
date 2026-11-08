@@ -1,6 +1,8 @@
 # Configuration Reference
 
-All runtime configuration is supplied through environment variables. Empty strings are treated as unset because `Config::from_env` trims values and filters empty results.
+Runtime settings are supplied through environment variables. Empty strings are treated as unset.
+The required `INGEST_ROUTES_FILE` points to the versioned route bundle; route and schema paths
+inside the bundle are resolved relative to the bundle file.
 
 ## Input source
 
@@ -10,30 +12,103 @@ All runtime configuration is supplied through environment variables. Empty strin
 
 The service ingests messages through a swappable `Source` abstraction (see `docs/architecture.md`). `INPUT_SOURCE` selects which implementation `build_source()` constructs at startup. Adding a new transport (e.g. Kafka) means adding a new `InputSourceKind` variant and a matching `Source`/`DlqPublisher` pair — no changes to `main.rs`'s wiring are required beyond that.
 
+## Route bundle
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `INGEST_ROUTES_FILE` | Yes | None | Path to the v1 JSON route bundle. Subscriptions, schemas, mapping, calculations, output validation, measurements, and cache opt-in are loaded from this file. |
+
+The shipped bundle is [`config/routes.json`](../config/routes.json). It is compiled once at startup;
+an empty route list or invalid route/schema fails startup. Schema-resource paths are relative to the
+bundle's directory. Keep the bundle and every referenced schema file together when deploying; the
+repository's firmware bundle stores its schemas under `config/schemas/`. The image includes the
+repository bundle at `/app/config`; Compose can override it with a complete read-only bind mount.
+
+Every subscribed topic, including firmware sensor and status traffic, must be represented by one
+route in this bundle. The firmware sensor filter is `smarthome/+/bme680`; the status filter is
+`smarthome/+/status`. Their measurements, schemas, mappings, calculations, and cache policy are in
+[`config/routes.json`](../config/routes.json). For a complete synthetic route and payload, see
+[`config/examples/climate`](../config/examples/climate/README.md).
+
+The former `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other non-DLQ `MQTT_TOPIC_*` variables, and
+`ENFORCE_TOPIC_DEVICE_MATCH` are rejected at startup with a migration hint to use the route bundle.
+Do not set them alongside `INGEST_ROUTES_FILE`; use the
+[stopped-ingest filter/session migration procedure](operations.md#route-changes-and-subscription-migration)
+when adopting the unified route bundle with a resumed persistent broker session.
+
+### Static preflight
+
+Run the same required-environment, journal-budget, route, schema, calculation, and output-type
+checks as startup without connecting to MQTT or InfluxDB, opening journal directories, or binding
+HTTP listeners:
+
+```bash
+./target/release/smarthome-ingest --check-config
+```
+
+For the deployed Compose environment and its read-only `config/` mount:
+
+```bash
+docker compose run --rm --no-deps ingest /app/smarthome-ingest --check-config
+```
+
+Both commands require the normal runtime environment variables to be set. To validate the
+synthetic route example instead, set `INGEST_ROUTES_FILE` to
+`config/examples/climate/routes.json` (or `/app/config/examples/climate/routes.json` in the
+container). The example's route-bundle version and environment-variable reference are in
+[`config/examples/climate/README.md`](../config/examples/climate/README.md).
+
+This is static validation only. It does not prove that credentials work, the broker's
+persistence/expiry/queue settings are correct, journal storage is writable, or target hardware
+has sufficient capacity. Runtime storage preflight and operational evidence are still required.
+This boundary follows the [side-effect-free preflight contract in issue #41](https://github.com/hengsti/ingestion-service/issues/41).
+
 ## MQTT
 
-The `MQTT_HOST` / `MQTT_PORT` / `MQTT_USERNAME` / `MQTT_PASSWORD` / `MQTT_CLIENT_ID` / `MQTT_TOPIC_*` variables below are **only required when `INPUT_SOURCE=mqtt`** — `Config::from_env` parses all of them, including topic/route definitions, inside the `InputSourceKind::Mqtt` arm. `MQTT_TOPIC_*` values are stored generically as `Config::topic_routes` (keyed by suffix, e.g. `SENSOR`/`STATUS`/`DLQ`), which the transport-agnostic `Router` consumes without any knowledge of MQTT or environment variable naming — a future Kafka source would populate the same `topic_routes` map from its own `KAFKA_TOPIC_*` convention.
+The broker variables below are required only when `INPUT_SOURCE=mqtt`. MQTT subscriptions come
+exclusively from the compiled route bundle. `MQTT_TOPIC_DLQ` remains required and is only used as
+the publish destination for rejected messages; it is not a subscription.
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
 | `MQTT_HOST` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker host |
 | `MQTT_PORT` | Only if `INPUT_SOURCE=mqtt` | None | MQTT broker port as `u16` |
-| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Base client id. The service appends `-<unix_timestamp>` at startup only when `MQTT_CLEAN_SESSION=true`; otherwise it is used verbatim |
-| `MQTT_CLEAN_SESSION` | No | `true` | Boolean. `false` requests a persistent session: the client id is used verbatim and the broker queues QoS 1 messages while ingest is offline |
+| `MQTT_CLIENT_ID` | Only if `INPUT_SOURCE=mqtt` | None | Stable client id used verbatim for the required persistent MQTT session |
+| `MQTT_CLEAN_SESSION` | No | `false` | Boolean. `true` is rejected; durable intake requires a persistent session so the broker can queue QoS 1 messages while ingest is offline |
 | `MQTT_USERNAME` | No | None | Optional MQTT username |
 | `MQTT_PASSWORD` | No | None | Optional MQTT password |
-| `MQTT_TOPIC_SENSOR` | Expected | None | Sensor subscription and route, for example `smarthome/+/sensor` |
-| `MQTT_TOPIC_STATUS` | Optional | None | Status subscription and route, for example `smarthome/+/status` |
 | `MQTT_TOPIC_DLQ` | Yes at runtime | None | DLQ publish topic |
-| `ENFORCE_TOPIC_DEVICE_MATCH` | Yes | None | Boolean. When `true`, payload `device_id` must match the device id extracted from the topic |
 
-At least one `MQTT_TOPIC_<NAME>` variable must be set for config parsing. `MQTT_TOPIC_DLQ` is required later during startup because the DLQ stage needs a publish topic.
+The MQTT client enforces a fixed 128 KiB maximum wire-packet size, including packet headers,
+topic, and payload. The application rejects payloads larger than 64 KiB before JSON decoding;
+messages between these limits can be received and durably quarantined as oversized. Packets
+above the MQTT wire limit are outside the local quarantine guarantee. Rejection reasons are
+bounded to 4,096 UTF-8 bytes; quarantine journal capacity is separately bounded by
+`QUARANTINE_MAX_BYTES`.
 
 With `MQTT_CLEAN_SESSION=false`, a client id must be used by only one ingest instance at a time. A second instance with the same id takes over the session from the first.
 
-A persistent session also keeps its subscriptions on the broker. The service subscribes to the current `MQTT_TOPIC_*` filters on every connect but never unsubscribes. If you remove or change a topic filter, the old subscription stays active, and its messages have no route, so they go to the DLQ. When you change topic filters, also change `MQTT_CLIENT_ID` (for example `smarthome-ingest-v2`) to start a fresh session. The broker discards the old session after its session expiry.
+The source reconciles the route bundle's filters at startup and after reconnect. A synced,
+two-slot subscription manifest in `WAL_DIR` records the broker/client identity and known filters;
+each slot is limited to 16 KiB within the WAL metadata reserve. The
+service persists the union of known and desired filters before changing the broker session, then
+reports ready only after the current filters receive QoS 1 grants and obsolete filters are
+acknowledged as unsubscribed. Messages already queued or in flight for removed filters can still
+arrive; unmatched messages are durably rejected and may also be published to the DLQ.
 
-Unknown `MQTT_TOPIC_*` keys are not routed. They are still subscribed if they do not end in `DLQ`, so avoid unknown topic keys in production.
+MQTT 3.1.1 cannot enumerate subscriptions in a resumed session. If a persistent session predates
+the manifest, startup fails closed until an operator verifies and supplies the old filters. See
+[route changes and subscription migration](operations.md#route-changes-and-subscription-migration).
+Do not delete the manifest or replace the broker session as a shortcut; either can hide queued
+work.
+
+The durable intake contract requires publisher QoS 1, the stable unique client ID, a persistent
+broker session, retained broker state, and explicitly sized broker session expiry and per-client
+queue/storage limits. PUBACK is eligible only after the output WAL or quarantine record is synced;
+queue or journal pressure leaves input unacknowledged. If broker expiry or capacity is exceeded,
+the broker may discard messages and replay is no longer guaranteed. A persistent session is
+bounded storage, not a lossless-delivery guarantee. See the
+[broker deployment prerequisites](../config/examples/deployment/README.md).
 
 ## InfluxDB
 
@@ -65,7 +140,7 @@ The service persists messages through a swappable `Sink`/`Encoder` pair (see `do
 | Variable | Required | Default | Description |
 |---|---:|---|---|
 | `BATCH_SIZE` | Yes | None | Maximum WAL entries per sink write |
-| `FLUSH_INTERVAL_MS` | Yes | None | Time trigger for partial WAL batches |
+| `FLUSH_INTERVAL_MS` | Yes | None | Positive time trigger for partial WAL batches |
 
 Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a smaller `FLUSH_INTERVAL_MS` for lower end-to-end latency.
 
@@ -73,11 +148,47 @@ Use a larger `BATCH_SIZE` for higher throughput and fewer HTTP writes. Use a sma
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `WAL_DIR` | Yes | None | Directory for WAL segment files and `commit.cursor` |
+| `WAL_DIR` | Yes | None | Directory for WAL segments, `commit.cursor`, and the MQTT subscription manifest |
+| `WAL_MAX_BYTES` | Yes | None | Maximum accounted WAL bytes, including pending appends and metadata reserves |
 | `WAL_SEGMENT_BYTES` | No | `67108864` | Segment rotation threshold in bytes |
-| `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer |
+| `WAL_QUEUE_CAPACITY` | No | `16384` | Capacity of the bounded channel into the WAL writer; must be greater than zero |
+| `QUARANTINE_DIR` | Yes | None | Separate, exclusively owned journal for rejected input |
+| `QUARANTINE_MAX_BYTES` | Yes | None | Maximum accounted bytes for the quarantine journal |
 
-Use persistent local storage for `WAL_DIR` in production. The WAL buffers sink outages (InfluxDB today) and replays uncommitted records after restart.
+Use separate writable, persistent local directories for `WAL_DIR` and `QUARANTINE_DIR`.
+The service acquires an OS-backed exclusive lock and checks file creation, writing, syncing,
+renaming, and reading in each directory before starting MQTT. Rejected messages are synced to
+the quarantine journal before the supplementary MQTT DLQ publish. Locks are advisory and require
+a filesystem that supports them; all journal users must honor the same lock file. Do not remove
+`.journal.lock` while a process may still own the directory.
+
+Both byte limits must be positive and at least:
+
+```text
+65536 + 2 * (max(WAL_SEGMENT_BYTES, 1048580) + 4096) + 4096
+```
+
+The minimum provides room for a retained segment, an empty post-rotation segment, one maximum
+1 MiB record plus its four-byte frame header, and metadata. With the default segment size it is
+134295552 bytes. Existing journal metadata or a recovered retained segment larger than the
+configured segment size can require a larger WAL limit; startup reports the computed minimum.
+
+Accounting covers segment file lengths, existing journal lock/cursor/probe file lengths, a
+4096-byte allowance per segment, a 65536-byte fixed metadata reserve, and reservations for queued
+appends. The reserve covers up to 32768 bytes of existing metadata while keeping at least 32768
+bytes for future housekeeping; existing metadata above that amount is charged on top,
+conservatively until restart. These are logical accounting limits, not filesystem quotas: other
+processes, filesystem allocation overhead, or a shared disk can still exhaust free space. Provision
+and monitor the underlying storage separately.
+
+When WAL capacity is exhausted, a pipeline worker keeps its current event and waits for committed
+segments to be reclaimed. Shutdown releases these pressure waits and gives workers and the
+forwarder a shared five-second drain deadline; unfinished input remains unacknowledged and
+uncommitted WAL entries remain available for replay.
+For QoS 1 messages, MQTT acknowledgement is deferred until the output WAL or quarantine append is
+durable. A full input queue leaves the message unacknowledged; persistent broker sessions are
+required for redelivery after a disconnect. QoS 0 and clean-session operation do not provide
+crash-safe broker redelivery, so these limits do not provide end-to-end delivery guarantees.
 
 ## Input Queue
 
@@ -91,17 +202,19 @@ The service divides `INPUT_QUEUE_CAPACITY` by worker count to create one bounded
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `CACHE_BIND` | Yes | None | Cache API bind address, for example `0.0.0.0:8085` |
-| `CACHE_TTL_MS` | Yes | None | Age threshold used to mark cached sensor states as stale |
-| `CACHE_BUFFER` | Yes | None | Maximum cached sensor devices and SSE broadcast buffer size |
-| `METRICS_BIND` | Yes | None | Prometheus endpoint bind address, for example `0.0.0.0:9090` |
+| `CACHE_BIND` | Yes | None | Cache API bind address, for example `0.0.0.0:8085` or `localhost:8085` |
+| `CACHE_TTL_MS` | Yes | None | Age threshold used to mark cached device states as stale |
+| `CACHE_BUFFER` | Yes | None | Positive maximum cached devices and SSE broadcast buffer size |
+| `METRICS_BIND` | Yes | None | Prometheus socket address with a numeric IP, for example `0.0.0.0:9090` |
 
 `CACHE_BUFFER` is used for two limits:
 
-- Maximum number of sensor devices retained in the cache.
+- Maximum number of devices retained in the latest-state cache.
 - Number of events retained in the SSE broadcast channel.
 
-When the sensor cache is full and a new device arrives, the stalest cached device is evicted.
+Only routes with `cache: true` update the cache. When it is full, a new device replaces the
+least recently received entry only if its receive sequence is newer; older delayed records
+are ignored by the cache but continue through the pipeline.
 
 ## Docker Compose
 
@@ -109,21 +222,31 @@ When the sensor cache is full and a new device arrives, the stalest cached devic
 
 | Variable | Required | Used for |
 |---|---:|---|
-| `INGEST_TAG` | Yes | Image tag: a release tag (`v1.2.3`) or `sha-<12hex>`. CD rewrites it in the stack `.env` |
-| `GHCR_OWNER` | Yes | Image owner in `ghcr.io/<owner>/ingestion-service` |
+| `INGEST_IMAGE` | Yes | Immutable image reference; deployment uses a registry digest |
+| `INGEST_CONFIG_DIR` | No | Complete route/schema bundle mounted read-only at `/app/config`; defaults to `./config` |
 | `INFLUX_TOKEN` | Yes | Passed to the container. Never commit it |
 | `MQTT_HOST` | Yes | Broker hostname |
 | `MQTT_PORT` | Yes | Broker port |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Passed to the container only when set |
 | `INFLUX_URL` | Yes | InfluxDB URL |
 | `INFLUX_ORG` / `INFLUX_BUCKET` | Yes | |
+| `WAL_MAX_BYTES` / `QUARANTINE_MAX_BYTES` | Yes | Independent journal byte limits |
 | `RUST_LOG` | Yes | Log filter, e.g. `info` |
 
-`WAL_DIR` is `/data/wal`, and the `wal` named volume is mounted at that path. Keep the two in sync. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set, so the code defaults apply. The image `HEALTHCHECK` is used as-is.
+`WAL_DIR` is `/data/wal` and `QUARANTINE_DIR` is `/data/quarantine`; each has a matching named
+volume. Keep paths and mounts aligned. `WAL_SEGMENT_BYTES` and `WAL_QUEUE_CAPACITY` are not set,
+so the code defaults apply. The image `HEALTHCHECK` is used as-is.
+
+Compose mounts the complete `INGEST_CONFIG_DIR` read-only at `/app/config` and sets
+`INGEST_ROUTES_FILE=/app/config/routes.json`. For deployment, keep the full bundle under
+`/opt/smarthome-ingest/config` as described in [Releasing and Deploying](releasing.md); all schema
+files referenced by `routes.json` must be present in that same bundle. CD snapshots the bundle,
+preflights the candidate image against it, and rolls back the image/config pair together. The
+workflow never merges the repository's config files into the host bundle.
 
 CI renders the file with `docker compose config` and compares its `environment` keys with the variables read in `src/config.rs`. A variable that the code does not read, or a missing required variable, fails the build. Update `compose.yaml`, `src/config.rs`, and this page together.
 
-See [Operations](operations.md#run-with-docker-compose) for standalone use and inclusion in the Server stack.
+See [Operations](operations.md#run-with-docker-compose) for standalone use.
 
 ## Logging
 
@@ -149,9 +272,8 @@ INPUT_SOURCE=mqtt
 MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_CLIENT_ID=smarthome-ingest
-MQTT_TOPIC_SENSOR=smarthome/+/sensor
-MQTT_TOPIC_STATUS=smarthome/+/status
 MQTT_TOPIC_DLQ=smarthome/_dlq/ingest
+INGEST_ROUTES_FILE=./config/routes.json
 OUTPUT_SINK=influx
 INFLUX_URL=http://localhost:8086
 INFLUX_ORG=smarthome
@@ -160,7 +282,9 @@ INFLUX_TOKEN=change-me
 BATCH_SIZE=500
 FLUSH_INTERVAL_MS=1000
 WAL_DIR=./data/wal
-ENFORCE_TOPIC_DEVICE_MATCH=true
+WAL_MAX_BYTES=268435456
+QUARANTINE_DIR=./data/quarantine
+QUARANTINE_MAX_BYTES=268435456
 METRICS_BIND=0.0.0.0:9090
 CACHE_BIND=0.0.0.0:8085
 CACHE_TTL_MS=60000

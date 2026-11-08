@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "device_id": {
+      "type": "string"
+    },
+    "temperature": {
+      "type": "number"
+    },
+    "humidity": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "device_id",
+    "temperature",
+    "humidity"
+  ],
+  "additionalProperties": false
+}

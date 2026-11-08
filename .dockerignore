@@ -2,4 +2,6 @@
 !Cargo.toml
 !Cargo.lock
 !src/
-!schema/
+!config/
+!config/schemas/
+!config/schemas/*.json

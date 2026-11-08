@@ -1,0 +1,68 @@
+[
+  {
+    "id": "all-optional-fields",
+    "topic": "smarthome/esp32-1/status",
+    "retained": false,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 1700000000000,
+      "time_iso": "2023-11-14T22:13:20Z",
+      "time_valid": true,
+      "ip": "192.0.2.1",
+      "rssi": -65,
+      "uptime": 3600,
+      "free_mem": 200000,
+      "ssid": "HomeNet",
+      "queued": 1,
+      "dropped_total": 2,
+      "samples_failed_total": 3,
+      "mqtt_connects_total": 4,
+      "sensor_read_failures_total": 5,
+      "reset_reason": "brownout"
+    },
+    "legacy_line_protocol": "device_status,device_class=esp32p4-bme680,device_id=esp32-1 dropped_total=2i,firmware_version=\"1.0.0\",free_mem=200000i,ip_address=\"192.0.2.1\",mqtt_connects_total=4i,queued=1i,reset_reason=\"brownout\",rssi=-65i,samples_failed_total=3i,sensor_read_failures_total=5i,ssid=\"HomeNet\",time_valid=true,uptime=3600i 1700000000000",
+    "unified_line_protocol": "device_status,device_class=esp32p4-bme680,device_id=esp32-1 dropped_total=2i,firmware_version=\"1.0.0\",free_mem=200000i,ip_address=\"192.0.2.1\",mqtt_connects_total=4i,mqtt_retained=false,queued=1i,reset_reason=\"brownout\",rssi=-65i,samples_failed_total=3i,sensor_read_failures_total=5i,ssid=\"HomeNet\",time_iso=\"2023-11-14T22:13:20Z\",time_valid=true,uptime=3600i 1700000000000"
+  },
+  {
+    "id": "without-optional-fields",
+    "topic": "smarthome/esp32-1/status",
+    "retained": false,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 1700000000000,
+      "time_iso": "2023-11-14T22:13:20Z",
+      "time_valid": true,
+      "ip": "192.0.2.1",
+      "rssi": -65,
+      "uptime": 3600,
+      "free_mem": 200000,
+      "ssid": "HomeNet"
+    },
+    "legacy_line_protocol": "device_status,device_class=esp32p4-bme680,device_id=esp32-1 firmware_version=\"1.0.0\",free_mem=200000i,ip_address=\"192.0.2.1\",rssi=-65i,ssid=\"HomeNet\",time_valid=true,uptime=3600i 1700000000000",
+    "unified_line_protocol": "device_status,device_class=esp32p4-bme680,device_id=esp32-1 firmware_version=\"1.0.0\",free_mem=200000i,ip_address=\"192.0.2.1\",mqtt_retained=false,rssi=-65i,ssid=\"HomeNet\",time_iso=\"2023-11-14T22:13:20Z\",time_valid=true,uptime=3600i 1700000000000"
+  },
+  {
+    "id": "defaulted-uptime-memory-ssid",
+    "topic": "smarthome/esp32-1/status",
+    "retained": true,
+    "received_at_ms": 1700000000456,
+    "payload": {
+      "device_id": "esp32-1",
+      "device_class": "esp32p4-bme680",
+      "fw_version": "1.0.0",
+      "time_ms": 1700000000000,
+      "time_iso": "2023-11-14T22:13:20Z",
+      "time_valid": true,
+      "ip": "192.0.2.1",
+      "rssi": -65
+    },
+    "legacy_line_protocol": "device_status,device_class=esp32p4-bme680,device_id=esp32-1 firmware_version=\"1.0.0\",free_mem=0i,ip_address=\"192.0.2.1\",rssi=-65i,ssid=\"\",time_valid=true,uptime=0i 1700000000000",
+    "unified_line_protocol": "device_status,device_class=esp32p4-bme680,device_id=esp32-1 firmware_version=\"1.0.0\",free_mem=0i,ip_address=\"192.0.2.1\",mqtt_retained=true,rssi=-65i,ssid=\"\",time_iso=\"2023-11-14T22:13:20Z\",time_valid=true,uptime=0i 1700000000000"
+  }
+]

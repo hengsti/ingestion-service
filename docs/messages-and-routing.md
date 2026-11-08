@@ -1,258 +1,150 @@
 # Messages and Routing
 
-This document is the integration contract for MQTT publishers.
+The route bundle is the contract between MQTT publishers and the ingest pipeline.
+Set `INGEST_ROUTES_FILE` to the v1 JSON bundle; the shipped configuration is
+[`config/routes.json`](../config/routes.json). MQTT subscribes to the bundle's exact
+filters. Every subscribed topic, including firmware sensor and status topics, is a
+configured route. Route selection does not infer a message type from a topic suffix or
+publisher. Schema and schema-resource paths are relative to the bundle file.
 
-## Topics
+## Synthetic climate walkthrough
 
-Recommended topic layout:
+The tracked [`config/examples/climate`](../config/examples/climate/README.md) bundle is the
+copyable synthetic example. Its README includes a payload; `routes.json` selects
+`example/climate/+`, extracts the device ID from topic segment 2, freezes receive time,
+maps `/temp_c` and `/rel_hum_perc` as floats, and selects `dew_point`. Missing
+`/site_label` maps to the default `"unassigned"`; missing `/sensor_label` is omitted.
+`cache: false` is explicit. The raw and output schemas are in that bundle's `schemas/`
+directory, and the same bundle is covered by configuration-preflight tests.
 
-```text
-smarthome/<device_id>/sensor
-smarthome/<device_id>/status
-smarthome/_dlq/ingest
+Run the same static preflight used for startup after changing the example:
+
+```bash
+INGEST_ROUTES_FILE=./config/examples/climate/routes.json ./target/release/smarthome-ingest --check-config
 ```
 
-Recommended environment:
+The shipped firmware examples are in [`config/routes.json`](../config/routes.json):
+`firmware-sensor` subscribes to `smarthome/+/bme680`, writes `bme680`, and opts into
+cache; `firmware-status` subscribes to `smarthome/+/status`, writes `device_status`,
+and opts out. Their raw and output schemas live under `config/schemas/`.
 
-```text
-MQTT_TOPIC_SENSOR=smarthome/+/sensor
-MQTT_TOPIC_STATUS=smarthome/+/status
-MQTT_TOPIC_DLQ=smarthome/_dlq/ingest
-```
+## Route processing
 
-The route matcher supports `+` and `#` MQTT wildcards. `#` must be the final segment. The first `+` segment is treated as the device id position for `ENFORCE_TOPIC_DEVICE_MATCH=true`.
+For each subscribed message, the service:
 
-## Raw Sensor Message
+1. Enforces the 64 KiB input limit, decodes UTF-8 JSON, and selects the matching route.
+2. Validates the raw JSON against that route's schema.
+3. Maps configured JSON pointers into typed tags and fields, applies configured defaults,
+   and runs the route's named calculations.
+4. Adds the reserved `device_id` tag and `mqtt_retained` boolean field, validates the
+   normalized record against its output schema and runtime constraints, then encodes it.
+5. Appends the resulting line protocol to the WAL before forwarding it to InfluxDB.
 
-Raw sensor messages are validated against `schema/sensor.schema.json` plus `schema/base.schema.json`.
+At startup, routes with duplicate IDs, reserved or colliding tag/field names, collisions
+with calculated fields, or control characters in static output names or values are
+rejected. Mapping also limits copied data, including repeated uses of the same JSON
+pointer, to prevent a small input from expanding without bound.
 
-Required base fields:
+`device_id` may also be checked against an explicitly configured topic segment. This
+behavior is part of the selected route, not a global MQTT setting. The service captures
+the MQTT receive timestamp and retain flag once at intake; a configured timestamp mapping
+can use that frozen receive time when the payload timestamp is not valid.
 
-| Field | Type | Notes |
-|---|---|---|
-| `device_id` | string | Non-empty |
-| `device_class` | string | Non-empty |
-| `fw_version` | string | Non-empty |
-| `time_ms` | integer | Minimum `0` |
-| `time_iso` | string | Non-empty and parsed as RFC3339 by the router |
-| `time_valid` | boolean | Controls whether `time_ms` is used as the InfluxDB timestamp |
+## Shipped firmware routes
 
-Required sensor fields:
+The default bundle keeps the existing firmware subscriptions and Influx measurement names:
 
-| Field | Type | Notes |
-|---|---|---|
-| `room` | string | Room name |
-| `data.temp_c` | number | Temperature in Celsius |
-| `data.rel_hum_perc` | number | Relative humidity percentage |
-| `data.pressure_hpa` | number | Atmospheric pressure in hPa |
-| `data.gas_ohm` | number | Gas resistance in Ohms |
-| `data.altitude_m` | number | Approximate altitude in meters |
+| Route | MQTT filter | Measurement | Cache |
+|---|---|---|---:|
+| `firmware-sensor` | `smarthome/+/bme680` | `bme680` | Yes |
+| `firmware-status` | `smarthome/+/status` | `device_status` | No |
 
-Optional sensor fields:
+Both routes use raw and output schemas from `config/schemas/`. Sensor fields map from
+`data.*`; status fields map from the root payload. The status route's configured defaults
+remain `0` for missing `uptime`/`free_mem` and `""` for missing `ssid`. Optional fields
+remain absent if the publisher omits them. The firmware sensor route calculates dew point,
+heat index, and IAQ. It emits `iaq_score` and `iaq_text` together unless `warmed_up` is
+explicitly false.
 
-| Field | Type | Notes |
-|---|---|---|
-| `boot_id` | unsigned 32-bit integer | Identifies the device boot for a reading |
-| `seq` | unsigned 32-bit integer | Reading sequence number within a boot |
-| `warmed_up` | boolean | `false` while gas and derived IAQ readings are unreliable |
-| `replayed` | boolean | `true` when the reading came from the offline buffer; defaults to `false` |
+The same pipeline accepts routes for other device formats and topic layouts. A Zigbee or
+other JSON payload needs only a route entry with a filter, raw schema, identity, mappings,
+optional calculations/output schema, and measurement. There are no firmware-only runtime
+branches.
 
-Example:
+## Firmware compatibility and migration
 
-```json
-{
-  "device_id": "esp32-1",
-  "room": "living_room",
-  "device_class": "esp32p4-bme680",
-  "fw_version": "1.0.0",
-  "time_ms": 1700000000000,
-  "time_iso": "2023-11-14T22:13:20Z",
-  "time_valid": true,
-  "data": {
-    "temp_c": 22.5,
-    "rel_hum_perc": 45.0,
-    "pressure_hpa": 1013.25,
-    "gas_ohm": 50000.0,
-    "altitude_m": 500.0
-  }
-}
-```
+The unified route model replaces `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other
+non-DLQ `MQTT_TOPIC_*` routing variables, and `ENFORCE_TOPIC_DEVICE_MATCH`; these
+settings are rejected with a migration hint. Move every desired filter and identity rule
+into the versioned route bundle, including the firmware routes, then follow the
+[stopped-ingest filter/session migration procedure](operations.md#route-changes-and-subscription-migration).
+Do not clear a persistent broker session to force a route update. A resumed MQTT 3.1.1
+session cannot enumerate unknown old filters, and reconnect does not reconcile them
+without trusted filter history. Already queued or in-flight publications for a removed
+filter can still arrive and be rejected.
+Where the previous firmware deployment used the default `smarthome/+/sensor` filter,
+the shipped sensor route now uses `smarthome/+/bme680`; verify the actual old filters
+rather than assuming every deployment used that default.
 
-## Canonical Sensor Message
+The firmware routes preserve the `bme680` and `device_status` measurement names and
+existing tag/field names and types. Documented additions/deltas are the reserved
+`device_id` tag and `mqtt_retained` field on every route, `altitude_m` on `bme680`,
+`time_iso` as a string field on both firmware measurements, present optional booleans
+(including `replayed: false`), and the frozen receive time when `time_valid` is false.
+A valid payload timestamp of zero is rejected rather than replaced with server time.
+When `warmed_up` is false, both IAQ outputs are omitted. The validated payload `time_iso`
+is copied unchanged and also appears in the sensor cache; point timestamps still follow
+the configured `time_ms`/`time_valid` policy, including receive-time fallback.
+See the canonical [unified-route compatibility decision in issue #19](https://github.com/hengsti/ingestion-service/issues/19).
 
-The transform stage adds these fields under `data`:
+HomeKit continues to read cached `device_id`, `last_seen_ms`, and
+`value.{temp_c, rel_hum_perc, iaq_score, iaq_text}`. A retained sensor publication
+delivered by the broker can seed the process-local cache after subscription; cache
+contents are not persisted across process restarts and do not prove WAL or InfluxDB
+delivery. The `route` metric label replaces the old `kind=sensor|status` label; see
+[HTTP API and Metrics](http-and-metrics.md#dashboard-and-alert-compatibility).
 
-| Field | Type | Source |
-|---|---|---|
-| `dew_point_c` | number | Calculated from temperature and humidity |
-| `heat_index_c` | number | Calculated from temperature and humidity |
-| `iaq_score` | number | Calculated from gas resistance and humidity (see [IAQ Scale](#iaq-scale)) |
-| `iaq_text` | string | Human-readable air quality classification (see [IAQ Scale](#iaq-scale)) |
+## InfluxDB output
 
-Transform bounds:
+One encoder renders every normalized record. It writes the configured measurement, sorted
+tags and fields, and the record's validated epoch-millisecond timestamp using
+`precision=ms`. Values retain their configured types: floats, signed integers (`i`),
+unsigned integers (`u`), booleans, and quoted strings. Optional unmapped values are not
+fabricated. Existing Influx series and field names are preserved by the shipped route
+bundle; the `device_id` tag and `mqtt_retained` field are emitted for every route.
 
-| Field | Valid range |
-|---|---|
-| `data.rel_hum_perc` | `(0, 100]` |
-| `data.gas_ohm` | `> 0` |
-| `data.pressure_hpa` | `[300, 1200]` |
+Output validation rejects fields or tags that do not match the route, invalid timestamps,
+non-finite numbers, unsupported control characters, and an encoder size bound that exceeds
+the WAL reader's record limit. The bound is conservative and is checked before caching
+or encoding, so an output near the limit can be rejected even if its actual bytes would
+fit. Persistence checks the actual encoded size again before WAL append. Since each point
+has a frozen timestamp, re-encoding a record or replaying its saved WAL payload does not
+depend on InfluxDB server time.
 
-After transform, `schema/sensor.business.schema.json` requires the derived fields and disallows additional properties in the canonical object sections.
+InfluxDB merges writes that have the same measurement, tag set, and timestamp; fields in
+subsequent writes at that point can overwrite matching field keys. WAL replay can cause
+at-least-once write attempts, not exactly-once end-to-end delivery: a crash after a
+successful sink write but before cursor commit can replay the same point. A permanent
+database row per accepted input is not guaranteed. This route cutover does not change the
+separate delivery-outcome work tracked by #32.
 
-### IAQ Scale
+## Cache
 
-`iaq_score` ranges from `0` to `100`, and **higher is better**. This is not the BSEC convention (0–500, lower is better).
+Only routes with `cache: true` update the latest-state cache. Entries are keyed by the
+normalized `device_id`, replaced by newer records, and expose the typed record field map as
+`value`. The HTTP response envelopes and SSE `sensor` event name remain stable for existing
+HomeKit clients. Cache state is not a persistence or delivery receipt.
 
-- Humidity part, max `25`: full score at 38–42 %RH, decreasing linearly below and above that range.
-- Gas part, max `75`: linear between 5 kΩ (`0`) and 50 kΩ (`75`); `gas_ohm` is clamped to that range.
+## DLQ message
 
-`iaq_text` maps the score to a BSEC-style index `(100 - iaq_score) * 5` (0–500, lower is better):
-
-| Index | `iaq_score` | `iaq_text` |
-|---|---|---|
-| `[0, 51)` | `(89.8, 100]` | `Air quality is Good` |
-| `[51, 151)` | `(69.8, 89.8]` | `Air quality is Moderate` |
-| `[151, 176)` | `(64.8, 69.8]` | `Air quality is Unhealthy for Sensitive Groups` |
-| `[176, 201)` | `(59.8, 64.8]` | `Air quality is Unhealthy` |
-| `[201, 301)` | `(39.8, 59.8]` | `Air quality is Very Unhealthy` |
-| `[301, 500]` | `[0, 39.8]` | `Air quality is Hazardous` |
-
-Gas readings are unreliable until the sensor has warmed up. When a sensor message has `warmed_up=false`, `iaq_score` and `iaq_text` are not written to InfluxDB. Both are written when `warmed_up=true` or the flag is absent (legacy messages). Dew point and heat index are written regardless of warm-up state.
-
-## Raw Status Message
-
-Raw status messages are validated against `schema/status.schema.json` plus `schema/base.schema.json`.
-
-Required status fields:
-
-| Field | Type | Notes |
-|---|---|---|
-| `ip` | string | Current IP address |
-| `rssi` | integer | RSSI in dBm |
-
-The raw schema defines `uptime`, `free_mem`, and `ssid`, but does not require them. The transform stage fills missing values:
-
-| Field | Default |
-|---|---|
-| `uptime` | `0` |
-| `free_mem` | `0` |
-| `ssid` | `""` |
-
-Optional device health fields are retained when sent:
-
-| Field | Type | Notes |
-|---|---|---|
-| `queued` | integer | Readings waiting in the device queue |
-| `dropped_total` | integer | Readings dropped by the device |
-| `samples_failed_total` | integer | Publish failures |
-| `mqtt_connects_total` | integer | MQTT connections |
-| `sensor_read_failures_total` | integer | Sensor read failures |
-| `reset_reason` | string | Device reset reason |
-
-Example:
-
-```json
-{
-  "device_id": "esp32-1",
-  "device_class": "esp32p4-bme680",
-  "fw_version": "1.0.0",
-  "ip": "192.168.1.42",
-  "rssi": -65,
-  "time_ms": 1700000000000,
-  "time_iso": "2023-11-14T22:13:20Z",
-  "time_valid": true,
-  "uptime": 3600,
-  "free_mem": 200000,
-  "ssid": "HomeNet"
-}
-```
-
-## Canonical Status Message
-
-After transform, `schema/status.business.schema.json` requires:
-
-- `ip`
-- `rssi`
-- `uptime`
-- `free_mem`
-- `ssid`
-
-It also requires `uptime >= 0`, `free_mem >= 0`, and a non-empty `ip`.
-
-## String Normalization
-
-The transform stage trims whitespace around these root string fields:
-
-| Message | Fields |
-|---|---|
-| Sensor | `device_id`, `room`, `device_class`, `fw_version`, `time_iso` |
-| Status | `device_id`, `device_class`, `fw_version`, `ip`, `time_iso`, `ssid` |
-
-The cache lowercases and trims sensor `device_id` keys for lookup.
-
-## InfluxDB Mapping
-
-Sensor messages become measurement `bme680`.
-
-Tags:
-
-- `device_id`
-- `room`
-- `device_class`
-
-Fields:
-
-- `firmware_version`
-- `temp_c`
-- `rel_hum_perc`
-- `pressure_hpa`
-- `gas_ohm`
-- `dew_point_c`
-- `heat_index_c`
-- `iaq_score` (omitted when `warmed_up=false`)
-- `iaq_text` (omitted when `warmed_up=false`)
-- `time_valid`
-- `boot_id` (when present)
-- `seq` (when present)
-- `warmed_up` (when present)
-- `replayed` (when `true`)
-
-Status messages become measurement `device_status`.
-
-Tags:
-
-- `device_id`
-- `device_class`
-
-Fields:
-
-- `firmware_version`
-- `ip_address`
-- `time_valid`
-- `uptime`
-- `free_mem`
-- `ssid`
-- `rssi`
-- `queued` (when present)
-- `dropped_total` (when present)
-- `samples_failed_total` (when present)
-- `mqtt_connects_total` (when present)
-- `sensor_read_failures_total` (when present)
-- `reset_reason` (when present)
-
-For both message types, `time_ms` is written as the InfluxDB timestamp only when `time_valid=true` and `time_ms > 0`. Otherwise the timestamp is omitted and InfluxDB uses server time.
-
-`altitude_m` and status `time_iso` are not written to InfluxDB; they stay available through the cache HTTP API. Firmware and IP use the field keys `firmware_version` and `ip_address` so they never collide with the historical `fw_version`/`ip` tags.
-
-## DLQ Message
-
-When a pipeline stage rejects a message, the failure stage publishes JSON to `MQTT_TOPIC_DLQ` with QoS `AtLeastOnce`:
+Rejected messages are published to the configured `MQTT_TOPIC_DLQ` with QoS
+`AtLeastOnce`:
 
 ```json
 {
   "received_at": "2026-06-20T12:00:00+00:00",
-  "src_topic": "smarthome/esp32-1/sensor",
-  "error": "raw validation failed: schema validation failed: ...",
+  "src_topic": "smarthome/esp32-1/bme680",
+  "error": "raw validation failed: ...",
   "payload_raw": "{\"device_id\":\"esp32-1\"}"
 }
 ```

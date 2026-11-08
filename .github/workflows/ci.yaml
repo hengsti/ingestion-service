@@ -4,7 +4,12 @@ on:
   push:
     branches: ["master"]
   pull_request:
-    branches: ["master"]
+  workflow_call:
+    inputs:
+      revision:
+        description: Source revision to validate
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -17,6 +22,78 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  broker-integration:
+    name: Isolated EMQX and InfluxDB integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      INGEST_IT_PROJECT: ingest-it-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+
+      - name: Detect broker integration harness
+        id: broker
+        shell: bash
+        env:
+          VALIDATED_REVISION: ${{ inputs.revision }}
+        run: |
+          if [[ -f tests/compose.integration.yaml && -f tests/broker_integration.rs ]]; then
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          elif [[ -n "${VALIDATED_REVISION}" && "${VALIDATED_REVISION}" != "${GITHUB_SHA}" \
+            && ! -e tests/compose.integration.yaml && ! -e tests/broker_integration.rs ]]; then
+            echo "::notice::Historical revision predates the broker integration harness."
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::error::Broker integration harness is incomplete or missing."
+            exit 1
+          fi
+
+      - name: Install Rust 1.87.0
+        if: steps.broker.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Cache cargo
+        if: steps.broker.outputs.available == 'true'
+        uses: Swatinem/rust-cache@v2.8.1
+
+      - name: Render isolated Compose stack
+        if: steps.broker.outputs.available == 'true'
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" config --quiet
+
+      - name: Start isolated services
+        if: steps.broker.outputs.available == 'true'
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" up -d --wait --wait-timeout 180
+
+      - name: Run real-container tests
+        if: steps.broker.outputs.available == 'true'
+        run: cargo test --all-features --locked --test broker_integration -- --ignored --test-threads=1
+
+      - name: Collect bounded container logs
+        if: failure() && steps.broker.outputs.available == 'true'
+        run: |
+          mkdir -p target/broker-integration
+          docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" logs --no-color --tail 100 \
+            | tail -c 65536 > target/broker-integration/compose.log
+
+      - name: Preserve recovery evidence
+        if: always() && steps.broker.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/broker-integration/
+          retention-days: 7
+
+      - name: Remove successful test stack
+        if: success() && steps.broker.outputs.available == 'true'
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" down -v --remove-orphans
+
+      - name: Stop failed test stack without deleting its volumes
+        if: failure() && steps.broker.outputs.available == 'true'
+        run: docker compose -f ./tests/compose.integration.yaml -p "$INGEST_IT_PROJECT" down --remove-orphans
+
   test:
     name: Test Rust project
     runs-on: ubuntu-latest
@@ -24,6 +101,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.revision || github.sha }}
 
       - name: Install Rust 1.87.0
         uses: dtolnay/rust-toolchain@1.87.0
@@ -48,17 +127,25 @@ jobs:
     env:
       GHCR_OWNER: ci
       INGEST_TAG: ci
+      INGEST_IMAGE: ghcr.io/ci/ingestion-service@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      INGEST_CONFIG_DIR: ./config
       RUST_LOG: info
       MQTT_HOST: ci
       MQTT_PORT: "1883"
+      MQTT_TOPIC_DLQ: smarthome/_dlq/ci
+      INGEST_ROUTES_FILE: /app/config/routes.json
       INFLUX_URL: http://ci:8086
       INFLUX_ORG: ci
       INFLUX_BUCKET: ci
       INFLUX_TOKEN: ci
+      WAL_MAX_BYTES: "268435456"
+      QUARANTINE_MAX_BYTES: "268435456"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.revision || github.sha }}
 
       - name: Render compose.yaml
         run: docker compose -f compose.yaml config --quiet
@@ -70,14 +157,17 @@ jobs:
             | jq -r '.services.ingest.environment | keys[]' | sort -u)
           code_keys=$(grep -oE 'env_var\("[A-Z_]+"\)' src/config.rs \
             | sed -E 's/env_var\("([A-Z_]+)"\)/\1/' | sort -u)
-          # RUST_LOG is read by tracing, MQTT_TOPIC_* by prefix scan.
+          # Older revisions read MQTT_TOPIC_* by scanning the environment.
+          unread_exemptions='RUST_LOG'
+          if grep -Fq 'strip_prefixed(env::vars(), "MQTT_TOPIC_")' src/config.rs; then
+            unread_exemptions='RUST_LOG|MQTT_TOPIC_[A-Z_]+'
+          fi
           unread=$(comm -23 <(echo "$compose_keys") <(echo "$code_keys") \
-            | grep -vE '^(RUST_LOG|MQTT_TOPIC_[A-Z_]+)$' || true)
+            | grep -vxE "$unread_exemptions" || true)
           # Optional variables with code defaults may be omitted.
           missing=$(comm -13 <(echo "$compose_keys") <(echo "$code_keys") \
-            | grep -vxE 'WAL_SEGMENT_BYTES|WAL_QUEUE_CAPACITY' || true)
+            | grep -vxE 'RUST_LOG|WAL_SEGMENT_BYTES|WAL_QUEUE_CAPACITY|INPUT_QUEUE_CAPACITY|MQTT_CLEAN_SESSION' || true)
           if [[ -n "$unread$missing" ]]; then
             echo "::error file=compose.yaml::env drift. Unread by src/config.rs: [${unread//$'\n'/ }]. Missing from compose.yaml: [${missing//$'\n'/ }]"
             exit 1
           fi
-

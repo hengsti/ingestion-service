@@ -1,28 +1,25 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
-use tracing::{debug, warn};
-
 use metrics::{counter, histogram};
+use tracing::warn;
 
 use crate::{
-    infrastructure::router::Router,
+    infrastructure::router::RouteSet,
     pipeline::{
         context::PipelineContext,
         stage::{PipelineStage, StageFlow, StageResult},
     },
 };
 
+/// Selects and validates the configured route for each raw payload.
 pub struct ValidateRawStage {
-    router: Arc<Router>,
-    enforce_topic_device_match: bool,
+    routes: Arc<RouteSet>,
 }
 
 impl ValidateRawStage {
-    pub fn new(router: Arc<Router>, enforce_topic_device_match: bool) -> Self {
-        Self {
-            router,
-            enforce_topic_device_match,
-        }
+    /// Creates a stage using the compiled route set.
+    pub fn new(routes: Arc<RouteSet>) -> Self {
+        Self { routes }
     }
 }
 
@@ -37,70 +34,61 @@ impl PipelineStage for ValidateRawStage {
     ) -> Pin<Box<dyn Future<Output = StageResult> + Send + 'a>> {
         Box::pin(async move {
             let start = Instant::now();
-            let payload = ctx.payload_json()?;
+            let Some(route) = self.routes.select(ctx.topic()) else {
+                counter!("ingest_validate_raw_failed_total").increment(1);
+                ctx.mark_rejection("raw validation failed: no configured route for topic");
+                histogram!("ingest_validate_raw_duration_seconds", "result" => "failed")
+                    .record(start.elapsed().as_secs_f64());
+                return Ok(StageFlow::Stop);
+            };
+            ctx.set_route(route.clone());
 
-            let (result, result_label) = match self.router.validate_raw(
-                ctx.topic(),
-                payload,
-                self.enforce_topic_device_match,
-            ) {
-                Ok(Some(_message_type)) => {
+            match route.validate_raw(ctx.payload_json()?) {
+                Ok(()) => {
                     counter!("ingest_validate_raw_success_total").increment(1);
-
-                    (StageFlow::Continue, "success")
-                }
-                Ok(None) => {
-                    counter!("ingest_validate_raw_ignored_total").increment(1);
-                    debug!(topic = %ctx.topic(), "no matching route; stopping pipeline without DLQ");
-
-                    ctx.mark_ignored("no matching route");
-
-                    (StageFlow::Stop, "no_matching_route")
+                    histogram!("ingest_validate_raw_duration_seconds", "result" => "success")
+                        .record(start.elapsed().as_secs_f64());
+                    Ok(StageFlow::Continue)
                 }
                 Err(err) => {
                     counter!("ingest_validate_raw_failed_total").increment(1);
-                    warn!(topic = %ctx.topic(), error = %err, "raw validation failed; marking for DLQ");
-
-                    ctx.mark_dlq(format!("raw validation failed: {}", err));
-
-                    (StageFlow::Stop, "failed")
+                    warn!(
+                        topic = %ctx.topic(),
+                        route = %route.id(),
+                        "raw validation failed; marking for DLQ"
+                    );
+                    ctx.mark_rejection(format!("raw validation failed: {err}"));
+                    histogram!("ingest_validate_raw_duration_seconds", "result" => "failed")
+                        .record(start.elapsed().as_secs_f64());
+                    Ok(StageFlow::Stop)
                 }
-            };
-
-            histogram!("ingest_validate_raw_duration_seconds", "result" => result_label)
-                .record(start.elapsed().as_secs_f64());
-
-            Ok(result)
+            }
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
+    use anyhow::Result;
     use serde_json::{json, Value};
 
     use super::*;
     use crate::{
-        infrastructure::router::{Route, Router},
-        model::messages::message::MessageType,
-        pipeline::stage::StageFlow,
+        config::routes,
+        infrastructure::router::RouteSet,
+        model::messages::telemetry::TelemetryValue,
+        pipeline::{stage::StageFlow, stages::telemetry_mapping::TelemetryMappingStage},
     };
 
-    const SENSOR_SCHEMA: &str = include_str!("../../../schema/sensor.schema.json");
-    const STATUS_SCHEMA: &str = include_str!("../../../schema/status.schema.json");
-
-    /// Router with a single sensor route on `smarthome/+/sensor`.
-    fn sensor_router() -> Arc<Router> {
-        let route = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
-        Arc::new(Router::new().add_route(route))
-    }
-
-    /// Non-strict router (unknown topics are silently ignored, not DLQ'd).
-    fn non_strict_sensor_router() -> Arc<Router> {
-        let route = Route::new(MessageType::Sensor, SENSOR_SCHEMA, "smarthome/+/sensor").unwrap();
-        Arc::new(Router::new().strict(false).add_route(route))
+    fn configured_route_set() -> Result<Arc<RouteSet>> {
+        let bundle_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/routes.json");
+        let bundle = routes::load(bundle_path)?;
+        Ok(Arc::new(RouteSet::compile(
+            bundle,
+            "smarthome/_dlq/ingest",
+        )?))
     }
 
     fn valid_sensor_payload() -> Value {
@@ -122,135 +110,76 @@ mod tests {
         })
     }
 
-    /// Build a context with `payload_json` already set (simulates post-decode state).
-    fn ctx_with_json(topic: &str, payload: Value) -> PipelineContext {
-        let mut ctx = PipelineContext::new(topic, vec![]);
+    fn ctx_with_json(
+        topic: &str,
+        payload: Value,
+        received_at_ms: i64,
+        retained: bool,
+    ) -> PipelineContext {
+        let mut ctx = PipelineContext::new_with_metadata(topic, vec![], received_at_ms, retained);
         ctx.set_payload_json(payload);
         ctx
     }
 
     #[tokio::test]
-    async fn run_on_valid_sensor_payload_returns_continue() {
-        let stage = ValidateRawStage::new(sensor_router(), false);
-        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", valid_sensor_payload());
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
-        assert!(ctx.ignored_reason().is_none());
-    }
-
-    #[tokio::test]
-    async fn run_on_unknown_topic_with_non_strict_router_marks_ignored_and_stops() {
-        let stage = ValidateRawStage::new(non_strict_sensor_router(), false);
-        let mut ctx = ctx_with_json("home/unknown/topic", valid_sensor_payload());
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(!ctx.should_publish_dlq());
-        assert_eq!(ctx.ignored_reason(), Some("no matching route"));
-    }
-
-    #[tokio::test]
-    async fn run_on_unknown_topic_with_strict_router_marks_dlq_and_stops() {
-        let stage = ValidateRawStage::new(sensor_router(), false);
-        let mut ctx = ctx_with_json("home/unknown/topic", valid_sensor_payload());
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert!(ctx.dlq_reason().unwrap().contains("raw validation failed"));
-    }
-
-    #[tokio::test]
-    async fn run_on_schema_invalid_payload_marks_dlq_and_stops() {
-        let stage = ValidateRawStage::new(sensor_router(), false);
-        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", json!({"device_id": "esp32-1"}));
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert!(ctx.dlq_reason().unwrap().contains("raw validation failed"));
-    }
-
-    #[tokio::test]
-    async fn run_on_invalid_time_iso_marks_dlq_and_stops() {
-        let stage = ValidateRawStage::new(sensor_router(), false);
+    async fn test_configured_raw_and_mapping_preserve_intake_metadata() -> Result<()> {
+        let raw_stage = ValidateRawStage::new(configured_route_set()?);
+        let mapping_stage = TelemetryMappingStage::new();
         let mut payload = valid_sensor_payload();
-        payload["time_iso"] = json!("not-a-timestamp");
-        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", payload);
+        payload["time_valid"] = json!(false);
+        let received_at_ms = 1_700_000_123_456;
+        let mut ctx = ctx_with_json("smarthome/esp32-1/bme680", payload, received_at_ms, true);
 
-        let result = stage.run(&mut ctx).await;
+        assert!(matches!(
+            raw_stage.run(&mut ctx).await?,
+            StageFlow::Continue
+        ));
+        assert_eq!(ctx.route()?.id(), "firmware-sensor");
+        assert!(matches!(
+            mapping_stage.run(&mut ctx).await?,
+            StageFlow::Continue
+        ));
 
-        assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert!(ctx.dlq_reason().unwrap().contains("raw validation failed"));
+        let record = ctx.telemetry_record()?;
+        assert_eq!(record.timestamp_ms, received_at_ms);
+        assert_eq!(
+            record.fields.get("mqtt_retained"),
+            Some(&TelemetryValue::Boolean(true))
+        );
+        assert!(record.fields.contains_key("dew_point_c"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_with_device_id_mismatch_when_enforced_marks_dlq_and_stops() {
-        let stage = ValidateRawStage::new(sensor_router(), true);
-        let mut payload = valid_sensor_payload();
-        payload["device_id"] = json!("esp32-2");
-        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", payload);
+    async fn test_configured_raw_rejects_unmatched_topic() -> Result<()> {
+        let stage = ValidateRawStage::new(configured_route_set()?);
+        let mut ctx = ctx_with_json(
+            "smarthome/esp32-1/unknown",
+            valid_sensor_payload(),
+            1_700_000_000_000,
+            false,
+        );
 
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Stop)));
-        assert!(ctx.should_publish_dlq());
-        assert!(ctx.dlq_reason().unwrap().contains("raw validation failed"));
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
+        assert!(ctx.should_quarantine());
+        assert!(ctx
+            .rejection_reason()
+            .is_some_and(|reason| reason.contains("route")));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_with_device_id_mismatch_when_not_enforced_returns_continue() {
-        let stage = ValidateRawStage::new(sensor_router(), false);
-        let mut payload = valid_sensor_payload();
-        payload["device_id"] = json!("esp32-2"); // mismatches topic "esp32-1"
-        let mut ctx = ctx_with_json("smarthome/esp32-1/sensor", payload);
+    async fn test_configured_raw_rejects_schema_invalid_payload() -> Result<()> {
+        let stage = ValidateRawStage::new(configured_route_set()?);
+        let mut ctx = ctx_with_json(
+            "smarthome/esp32-1/bme680",
+            json!({"device_id": "esp32-1"}),
+            1_700_000_000_000,
+            false,
+        );
 
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
-    }
-
-    #[tokio::test]
-    async fn run_without_payload_json_in_context_returns_error() {
-        let stage = ValidateRawStage::new(sensor_router(), false);
-        // Context has no payload_json set — simulates a stage ordering bug.
-        let mut ctx = PipelineContext::new("smarthome/esp32-1/sensor", vec![]);
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(result.is_err());
-        assert!(!ctx.should_publish_dlq());
-    }
-
-    #[tokio::test]
-    async fn run_on_valid_status_payload_returns_continue() {
-        let route = Route::new(MessageType::Status, STATUS_SCHEMA, "smarthome/+/status").unwrap();
-        let router = Arc::new(Router::new().add_route(route));
-        let stage = ValidateRawStage::new(router, false);
-
-        let payload = json!({
-            "device_id": "esp32-1",
-            "device_class": "esp32p4-bme680",
-            "fw_version": "1.0.0",
-            "ip": "192.168.1.42",
-            "rssi": -65,
-            "time_ms": 1_700_000_000_000_i64,
-            "time_iso": "2023-11-14T22:13:20Z",
-            "time_valid": true
-        });
-        let mut ctx = ctx_with_json("smarthome/esp32-1/status", payload);
-
-        let result = stage.run(&mut ctx).await;
-
-        assert!(matches!(result, Ok(StageFlow::Continue)));
-        assert!(!ctx.should_publish_dlq());
+        assert!(matches!(stage.run(&mut ctx).await?, StageFlow::Stop));
+        assert!(ctx.should_quarantine());
+        Ok(())
     }
 }

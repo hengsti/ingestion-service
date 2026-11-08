@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "schema_resources": {
+    "https://smarthome-ingest/base.schema.json": "schemas/base.schema.json"
+  },
+  "routes": [
+    {
+      "id": "firmware-sensor",
+      "topic": "smarthome/+/bme680",
+      "schema": "schemas/sensor.schema.json",
+      "output_schema": "schemas/sensor.output.schema.json",
+      "device_id": {
+        "pointer": "/device_id",
+        "topic_segment": 1
+      },
+      "measurement": "bme680",
+      "tags": {
+        "room": {
+          "pointer": "/room"
+        },
+        "device_class": {
+          "pointer": "/device_class"
+        }
+      },
+      "fields": {
+        "firmware_version": {
+          "pointer": "/fw_version",
+          "type": "string"
+        },
+        "temp_c": {
+          "pointer": "/data/temp_c",
+          "type": "float"
+        },
+        "rel_hum_perc": {
+          "pointer": "/data/rel_hum_perc",
+          "type": "float"
+        },
+        "pressure_hpa": {
+          "pointer": "/data/pressure_hpa",
+          "type": "float"
+        },
+        "gas_ohm": {
+          "pointer": "/data/gas_ohm",
+          "type": "float"
+        },
+        "altitude_m": {
+          "pointer": "/data/altitude_m",
+          "type": "float"
+        },
+        "time_valid": {
+          "pointer": "/time_valid",
+          "type": "boolean"
+        },
+        "time_iso": {
+          "pointer": "/time_iso",
+          "type": "string"
+        },
+        "boot_id": {
+          "pointer": "/boot_id",
+          "type": "unsigned",
+          "optional": true
+        },
+        "seq": {
+          "pointer": "/seq",
+          "type": "unsigned",
+          "optional": true
+        },
+        "warmed_up": {
+          "pointer": "/warmed_up",
+          "type": "boolean",
+          "optional": true
+        },
+        "replayed": {
+          "pointer": "/replayed",
+          "type": "boolean",
+          "optional": true
+        }
+      },
+      "timestamp": {
+        "source": "payload",
+        "pointer": "/time_ms",
+        "format": "epoch_ms",
+        "valid_flag": "/time_valid",
+        "fallback": "received_at"
+      },
+      "calculations": [
+        "dew_point",
+        "heat_index",
+        "iaq"
+      ],
+      "cache": true
+    },
+    {
+      "id": "firmware-status",
+      "topic": "smarthome/+/status",
+      "schema": "schemas/status.schema.json",
+      "output_schema": "schemas/status.output.schema.json",
+      "device_id": {
+        "pointer": "/device_id",
+        "topic_segment": 1
+      },
+      "measurement": "device_status",
+      "tags": {
+        "device_class": {
+          "pointer": "/device_class"
+        }
+      },
+      "fields": {
+        "firmware_version": {
+          "pointer": "/fw_version",
+          "type": "string"
+        },
+        "ip_address": {
+          "pointer": "/ip",
+          "type": "string"
+        },
+        "time_valid": {
+          "pointer": "/time_valid",
+          "type": "boolean"
+        },
+        "time_iso": {
+          "pointer": "/time_iso",
+          "type": "string"
+        },
+        "rssi": {
+          "pointer": "/rssi",
+          "type": "integer"
+        },
+        "uptime": {
+          "pointer": "/uptime",
+          "type": "integer",
+          "default": 0
+        },
+        "free_mem": {
+          "pointer": "/free_mem",
+          "type": "integer",
+          "default": 0
+        },
+        "ssid": {
+          "pointer": "/ssid",
+          "type": "string",
+          "default": ""
+        },
+        "queued": {
+          "pointer": "/queued",
+          "type": "integer",
+          "optional": true
+        },
+        "dropped_total": {
+          "pointer": "/dropped_total",
+          "type": "integer",
+          "optional": true
+        },
+        "samples_failed_total": {
+          "pointer": "/samples_failed_total",
+          "type": "integer",
+          "optional": true
+        },
+        "mqtt_connects_total": {
+          "pointer": "/mqtt_connects_total",
+          "type": "integer",
+          "optional": true
+        },
+        "sensor_read_failures_total": {
+          "pointer": "/sensor_read_failures_total",
+          "type": "integer",
+          "optional": true
+        },
+        "reset_reason": {
+          "pointer": "/reset_reason",
+          "type": "string",
+          "optional": true
+        }
+      },
+      "timestamp": {
+        "source": "payload",
+        "pointer": "/time_ms",
+        "format": "epoch_ms",
+        "valid_flag": "/time_valid",
+        "fallback": "received_at"
+      },
+      "cache": false
+    }
+  ]
+}

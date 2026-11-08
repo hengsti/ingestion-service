@@ -1,13 +1,5 @@
 use anyhow::{bail, Result};
 
-/// Topic filter that supports `+` (single level) and `#` (multi level) wildcards.
-#[derive(Debug, Clone)]
-pub struct TopicPattern {
-    segments: Vec<Segment>,
-    /// Best-effort: treat the first `+` segment as the device_id position.
-    device_id_index: Option<usize>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment {
     Lit(String),
@@ -15,87 +7,239 @@ enum Segment {
     Multi,
 }
 
-impl TopicPattern {
+/// MQTT topic filter for configured routes.
+///
+/// This type preserves the configured filter exactly and implements MQTT wildcard and
+/// system-topic matching rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttTopicFilter {
+    raw: String,
+    segments: Vec<Segment>,
+}
+
+impl MqttTopicFilter {
+    /// Parses an MQTT topic filter without trimming or normalizing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the filter has empty levels, embedded wildcards, a nonterminal
+    /// `#`, a NUL character, or unsupported shared-subscription syntax.
     pub fn new(raw: &str) -> Result<Self> {
-        let raw = raw.trim().trim_matches('/').to_string();
         if raw.is_empty() {
-            bail!("topic pattern must not be empty");
+            bail!("MQTT topic filter must not be empty");
+        }
+        if raw.contains('\0') {
+            bail!("MQTT topic filter must not contain NUL");
+        }
+        if raw.starts_with("$share/") {
+            bail!("shared subscriptions are not supported");
         }
 
         let parts: Vec<&str> = raw.split('/').collect();
         let mut segments = Vec::with_capacity(parts.len());
-        let mut device_id_index = None;
-
-        for (i, seg) in parts.iter().enumerate() {
-            if seg.is_empty() {
-                bail!("topic pattern contains empty segment: '{}'", raw);
+        for (index, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                bail!("MQTT topic filter must not contain empty levels");
             }
-
-            match *seg {
-                "+" => {
-                    if device_id_index.is_none() {
-                        device_id_index = Some(i);
-                    }
-                    segments.push(Segment::One);
+            match *part {
+                "+" => segments.push(Segment::One),
+                "#" if index == parts.len() - 1 => segments.push(Segment::Multi),
+                "#" => bail!("MQTT multi-level wildcard must be the final level"),
+                literal if literal.contains('+') || literal.contains('#') => {
+                    bail!("MQTT wildcards must occupy a complete topic level")
                 }
-                "#" => {
-                    if i != parts.len() - 1 {
-                        bail!("'#' must be the last segment in topic pattern: '{}'", raw);
-                    }
-                    segments.push(Segment::Multi);
-                }
-                lit => segments.push(Segment::Lit(lit.to_string())),
+                literal => segments.push(Segment::Lit(literal.to_owned())),
             }
-        }
-
-        // Convention fallback: "smarthome/<device_id>/..." even if TopicPattern uses a concrete device id.
-        if device_id_index.is_none() && parts.len() >= 2 && parts[0] == "smarthome" {
-            device_id_index = Some(1);
         }
 
         Ok(Self {
+            raw: raw.to_owned(),
             segments,
-            device_id_index,
         })
     }
 
-    pub fn matches(&self, topic: &str) -> bool {
-        let topic = topic.trim().trim_matches('/');
-        let t_parts: Vec<&str> = topic.split('/').collect();
+    /// Returns the exact filter text used to create this value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
 
-        let mut ti = 0usize;
-        for (pi, pseg) in self.segments.iter().enumerate() {
-            match pseg {
-                Segment::Multi => {
-                    // '#' matches the rest; allowed only at the end.
-                    return pi == self.segments.len() - 1;
-                }
+    pub(crate) fn has_fixed_segment(&self, index: usize) -> bool {
+        matches!(
+            self.segments.get(index),
+            Some(Segment::Lit(_) | Segment::One)
+        )
+    }
+
+    /// Returns whether this filter matches the supplied MQTT topic name.
+    #[must_use]
+    pub fn matches(&self, topic: &str) -> bool {
+        if !valid_topic_name(topic) {
+            return false;
+        }
+
+        if topic.starts_with('$')
+            && matches!(self.segments.first(), Some(Segment::One | Segment::Multi))
+        {
+            return false;
+        }
+
+        let mut topic_levels = topic.split('/');
+        for filter_level in &self.segments {
+            match filter_level {
+                Segment::Multi => return true,
                 Segment::One => {
-                    if ti >= t_parts.len() {
+                    if topic_levels.next().is_none() {
                         return false;
                     }
-                    if t_parts[ti].is_empty() {
-                        return false;
-                    }
-                    ti += 1;
                 }
-                Segment::Lit(lit) => {
-                    if ti >= t_parts.len() {
+                Segment::Lit(literal) => {
+                    if topic_levels.next() != Some(literal.as_str()) {
                         return false;
                     }
-                    if t_parts[ti] != lit {
-                        return false;
-                    }
-                    ti += 1;
                 }
             }
         }
-        ti == t_parts.len()
+        topic_levels.next().is_none()
     }
 
-    pub fn device_id_from_topic<'a>(&self, topic: &'a str) -> Option<&'a str> {
-        let idx = self.device_id_index?;
-        let topic = topic.trim().trim_matches('/');
-        topic.split('/').nth(idx)
+    /// Returns whether this filter and another can match the same topic name.
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let Some(left_first) = self.segments.first() else {
+            return false;
+        };
+        let Some(right_first) = other.segments.first() else {
+            return false;
+        };
+        if wildcard_cannot_match_system_level(left_first, right_first)
+            || wildcard_cannot_match_system_level(right_first, left_first)
+        {
+            return false;
+        }
+
+        let max_levels = self.segments.len().max(other.segments.len());
+        for index in 0..max_levels {
+            let left = self.segments.get(index);
+            let right = other.segments.get(index);
+            match (left, right) {
+                (Some(Segment::Multi), _) | (_, Some(Segment::Multi)) => return true,
+                (None, _) | (_, None) => return false,
+                (Some(Segment::Lit(left)), Some(Segment::Lit(right))) if left != right => {
+                    return false;
+                }
+                (Some(Segment::Lit(literal)), Some(Segment::One))
+                | (Some(Segment::One), Some(Segment::Lit(literal)))
+                    if index == 0 && literal.starts_with('$') =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+}
+
+fn valid_topic_name(topic: &str) -> bool {
+    !topic.is_empty() && !topic.contains('\0') && !topic.contains('+') && !topic.contains('#')
+}
+
+fn wildcard_cannot_match_system_level(wildcard: &Segment, other: &Segment) -> bool {
+    matches!(wildcard, Segment::One | Segment::Multi)
+        && matches!(other, Segment::Lit(level) if level.starts_with('$'))
+}
+
+#[cfg(test)]
+mod configured_route_tests {
+    use super::*;
+
+    #[test]
+    fn test_configured_route_topic_matches_supported_filters_exactly() {
+        assert!(MqttTopicFilter::new("sensor/room").is_ok_and(|f| f.matches("sensor/room")));
+        assert!(!MqttTopicFilter::new("sensor/room").is_ok_and(|f| f.matches("sensor/room/")));
+        assert!(MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/kitchen")));
+        assert!(MqttTopicFilter::new("sensor/+").is_ok_and(|f| f.matches("sensor/")));
+        assert!(MqttTopicFilter::new("home/+/sensor").is_ok_and(|f| f.matches("home//sensor")));
+        assert!(MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensor")));
+        assert!(MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensor/a/b")));
+        assert!(!MqttTopicFilter::new("sensor/#").is_ok_and(|f| f.matches("sensors/a")));
+    }
+
+    #[test]
+    fn test_configured_route_topic_preserves_filter_text_without_normalizing() {
+        for filter in ["/sensor/a", "sensor/a/"] {
+            assert!(MqttTopicFilter::new(filter).is_err(), "accepted {filter:?}");
+        }
+
+        let spaced = MqttTopicFilter::new(" sensor /a ").expect("spaces are literal topic text");
+        assert_eq!(spaced.as_str(), " sensor /a ");
+        assert!(spaced.matches(" sensor /a "));
+        assert!(!spaced.matches("sensor/a"));
+    }
+
+    #[test]
+    fn test_configured_route_topic_rejects_unsupported_filter_syntax() {
+        for filter in [
+            "",
+            "sensor//a",
+            "sensor/a//",
+            "sen+or/a",
+            "sensor/a#",
+            "sensor/#/a",
+        ] {
+            assert!(MqttTopicFilter::new(filter).is_err(), "accepted {filter:?}");
+        }
+
+        assert!(MqttTopicFilter::new("sensor/\0/a").is_err());
+        assert!(MqttTopicFilter::new("$share/group/sensor/+").is_err());
+    }
+
+    #[test]
+    fn test_configured_route_topic_obeys_leading_dollar_rule() -> Result<()> {
+        assert!(!MqttTopicFilter::new("+/status")?.matches("$SYS/status"));
+        assert!(!MqttTopicFilter::new("#")?.matches("$SYS/status"));
+        assert!(MqttTopicFilter::new("$SYS/#")?.matches("$SYS/status"));
+        assert!(MqttTopicFilter::new("+/status")?.matches("room/status"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_topic_overlap_detects_intersecting_filter_languages() -> Result<()> {
+        let overlaps = [
+            ("a", "a"),
+            ("a/+", "a/b"),
+            ("a/#", "a"),
+            ("a/+/c", "a/b/#"),
+            ("a/+", "a/#"),
+        ];
+
+        for (left, right) in overlaps {
+            assert!(
+                MqttTopicFilter::new(left)?.overlaps(&MqttTopicFilter::new(right)?),
+                "{left:?} should overlap {right:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_topic_overlap_allows_disjoint_filters_and_system_topic_separation() -> Result<()> {
+        let disjoint = [
+            ("a/b", "a/c"),
+            ("a/+", "b/+"),
+            ("+", "$SYS/#"),
+            ("#", "$SYS/status"),
+        ];
+
+        for (left, right) in disjoint {
+            assert!(
+                !MqttTopicFilter::new(left)?.overlaps(&MqttTopicFilter::new(right)?),
+                "{left:?} must not overlap {right:?}"
+            );
+        }
+
+        assert!(MqttTopicFilter::new("$SYS/+")?.overlaps(&MqttTopicFilter::new("$SYS/status")?));
+        Ok(())
     }
 }

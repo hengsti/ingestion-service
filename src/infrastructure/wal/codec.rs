@@ -3,7 +3,24 @@ use std::io::Read;
 
 use crate::infrastructure::wal::types::WalEvent;
 
-const MAX_WAL_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_WAL_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
+const WAL_EVENT_FIXED_BYTES: usize = 24;
+const WAL_FRAME_HEADER_BYTES: usize = 4;
+
+pub(crate) fn wal_record_frame_size(topic_bytes: usize, payload_bytes: usize) -> Result<usize> {
+    let body_bytes = WAL_EVENT_FIXED_BYTES
+        .checked_add(topic_bytes)
+        .and_then(|size| size.checked_add(payload_bytes))
+        .context("WAL record size estimate overflowed")?;
+    if body_bytes > MAX_WAL_RECORD_PAYLOAD_BYTES {
+        return Err(anyhow!(
+            "WAL record body size {body_bytes} exceeds max {MAX_WAL_RECORD_PAYLOAD_BYTES} bytes"
+        ));
+    }
+    body_bytes
+        .checked_add(WAL_FRAME_HEADER_BYTES)
+        .context("WAL frame size estimate overflowed")
+}
 
 /// Outcome of attempting to decode a WAL record.
 pub enum DecodeOutcome {
@@ -12,11 +29,11 @@ pub enum DecodeOutcome {
     /// Clean EOF or torn tail (incomplete frame).
     CleanEof,
     /// Frame was complete but payload deserialization failed (decodable-corrupt).
-    /// Includes the number of bytes consumed so recovery can skip this record.
-    FrameCorrupt(usize),
+    FrameCorrupt,
 }
 
 pub fn encode_into(buf: &mut Vec<u8>, event: &WalEvent) -> Result<()> {
+    wal_record_frame_size(event.topic.len(), event.payload.len())?;
     buf.clear();
     buf.extend_from_slice(&[0u8; 4]); // Placeholder for the length of the encoded event
 
@@ -34,9 +51,8 @@ pub fn encode_into(buf: &mut Vec<u8>, event: &WalEvent) -> Result<()> {
 /// is `4 + payload_len` — the exact byte width of the record on disk. The
 /// caller uses it to advance its read cursor without re-measuring the payload.
 ///
-/// Returns `Ok(None)` on a clean EOF *or* a torn tail (short read of either
-/// the length prefix or the payload). Both are non-fatal: a torn tail is
-/// truncated during recovery (`recover::truncate_to`) before the writer reopens.
+/// Returns `Ok(None)` on a clean EOF. A short frame is an error; only startup
+/// recovery treats an incomplete final frame as a repairable tail.
 ///
 /// Convenience wrapper over [`decode_into`] that allocates a fresh payload
 /// buffer per call — used by recovery and tests. The hot read path uses
@@ -57,10 +73,8 @@ pub fn decode_from<R: Read>(r: &mut R) -> Result<Option<(WalEvent, usize)>> {
 pub fn decode_into<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Option<(WalEvent, usize)>> {
     let mut len_buf = [0u8; 4];
 
-    match r.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    if !read_prefix_or_eof(r, &mut len_buf)? {
+        return Ok(None);
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     ensure_len_within_limit(len)?;
@@ -69,11 +83,28 @@ pub fn decode_into<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Option<(
     payload.resize(len, 0);
     match r.read_exact(payload) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(e).context("truncated WAL record payload")
+        }
         Err(e) => return Err(e.into()),
     }
     let event: WalEvent = bincode::deserialize(payload)?;
     Ok(Some((event, 4 + len)))
+}
+
+fn read_prefix_or_eof<R: Read>(r: &mut R, prefix: &mut [u8; 4]) -> Result<bool> {
+    let mut read = 0;
+    while read < prefix.len() {
+        match r.read(&mut prefix[read..]) {
+            Ok(0) if read == 0 => return Ok(false),
+            Ok(0) => anyhow::bail!("truncated WAL record length prefix"),
+            Ok(bytes) => read += bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Ok(true)
 }
 
 /// Decodes one record for recovery purposes, distinguishing between frame errors
@@ -81,9 +112,8 @@ pub fn decode_into<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<Option<(
 ///
 /// - Returns `DecodeOutcome::ValidRecord` on successful deserialization.
 /// - Returns `DecodeOutcome::CleanEof` on I/O EOF or torn frame.
-/// - Returns `DecodeOutcome::FrameCorrupt` if frame was complete but payload
-///   deserialization failed; includes the bytes consumed so recovery can skip
-///   this record and continue scanning.
+/// - Returns `DecodeOutcome::FrameCorrupt` if a complete frame's payload fails
+///   deserialization; recovery must preserve and report this corruption.
 pub fn decode_for_recovery<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<DecodeOutcome> {
     let mut len_buf = [0u8; 4];
 
@@ -95,11 +125,7 @@ pub fn decode_for_recovery<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_le_bytes(len_buf) as usize;
-    if ensure_len_within_limit(len).is_err() {
-        // Oversized frame length indicates corruption; treat it as a torn tail so recovery
-        // doesn't attempt to discard potentially huge payloads.
-        return Ok(DecodeOutcome::CleanEof);
-    }
+    ensure_len_within_limit(len)?;
 
     payload.clear();
     payload.resize(len, 0);
@@ -111,11 +137,10 @@ pub fn decode_for_recovery<R: Read>(r: &mut R, payload: &mut Vec<u8>) -> Result<
         Err(e) => return Err(e.into()),
     }
 
-    // Frame is complete; try to deserialize. If deserialization fails, report it
-    // as a frame-corrupt record (not as an I/O error), so recovery can skip it.
+    // Frame is complete; try to deserialize and preserve any corruption for recovery.
     match bincode::deserialize::<WalEvent>(payload) {
         Ok(event) => Ok(DecodeOutcome::ValidRecord(event, 4 + len)),
-        Err(_) => Ok(DecodeOutcome::FrameCorrupt(4 + len)),
+        Err(_) => Ok(DecodeOutcome::FrameCorrupt),
     }
 }
 
@@ -149,6 +174,43 @@ fn discard_bytes<R: Read>(r: &mut R, mut remaining: usize) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::infrastructure::wal::types::WalEvent;
+
+    #[test]
+    fn wal_record_size_estimate_matches_bincode_frame() -> Result<()> {
+        let event = WalEvent {
+            topic: "topic".to_owned(),
+            ts_ms: 123,
+            payload: "line".to_owned(),
+        };
+        let expected = bincode::serialized_size(&event)? as usize + WAL_FRAME_HEADER_BYTES;
+
+        assert_eq!(
+            wal_record_frame_size(event.topic.len(), event.payload.len())?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_sync_codec_enforces_body_limit_with_framing_overhead() -> Result<()> {
+        let mut event = WalEvent {
+            topic: "t".to_owned(),
+            ts_ms: 1,
+            payload: "x".repeat(MAX_WAL_RECORD_PAYLOAD_BYTES - WAL_EVENT_FIXED_BYTES - 1),
+        };
+        let mut frame = Vec::new();
+
+        encode_into(&mut frame, &event)?;
+        assert_eq!(
+            frame.len(),
+            MAX_WAL_RECORD_PAYLOAD_BYTES + WAL_FRAME_HEADER_BYTES
+        );
+        assert!(decode_from(&mut std::io::Cursor::new(&frame))?.is_some());
+
+        event.payload.push('x');
+        assert!(encode_into(&mut frame, &event).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_encode() {
@@ -245,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_truncated_event() {
+    fn test_truncated_event_returns_error() {
         let event = WalEvent {
             topic: String::from("test-topic"),
             ts_ms: 123456789,
@@ -259,8 +321,8 @@ mod tests {
         let truncated_buf = &buf[..truncated_len];
         let mut cursor = std::io::Cursor::new(truncated_buf.to_vec());
 
-        let result = decode_from(&mut cursor).unwrap();
-        assert!(result.is_none()); // Should return None due to incomplete event
+        let result = decode_from(&mut cursor);
+        assert!(result.is_err(), "a truncated frame is not clean EOF");
     }
 
     #[test]
@@ -282,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_for_recovery_oversized_length_prefix_keeps_small_payload_buffer() {
+    fn decode_for_recovery_oversized_length_prefix_fails_without_growing_payload_buffer() {
         let mut wire = Vec::new();
         wire.extend_from_slice(&2_000_000u32.to_le_bytes());
 
@@ -290,8 +352,11 @@ mod tests {
         let mut payload = Vec::with_capacity(16);
         let cap_before = payload.capacity();
 
-        let outcome = decode_for_recovery(&mut cursor, &mut payload).unwrap();
-        assert!(matches!(outcome, DecodeOutcome::CleanEof));
+        let error = match decode_for_recovery(&mut cursor, &mut payload) {
+            Err(error) => error,
+            Ok(_) => panic!("an invalid frame length must not be treated as a torn tail"),
+        };
+        assert!(error.to_string().contains("WAL record length"));
         assert_eq!(payload.capacity(), cap_before);
     }
 }

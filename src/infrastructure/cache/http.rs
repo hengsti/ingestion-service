@@ -1,8 +1,5 @@
-use std::convert::Infallible;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
+use std::{collections::BTreeMap, convert::Infallible};
 
 use axum::{
     extract::{Path, State},
@@ -21,60 +18,68 @@ use tokio_stream::{
 };
 
 use super::state::{CacheEvent, CacheState};
-use crate::model::messages::sensor::SensorData;
+use crate::infrastructure::operations::Operations;
+use crate::model::messages::telemetry::TelemetryValue;
 
 /// Builds the cache HTTP API router.
-pub fn router(state: CacheState, source_ready: Arc<AtomicBool>) -> Router {
+pub fn router(state: CacheState, operations: Arc<Operations>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/v1/operations", get(operations_snapshot))
         .route("/v1/state", get(list_state))
         .route("/v1/state/{device_id}", get(get_state))
         .route("/v1/stream", get(stream_updates))
         .with_state(state)
-        .layer(Extension(source_ready))
+        .layer(Extension(operations))
 }
 
 async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-async fn readyz(Extension(source_ready): Extension<Arc<AtomicBool>>) -> StatusCode {
-    if source_ready.load(Ordering::Relaxed) {
+async fn readyz(Extension(operations): Extension<Arc<Operations>>) -> StatusCode {
+    if operations.ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
 }
 
+async fn operations_snapshot(
+    Extension(operations): Extension<Arc<Operations>>,
+) -> impl IntoResponse {
+    Json(operations.snapshot())
+}
+
 #[derive(Serialize)]
-struct SensorDto {
+struct DeviceDto {
     device_id: String,
     stale: bool,
     last_seen_ms: u64,
-    value: SensorData,
+    value: Arc<BTreeMap<String, TelemetryValue>>,
 }
 
 #[derive(Serialize)]
 struct SensorStateResponse {
     ttl_ms: u64,
-    sensors: Vec<SensorDto>,
+    sensors: Vec<DeviceDto>,
 }
 
 #[derive(Serialize)]
-struct SseSensorEvent {
+struct SseTelemetryEvent {
     kind: &'static str,
     device_id: String,
     last_seen_ms: u64,
-    value: SensorData,
+    value: Arc<BTreeMap<String, TelemetryValue>>,
 }
 
 async fn list_state(State(cache_state): State<CacheState>) -> impl IntoResponse {
     let ttl_ms = cache_state.ttl_ms();
     let sensors = cache_state
-        .snapshot_all_sensors()
+        .snapshot_all_devices()
         .into_iter()
-        .map(|(device_id, state, stale)| SensorDto {
+        .map(|(device_id, state, stale)| DeviceDto {
             device_id,
             stale,
             last_seen_ms: state.last_seen_ms,
@@ -86,17 +91,17 @@ async fn list_state(State(cache_state): State<CacheState>) -> impl IntoResponse 
 }
 
 #[derive(Serialize)]
-struct SensorDtoNoId {
+struct DeviceDtoNoId {
     stale: bool,
     last_seen_ms: u64,
-    value: SensorData,
+    value: Arc<BTreeMap<String, TelemetryValue>>,
 }
 
 #[derive(Serialize)]
 struct DeviceStateResponse {
     ttl_ms: u64,
     device_id: String,
-    sensor: Option<SensorDtoNoId>,
+    sensor: Option<DeviceDtoNoId>,
 }
 
 async fn get_state(
@@ -105,8 +110,8 @@ async fn get_state(
 ) -> impl IntoResponse {
     let ttl_ms = cache_state.ttl_ms();
     let sensor = cache_state
-        .snapshot_sensor(&device_id)
-        .map(|(state, stale)| SensorDtoNoId {
+        .snapshot_device(&device_id)
+        .map(|(state, stale)| DeviceDtoNoId {
             stale,
             last_seen_ms: state.last_seen_ms,
             value: state.value,
@@ -126,12 +131,12 @@ async fn stream_updates(
 
     let stream = BroadcastStream::new(rx).filter_map(|msg| {
         match msg {
-            Ok(CacheEvent::Sensor {
+            Ok(CacheEvent::Telemetry {
                 device_id,
                 last_seen_ms,
                 value,
             }) => {
-                let payload = SseSensorEvent {
+                let payload = SseTelemetryEvent {
                     kind: "sensor",
                     device_id,
                     last_seen_ms,
@@ -159,4 +164,75 @@ async fn stream_updates(
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::infrastructure::operations::ForwarderState;
+    use crate::infrastructure::wal::capacity::{
+        self, Capacity, METADATA_RESERVE_BYTES, SEGMENT_ALLOWANCE_BYTES,
+    };
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_wal_cannot_admit_a_maximum_record() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let max_bytes = capacity::minimum_capacity(1024 * 1024)?;
+        let required = crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES as u64
+            + 4
+            + SEGMENT_ALLOWANCE_BYTES;
+        let segment_bytes =
+            max_bytes - required - METADATA_RESERVE_BYTES - SEGMENT_ALLOWANCE_BYTES + 1;
+        std::fs::write(
+            dir.path().join("00000000000000000001.log"),
+            vec![0; segment_bytes as usize],
+        )?;
+        let wal = Capacity::recover(dir.path(), max_bytes)?;
+        let quarantine_dir = tempfile::tempdir()?;
+        let quarantine = Capacity::recover(quarantine_dir.path(), max_bytes)?;
+
+        let response = readyz(Extension(test_operations(wal, quarantine))).await;
+
+        assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_503_when_quarantine_cannot_admit_a_maximum_record() -> anyhow::Result<()>
+    {
+        let wal_dir = tempfile::tempdir()?;
+        let quarantine_dir = tempfile::tempdir()?;
+        let max_bytes = capacity::minimum_capacity(1024 * 1024)?;
+        let required = crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES as u64
+            + 4
+            + SEGMENT_ALLOWANCE_BYTES;
+        let segment_bytes =
+            max_bytes - required - METADATA_RESERVE_BYTES - SEGMENT_ALLOWANCE_BYTES + 1;
+        std::fs::write(
+            quarantine_dir.path().join("00000000000000000001.log"),
+            vec![0; segment_bytes as usize],
+        )?;
+        let wal = Capacity::recover(wal_dir.path(), max_bytes)?;
+        let quarantine = Capacity::recover(quarantine_dir.path(), max_bytes)?;
+
+        let response = readyz(Extension(test_operations(wal, quarantine))).await;
+
+        assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    fn test_operations(wal: Arc<Capacity>, quarantine: Arc<Capacity>) -> Arc<Operations> {
+        let forwarder = Arc::new(ForwarderState::default());
+        forwarder.alive.store(true, Ordering::Relaxed);
+        let state = Arc::new(Operations::new(
+            Arc::new(AtomicBool::new(true)),
+            forwarder,
+            wal,
+            quarantine,
+        ));
+        state.update_admission(1, 1, 0);
+        state
+    }
 }

@@ -1,6 +1,8 @@
+/// Versioned route-bundle DTOs and the pure configuration loader.
+pub mod routes;
+
 use anyhow::{bail, Context, Result};
 use secrecy::SecretString;
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
@@ -96,20 +98,22 @@ pub struct Config {
     pub input_source: InputSourceKind,
     /// Present when `input_source` is [`InputSourceKind::Mqtt`].
     pub mqtt: Option<MqttSourceConfig>,
-    /// Route definitions (message-type suffix → topic/route string), populated
-    /// by whichever input source is active. Today only `Mqtt` populates this,
-    /// scanning `MQTT_TOPIC_*` env vars — see `InputSourceKind::Mqtt` below.
-    pub topic_routes: HashMap<String, String>,
+    /// Path to the configured route bundle.
+    pub routes_file: PathBuf,
+    /// Publish-only destination for invalid messages.
+    pub dlq_topic: String,
     pub output_sink: OutputSinkKind,
     /// Present when `output_sink` is [`OutputSinkKind::Influx`].
     pub influx: Option<InfluxSinkConfig>,
     pub batch_size: usize,
     pub flush_interval_ms: u64,
     pub wal_dir: PathBuf,
+    pub wal_max_bytes: u64,
     pub wal_segment_bytes: u64,
     pub wal_queue_capacity: usize,
+    pub quarantine_dir: PathBuf,
+    pub quarantine_max_bytes: u64,
     pub input_queue_capacity: usize,
-    pub enforce_topic_device_match: bool,
     pub metrics_bind: String,
     pub cache_ttl_ms: u64,
     pub cache_bind: String,
@@ -121,19 +125,19 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("input_source", &self.input_source)
             .field("mqtt", &self.mqtt)
-            .field("topic_routes", &self.topic_routes)
+            .field("routes_file", &self.routes_file)
+            .field("dlq_topic", &self.dlq_topic)
             .field("output_sink", &self.output_sink)
             .field("influx", &self.influx)
             .field("batch_size", &self.batch_size)
             .field("flush_interval_ms", &self.flush_interval_ms)
             .field("wal_dir", &self.wal_dir)
+            .field("wal_max_bytes", &self.wal_max_bytes)
             .field("wal_segment_bytes", &self.wal_segment_bytes)
             .field("wal_queue_capacity", &self.wal_queue_capacity)
+            .field("quarantine_dir", &self.quarantine_dir)
+            .field("quarantine_max_bytes", &self.quarantine_max_bytes)
             .field("input_queue_capacity", &self.input_queue_capacity)
-            .field(
-                "enforce_topic_device_match",
-                &self.enforce_topic_device_match,
-            )
             .field("metrics_bind", &self.metrics_bind)
             .field("cache_ttl_ms", &self.cache_ttl_ms)
             .field("cache_bind", &self.cache_bind)
@@ -144,10 +148,17 @@ impl fmt::Debug for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        if let Some(message) =
+            routes::removed_route_environment_variables(env::vars().map(|(name, _)| name))
+        {
+            bail!("{message}");
+        }
+        let routes_file = required_routes_file(env_var("INGEST_ROUTES_FILE"))?;
+
         let input_source =
             InputSourceKind::parse(&env_var("INPUT_SOURCE").context("INPUT_SOURCE must be set")?)?;
 
-        let (mqtt, topic_routes) = match input_source {
+        let (mqtt, dlq_topic) = match input_source {
             InputSourceKind::Mqtt => {
                 let host =
                     env_var("MQTT_HOST").context("MQTT_HOST is required when INPUT_SOURCE=mqtt")?;
@@ -164,11 +175,7 @@ impl Config {
                 let (clean_session, client_id) =
                     mqtt_session(env_var("MQTT_CLEAN_SESSION"), client_id)?;
 
-                let topic_routes = strip_prefixed(env::vars(), "MQTT_TOPIC_");
-                if topic_routes.is_empty() {
-                    bail!("At least one MQTT_TOPIC_<NAME> environment variable must be set");
-                }
-
+                let dlq_topic = required_dlq_topic(env_var("MQTT_TOPIC_DLQ"))?;
                 (
                     Some(MqttSourceConfig {
                         host,
@@ -178,7 +185,7 @@ impl Config {
                         client_id,
                         clean_session,
                     }),
-                    topic_routes,
+                    dlq_topic,
                 )
             }
         };
@@ -211,12 +218,15 @@ impl Config {
             .parse::<usize>()
             .context("BATCH_SIZE must be a valid usize")?;
 
-        let flush_interval_ms = env_var("FLUSH_INTERVAL_MS")
-            .context("FLUSH_INTERVAL_MS must be set")?
-            .parse::<u64>()
-            .context("FLUSH_INTERVAL_MS must be a valid u64")?;
+        let flush_interval_ms =
+            required_positive_u64(env_var("FLUSH_INTERVAL_MS"), "FLUSH_INTERVAL_MS")?;
 
         let wal_dir = PathBuf::from(env_var("WAL_DIR").context("WAL_DIR must be set")?);
+        let wal_max_bytes = required_positive_u64(env_var("WAL_MAX_BYTES"), "WAL_MAX_BYTES")?;
+        let quarantine_dir =
+            PathBuf::from(env_var("QUARANTINE_DIR").context("QUARANTINE_DIR must be set")?);
+        let quarantine_max_bytes =
+            required_positive_u64(env_var("QUARANTINE_MAX_BYTES"), "QUARANTINE_MAX_BYTES")?;
 
         let wal_segment_bytes = match env_var("WAL_SEGMENT_BYTES") {
             Some(v) => v
@@ -224,6 +234,16 @@ impl Config {
                 .context("WAL_SEGMENT_BYTES must be a valid u64")?,
             None => 64 * 1024 * 1024,
         };
+        crate::infrastructure::wal::capacity::validate_limit(
+            "WAL_MAX_BYTES",
+            wal_max_bytes,
+            wal_segment_bytes,
+        )?;
+        crate::infrastructure::wal::capacity::validate_limit(
+            "QUARANTINE_MAX_BYTES",
+            quarantine_max_bytes,
+            wal_segment_bytes,
+        )?;
 
         let wal_queue_capacity = match env_var("WAL_QUEUE_CAPACITY") {
             Some(v) => v
@@ -231,20 +251,16 @@ impl Config {
                 .context("WAL_QUEUE_CAPACITY must be a valid usize")?,
             None => 16_384,
         };
+        if wal_queue_capacity == 0 {
+            bail!("WAL_QUEUE_CAPACITY must be greater than zero");
+        }
 
-        let input_queue_capacity = match env_var("INPUT_QUEUE_CAPACITY") {
-            Some(v) => v
-                .parse::<usize>()
-                .context("INPUT_QUEUE_CAPACITY must be a valid usize")?,
-            None => 16_384,
-        };
-
-        let enforce_topic_device_match = env_var("ENFORCE_TOPIC_DEVICE_MATCH")
-            .context("ENFORCE_TOPIC_DEVICE_MATCH must be set")?
-            .parse::<bool>()
-            .context("ENFORCE_TOPIC_DEVICE_MATCH must be a valid bool")?;
+        let input_queue_capacity = parse_input_queue_capacity(env_var("INPUT_QUEUE_CAPACITY"))?;
 
         let metrics_bind = env_var("METRICS_BIND").context("METRICS_BIND must be set")?;
+        metrics_bind
+            .parse::<std::net::SocketAddr>()
+            .context("METRICS_BIND must be a socket address like 0.0.0.0:9090")?;
 
         let cache_ttl_ms = env_var("CACHE_TTL_MS")
             .context("CACHE_TTL_MS must be set")?
@@ -252,25 +268,32 @@ impl Config {
             .context("CACHE_TTL_MS must be a valid u64")?;
 
         let cache_bind = env_var("CACHE_BIND").context("CACHE_BIND must be set")?;
+        validate_cache_bind(&cache_bind)?;
 
         let cache_buffer = env_var("CACHE_BUFFER")
             .context("CACHE_BUFFER must be set")?
             .parse::<usize>()
             .context("CACHE_BUFFER must be a valid usize")?;
+        if cache_buffer == 0 {
+            bail!("CACHE_BUFFER must be greater than zero");
+        }
 
         Ok(Self {
             input_source,
             mqtt,
-            topic_routes,
+            routes_file,
+            dlq_topic,
             output_sink,
             influx,
             batch_size,
             flush_interval_ms,
             wal_dir,
+            wal_max_bytes,
             wal_segment_bytes,
             wal_queue_capacity,
+            quarantine_dir,
+            quarantine_max_bytes,
             input_queue_capacity,
-            enforce_topic_device_match,
             metrics_bind,
             cache_ttl_ms,
             cache_bind,
@@ -279,36 +302,106 @@ impl Config {
     }
 }
 
+fn required_positive_u64(value: Option<String>, name: &str) -> Result<u64> {
+    let value = value.with_context(|| format!("{name} must be set"))?;
+    let value = value
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a valid u64"))?;
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn required_routes_file(value: Option<String>) -> Result<PathBuf> {
+    let value = value.context("INGEST_ROUTES_FILE must be set")?;
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("INGEST_ROUTES_FILE must not be empty");
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn required_dlq_topic(value: Option<String>) -> Result<String> {
+    let value = value.context("MQTT_TOPIC_DLQ must be set")?;
+    if value.trim().is_empty() {
+        bail!("MQTT_TOPIC_DLQ must not be empty");
+    }
+    Ok(value)
+}
+
 fn env_var(k: &str) -> Option<String> {
     env::var(k)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
-fn mqtt_session(clean_session: Option<String>, mut client_id: String) -> Result<(bool, String)> {
+
+fn validate_cache_bind(address: &str) -> Result<()> {
+    if address.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let Some((host, port)) = address.rsplit_once(':') else {
+        bail!("CACHE_BIND must be a host or IP address with a numeric port");
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.contains(':')
+        || host.is_empty()
+        || host.len() > 253
+        || port.parse::<u16>().is_err()
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        bail!("CACHE_BIND must be a host or IP address with a numeric port");
+    }
+
+    Ok(())
+}
+
+fn mqtt_session(clean_session: Option<String>, client_id: String) -> Result<(bool, String)> {
     let clean_session = match clean_session {
         Some(v) => v
             .parse::<bool>()
             .context("MQTT_CLEAN_SESSION must be a valid bool")?,
-        None => true,
+        None => false,
     };
     if clean_session {
-        client_id.push_str(&format!("-{}", chrono::Utc::now().timestamp()));
+        bail!("MQTT_CLEAN_SESSION=true is unsupported; durable MQTT intake requires a persistent session");
     }
     Ok((clean_session, client_id))
 }
 
-fn strip_prefixed(
-    vars: impl Iterator<Item = (String, String)>,
-    prefix: &str,
-) -> HashMap<String, String> {
-    vars.filter_map(|(k, v)| k.strip_prefix(prefix).map(|suffix| (suffix.to_string(), v)))
-        .collect()
+fn parse_input_queue_capacity(value: Option<String>) -> Result<usize> {
+    let capacity = match value {
+        Some(value) => value
+            .parse::<usize>()
+            .context("INPUT_QUEUE_CAPACITY must be a valid usize")?,
+        None => 16_384,
+    };
+    if capacity == 0 {
+        bail!("INPUT_QUEUE_CAPACITY must be greater than zero");
+    }
+    Ok(capacity)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cache_bind_accepts_ip_and_hostname_socket_addresses() {
+        for address in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080"] {
+            assert!(validate_cache_bind(address).is_ok(), "{address}");
+        }
+    }
 
     #[test]
     fn input_source_kind_parse_accepts_mqtt_case_insensitive() {
@@ -365,14 +458,11 @@ mod tests {
     }
 
     #[test]
-    fn mqtt_session_unset_defaults_to_clean_with_suffixed_client_id() -> Result<()> {
+    fn mqtt_session_unset_defaults_to_persistent_with_stable_client_id() -> Result<()> {
         let (clean_session, client_id) = mqtt_session(None, "ingest".to_string())?;
 
-        assert!(clean_session);
-        let suffix = client_id
-            .strip_prefix("ingest-")
-            .context("client id must be suffixed")?;
-        assert!(suffix.parse::<i64>().is_ok());
+        assert!(!clean_session);
+        assert_eq!(client_id, "ingest");
         Ok(())
     }
 
@@ -387,6 +477,13 @@ mod tests {
     }
 
     #[test]
+    fn mqtt_session_true_rejects_nonpersistent_mode() {
+        let result = mqtt_session(Some("true".to_string()), "ingest".to_string());
+
+        assert!(format!("{:#}", result.unwrap_err()).contains("MQTT_CLEAN_SESSION"));
+    }
+
+    #[test]
     fn mqtt_session_invalid_value_returns_error() {
         let result = mqtt_session(Some("nope".to_string()), "ingest".to_string());
 
@@ -394,30 +491,127 @@ mod tests {
     }
 
     #[test]
-    fn strip_prefixed_extracts_suffix_and_ignores_other_keys() {
-        let vars = vec![
-            (
-                "MQTT_TOPIC_SENSOR".to_string(),
-                "smarthome/+/sensor".to_string(),
-            ),
-            (
-                "MQTT_TOPIC_DLQ".to_string(),
-                "smarthome/_dlq/ingest".to_string(),
-            ),
-            ("MQTT_HOST".to_string(), "mqtt.example.com".to_string()),
-        ];
+    fn input_queue_capacity_rejects_zero() {
+        assert!(parse_input_queue_capacity(Some("0".to_string())).is_err());
+    }
 
-        let result = strip_prefixed(vars.into_iter(), "MQTT_TOPIC_");
+    #[test]
+    fn input_queue_capacity_defaults_to_positive_capacity() -> Result<()> {
+        let capacity = parse_input_queue_capacity(None)?;
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(
-            result.get("SENSOR").map(String::as_str),
-            Some("smarthome/+/sensor")
-        );
-        assert_eq!(
-            result.get("DLQ").map(String::as_str),
-            Some("smarthome/_dlq/ingest")
-        );
-        assert!(!result.contains_key("HOST"));
+        assert!(capacity > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_rejects_removed_route_environment() {
+        for name in [
+            "MQTT_TOPIC_SENSOR",
+            "MQTT_TOPIC_STATUS",
+            "MQTT_TOPIC_ZIGBEE",
+            "MQTT_TOPIC_OTHER_DLQ",
+            "ENFORCE_TOPIC_DEVICE_MATCH",
+        ] {
+            let err = routes::removed_route_environment_variables([name])
+                .expect("removed configuration must fail");
+
+            assert!(err.contains(name));
+            assert!(err.contains("INGEST_ROUTES_FILE"));
+        }
+
+        assert!(routes::removed_route_environment_variables(["MQTT_TOPIC_DLQ"]).is_none());
+    }
+
+    #[test]
+    fn test_config_requires_nonempty_routes_file() {
+        for value in [None, Some(String::new()), Some("  ".to_string())] {
+            assert!(required_routes_file(value).is_err());
+        }
+    }
+
+    #[test]
+    fn test_config_requires_dlq_topic() {
+        assert!(required_dlq_topic(None).is_err());
+        assert!(required_dlq_topic(Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn test_wal_capacity_rejects_nonpositive_or_invalid_limits() {
+        for name in ["WAL_MAX_BYTES", "QUARANTINE_MAX_BYTES"] {
+            for value in [None, Some("0"), Some("-1"), Some("invalid")] {
+                let error = required_positive_u64(value.map(str::to_owned), name)
+                    .expect_err("invalid byte limit must fail");
+                assert!(format!("{error:#}").contains(name));
+            }
+        }
+    }
+
+    #[test]
+    fn test_wal_capacity_requires_explicit_journal_configuration() -> Result<()> {
+        const CHILD: &str = "INGEST_TEST_MISSING_JOURNAL_SETTING";
+        if let Ok(missing) = env::var(CHILD) {
+            let error = Config::from_env()
+                .err()
+                .context("missing journal configuration was accepted")?;
+            assert!(format!("{error:#}").contains(&missing));
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        for missing in [
+            "WAL_MAX_BYTES",
+            "QUARANTINE_DIR",
+            "QUARANTINE_MAX_BYTES",
+            "WAL_QUEUE_CAPACITY",
+        ] {
+            let mut command = std::process::Command::new(env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "config::tests::test_wal_capacity_requires_explicit_journal_configuration",
+                ])
+                .env_clear()
+                .env(CHILD, missing)
+                .env("INGEST_ROUTES_FILE", "routes.json")
+                .env("INPUT_SOURCE", "mqtt")
+                .env("MQTT_HOST", "localhost")
+                .env("MQTT_PORT", "1883")
+                .env("MQTT_CLIENT_ID", "test")
+                .env("MQTT_TOPIC_DLQ", "test/dlq")
+                .env("OUTPUT_SINK", "influx")
+                .env("INFLUX_URL", "http://localhost:8086")
+                .env("INFLUX_ORG", "test")
+                .env("INFLUX_BUCKET", "test")
+                .env("INFLUX_TOKEN", "test")
+                .env("BATCH_SIZE", "1")
+                .env("FLUSH_INTERVAL_MS", "1")
+                .env("WAL_DIR", dir.path().join("wal"))
+                .env("WAL_MAX_BYTES", "268435456")
+                .env("QUARANTINE_DIR", dir.path().join("quarantine"))
+                .env("QUARANTINE_MAX_BYTES", "268435456")
+                .env("METRICS_BIND", "127.0.0.1:9090")
+                .env("CACHE_TTL_MS", "1")
+                .env("CACHE_BIND", "127.0.0.1:8080")
+                .env("CACHE_BUFFER", "1");
+            if missing == "WAL_QUEUE_CAPACITY" {
+                command.env(missing, "0");
+            } else {
+                command.env_remove(missing);
+            }
+            if let Some(system_root) = env::var_os("SystemRoot") {
+                command.env("SystemRoot", system_root);
+            }
+
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "configuration probe for {missing} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(!dir.path().join("wal").exists());
+        assert!(!dir.path().join("quarantine").exists());
+        Ok(())
     }
 }
