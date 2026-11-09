@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Canonical Shelly Plug switch:0 record",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "route_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "device_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "measurement": {
+      "const": "shelly_plug"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "device_id"
+      ]
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "type": "boolean"
+        },
+        "power_w": {
+          "type": "number"
+        },
+        "voltage_v": {
+          "type": "number",
+          "minimum": 0
+        },
+        "frequency_hz": {
+          "type": "number",
+          "minimum": 0
+        },
+        "current_a": {
+          "type": "number",
+          "minimum": 0
+        },
+        "energy_wh": {
+          "type": "number",
+          "minimum": 0
+        },
+        "returned_energy_wh": {
+          "type": "number",
+          "minimum": 0
+        },
+        "temp_c": {
+          "type": "number"
+        },
+        "mqtt_retained": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "output",
+        "power_w",
+        "voltage_v",
+        "current_a",
+        "energy_wh",
+        "temp_c",
+        "mqtt_retained"
+      ]
+    },
+    "source_topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "retained": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "route_id",
+    "device_id",
+    "measurement",
+    "timestamp_ms",
+    "tags",
+    "fields",
+    "source_topic",
+    "retained"
+  ]
+}

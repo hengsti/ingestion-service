@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Shelly Plug switch:0 status",
+  "type": "object",
+  "properties": {
+    "id": {
+      "const": 0
+    },
+    "output": {
+      "type": "boolean"
+    },
+    "apower": {
+      "type": "number"
+    },
+    "voltage": {
+      "type": "number",
+      "minimum": 0
+    },
+    "freq": {
+      "type": "number",
+      "minimum": 0
+    },
+    "current": {
+      "type": "number",
+      "minimum": 0
+    },
+    "aenergy": {
+      "$ref": "#/definitions/energy"
+    },
+    "ret_aenergy": {
+      "$ref": "#/definitions/energy"
+    },
+    "temperature": {
+      "type": "object",
+      "properties": {
+        "tC": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "tC"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "output",
+    "apower",
+    "voltage",
+    "current",
+    "aenergy",
+    "temperature"
+  ],
+  "definitions": {
+    "energy": {
+      "type": "object",
+      "properties": {
+        "total": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "total"
+      ]
+    }
+  }
+}
