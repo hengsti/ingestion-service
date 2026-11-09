@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Aqara P100 state",
+  "type": "object",
+  "properties": {
+    "contact": {
+      "type": "boolean"
+    },
+    "linkquality": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "battery": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "voltage": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "device_mode": {
+      "type": "string",
+      "minLength": 1
+    },
+    "device_posture": {
+      "type": "string",
+      "minLength": 1
+    },
+    "door_window_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fall_detection": {
+      "type": "string",
+      "minLength": 1
+    },
+    "movement_detection": {
+      "type": "string",
+      "minLength": 1
+    },
+    "orientation_detection": {
+      "type": "string",
+      "minLength": 1
+    },
+    "report_interval": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sensitivity": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "triple_tap_detection": {
+      "type": "string",
+      "minLength": 1
+    },
+    "vibration_detection": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "contact",
+    "linkquality"
+  ]
+}

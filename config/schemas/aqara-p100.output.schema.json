@@ -1,0 +1,125 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Canonical Aqara P100 record",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "route_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "device_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "measurement": {
+      "const": "aqara_p100"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "device_id"
+      ]
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "contact": {
+          "type": "boolean"
+        },
+        "linkquality": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "battery_perc": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "voltage_mv": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "device_mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "device_posture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "door_window_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fall_detection": {
+          "type": "string",
+          "minLength": 1
+        },
+        "movement_detection": {
+          "type": "string",
+          "minLength": 1
+        },
+        "orientation_detection": {
+          "type": "string",
+          "minLength": 1
+        },
+        "report_interval": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sensitivity": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "triple_tap_detection": {
+          "type": "string",
+          "minLength": 1
+        },
+        "vibration_detection": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mqtt_retained": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "contact",
+        "linkquality",
+        "mqtt_retained"
+      ]
+    },
+    "source_topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "retained": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "route_id",
+    "device_id",
+    "measurement",
+    "timestamp_ms",
+    "tags",
+    "fields",
+    "source_topic",
+    "retained"
+  ]
+}
