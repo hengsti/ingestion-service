@@ -27,10 +27,14 @@
         "device_id": {
           "type": "string",
           "minLength": 1
+        },
+        "device_class": {
+          "const": "aqara-p100"
         }
       },
       "required": [
-        "device_id"
+        "device_id",
+        "device_class"
       ]
     },
     "fields": {

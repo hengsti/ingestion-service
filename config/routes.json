@@ -290,6 +290,9 @@
         "topic_segment": 1
       },
       "measurement": "aqara_p100",
+      "tags": {
+        "device_class": "aqara-p100"
+      },
       "fields": {
         "contact": {
           "pointer": "/contact",
