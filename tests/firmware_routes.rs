@@ -9,7 +9,7 @@ use smarthome_ingest::{
 #[test]
 fn test_firmware_routes_loads_and_compiles_two_routes() -> anyhow::Result<()> {
     let bundle = routes::load("config/routes.json")?;
-    assert_eq!(bundle.version, 1);
+    assert_eq!(bundle.version, 2);
     let sensor_has_topic_identity = matches!(
         &bundle.routes[0].device_id,
         DeviceIdSource::PointerAndTopicSegment(_)

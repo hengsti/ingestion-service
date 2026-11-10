@@ -21,6 +21,36 @@ pub struct RouteBundle {
     pub schema_resources: BTreeMap<String, PathBuf>,
 }
 
+#[derive(Deserialize)]
+struct BundleVersion {
+    version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteManifest {
+    version: u32,
+    route_files: Vec<PathBuf>,
+    #[serde(default)]
+    schema_resources: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteFamily {
+    routes: Vec<RouteBinding>,
+    mapping: serde_json::Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteBinding {
+    id: String,
+    topic: String,
+    #[serde(default, deserialize_with = "deserialize_sink_target")]
+    sink_target: Option<String>,
+}
+
 /// A single topic route and its payload-to-record mappings.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,7 +217,7 @@ pub enum TimestampFallback {
     ReceivedAt,
 }
 
-/// Calculation names supported by the v1 route contract.
+/// Calculation names supported by the route contract.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CalculationName {
@@ -201,9 +231,9 @@ pub enum CalculationName {
 
 impl RouteBundle {
     fn validate(&mut self, bundle_path: &Path) -> Result<()> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             bail!(
-                "unsupported route bundle version {}; only version 1 is supported",
+                "unsupported route bundle version {}; only versions 1 and 2 are supported",
                 self.version
             );
         }
@@ -212,11 +242,26 @@ impl RouteBundle {
         }
 
         let bundle_dir = bundle_path.parent().unwrap_or_else(|| Path::new(""));
+        let canonical_root = if self.version == 2 {
+            Some(fs::canonicalize(if bundle_dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                bundle_dir
+            })?)
+        } else {
+            None
+        };
         let mut ids = BTreeSet::new();
         for (index, route) in self.routes.iter_mut().enumerate() {
             route
                 .validate(bundle_dir)
                 .with_context(|| format!("validating routes[{index}]"))?;
+            if let Some(root) = &canonical_root {
+                route.schema = contained_file(&route.schema, root, "schema")?;
+                if let Some(output_schema) = &mut route.output_schema {
+                    *output_schema = contained_file(output_schema, root, "output_schema")?;
+                }
+            }
             if !ids.insert(route.id.as_str()) {
                 bail!("duplicate route id '{}'", route.id);
             }
@@ -231,6 +276,9 @@ impl RouteBundle {
             }
             *path =
                 resolve_bundle_path(path, bundle_dir, &format!("schema_resources entry '{uri}'"))?;
+            if let Some(root) = &canonical_root {
+                *path = contained_file(path, root, "schema_resources")?;
+            }
         }
 
         Ok(())
@@ -481,15 +529,83 @@ fn resolve_bundle_path(path: &Path, bundle_dir: &Path, label: &str) -> Result<Pa
     Ok(bundle_dir.join(path))
 }
 
-/// Loads and validates a v1 route bundle from a JSON file.
+fn contained_file(path: &Path, root: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("resolving {label} file '{}'", path.display()))?;
+    if !canonical.starts_with(root) {
+        bail!("{label} path must not escape the bundle directory");
+    }
+    Ok(canonical)
+}
+
+fn load_manifest(contents: &str, path: &Path) -> Result<RouteBundle> {
+    let manifest: RouteManifest = serde_json::from_str(contents)?;
+    if manifest.route_files.is_empty() {
+        bail!("route_files must contain at least one file");
+    }
+    let bundle_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root = fs::canonicalize(bundle_dir).context("resolving bundle directory")?;
+    let mut files = BTreeSet::new();
+    let mut routes = Vec::new();
+    for (index, file) in manifest.route_files.iter().enumerate() {
+        let file = resolve_bundle_path(file, &root, "route_files")?;
+        let file = contained_file(&file, &root, "route_files")?;
+        if !files.insert(file.clone()) {
+            bail!("duplicate route_files reference at index {index}");
+        }
+        let contents = fs::read_to_string(&file)
+            .with_context(|| format!("reading route family '{}'", file.display()))?;
+        let family: RouteFamily = serde_json::from_str(&contents)
+            .with_context(|| format!("parsing route family '{}'", file.display()))?;
+        if family.routes.is_empty() {
+            bail!(
+                "route family '{}' must contain at least one binding",
+                file.display()
+            );
+        }
+        for key in ["id", "topic", "sink_target"] {
+            if family.mapping.contains_key(key) {
+                bail!(
+                    "route family '{}' mapping must not define binding property '{key}'",
+                    file.display()
+                );
+            }
+        }
+        for (index, binding) in family.routes.into_iter().enumerate() {
+            // Only disjoint binding keys are added; RouteConfig owns the mapping contract.
+            let mut route = family.mapping.clone();
+            route.insert("id".into(), binding.id.into());
+            route.insert("topic".into(), binding.topic.into());
+            if let Some(target) = binding.sink_target {
+                route.insert("sink_target".into(), target.into());
+            }
+            let context = || format!("route family '{}' binding[{index}]", file.display());
+            let route: RouteConfig =
+                serde_json::from_value(Value::Object(route)).with_context(context)?;
+            route.validate_static().with_context(context)?;
+            routes.push(route);
+        }
+    }
+    Ok(RouteBundle {
+        version: manifest.version,
+        routes,
+        schema_resources: manifest.schema_resources,
+    })
+}
+
+/// Loads and validates a v1 inline bundle or v2 manifest from a JSON file.
 ///
-/// Relative schema paths are resolved against the parent directory of the bundle file.
+/// All relative file paths resolve against the bundle's parent directory. V2 expands
+/// explicitly listed family files into flat routes and checks canonical containment.
 /// This function does not compile schemas, access the environment, or perform network I/O.
 ///
 /// # Errors
 ///
 /// Returns an error when the path is empty or unreadable, the JSON is invalid, the bundle
-/// version is unsupported, or any route violates the v1 contract.
+/// version is unsupported, or any file or route violates the configuration contract.
 pub fn load(path: impl AsRef<Path>) -> Result<RouteBundle> {
     let path = path.as_ref();
     if path.as_os_str().is_empty() {
@@ -498,8 +614,17 @@ pub fn load(path: impl AsRef<Path>) -> Result<RouteBundle> {
 
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading route bundle '{}'", path.display()))?;
-    let mut bundle: RouteBundle = serde_json::from_str(&contents)
+    let version: BundleVersion = serde_json::from_str(&contents)
         .with_context(|| format!("parsing route bundle '{}'", path.display()))?;
+    let mut bundle = match version.version {
+        1 => serde_json::from_str::<RouteBundle>(&contents)
+            .with_context(|| format!("parsing route bundle '{}'", path.display()))?,
+        2 => load_manifest(&contents, path)
+            .with_context(|| format!("loading route manifest '{}'", path.display()))?,
+        version => {
+            bail!("unsupported route bundle version {version}; only versions 1 and 2 are supported")
+        }
+    };
     bundle
         .validate(path)
         .with_context(|| format!("validating route bundle '{}'", path.display()))?;
@@ -531,7 +656,7 @@ where
         None
     } else {
         Some(format!(
-            "Removed routing environment variables are set: {}. Define subscriptions in the v1 route bundle and set INGEST_ROUTES_FILE instead.",
+            "Removed routing environment variables are set: {}. Define subscriptions in the route bundle and set INGEST_ROUTES_FILE instead.",
             removed.join(", ")
         ))
     }
@@ -569,6 +694,217 @@ mod tests {
         let path = dir.path().join("routes.json");
         fs::write(&path, serde_json::to_vec(value)?)?;
         load(path)
+    }
+
+    fn v2_family(id: &str, topic: &str) -> Value {
+        let mut mapping = valid_route();
+        let object = mapping.as_object_mut().unwrap();
+        object.remove("id");
+        object.remove("topic");
+        json!({"routes": [{"id": id, "topic": topic}], "mapping": mapping})
+    }
+
+    fn write_v2_fixture(directory: &Path) -> Result<(PathBuf, Value, Value)> {
+        fs::create_dir_all(directory.join("routes/nested"))?;
+        fs::create_dir_all(directory.join("schemas"))?;
+        fs::write(directory.join("schemas/test.json"), "{}")?;
+        let manifest = json!({"version": 2, "route_files": ["routes/nested/first.json"]});
+        let family = v2_family("first", "test/first");
+        let path = directory.join("routes.json");
+        fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        fs::write(
+            directory.join("routes/nested/first.json"),
+            serde_json::to_vec(&family)?,
+        )?;
+        Ok((path, manifest, family))
+    }
+
+    #[test]
+    fn test_route_config_v2_expands_families_in_order_from_manifest_root() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (path, mut manifest, mut family) = write_v2_fixture(directory.path())?;
+        family["routes"].as_array_mut().unwrap().push(json!({
+            "id": "second", "topic": "test/second", "sink_target": "metrics"
+        }));
+        family["mapping"]["output_schema"] = json!("schemas/test.json");
+        manifest["route_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("routes/last.json"));
+        manifest["schema_resources"] = json!({"https://schemas.test/shared": "schemas/test.json"});
+        fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        fs::write(
+            directory.path().join("routes/nested/first.json"),
+            serde_json::to_vec(&family)?,
+        )?;
+        fs::write(
+            directory.path().join("routes/last.json"),
+            serde_json::to_vec(&v2_family("third", "test/third"))?,
+        )?;
+        fs::write(directory.path().join("routes/inactive.json"), "not JSON")?;
+
+        let bundle = load(&path)?;
+
+        assert_eq!(bundle.version, 2);
+        assert_eq!(
+            bundle
+                .routes
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        assert!(bundle.routes[0].sink_target.is_none());
+        assert_eq!(bundle.routes[1].sink_target.as_deref(), Some("metrics"));
+        assert_eq!(
+            bundle.routes[0].schema,
+            directory.path().join("schemas/test.json").canonicalize()?
+        );
+        assert_eq!(bundle.routes[0].schema, bundle.routes[1].schema);
+        assert_eq!(
+            bundle.routes[0].output_schema.as_ref(),
+            Some(&bundle.routes[0].schema)
+        );
+        assert_eq!(
+            bundle.schema_resources["https://schemas.test/shared"],
+            bundle.routes[0].schema
+        );
+        assert_eq!(bundle.routes[1].fields["temp_c"].pointer, "/temperature");
+        Ok(())
+    }
+
+    #[test]
+    fn test_route_config_v2_rejects_invalid_manifest_and_file_references() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (path, manifest, _) = write_v2_fixture(directory.path())?;
+        for (key, value, expected) in [
+            ("route_files", json!([]), "at least one"),
+            ("route_files", json!([""]), "empty"),
+            ("route_files", json!(["missing.json"]), "missing.json"),
+            ("route_files", json!(["../outside.json"]), "escape"),
+            (
+                "route_files",
+                json!([directory.path().join("routes/nested/first.json")]),
+                "relative",
+            ),
+            (
+                "route_files",
+                json!([
+                    "routes/nested/first.json",
+                    "routes/nested/../nested/first.json"
+                ]),
+                "duplicate",
+            ),
+            ("routes", json!([]), "unknown field"),
+        ] {
+            let mut invalid = manifest.clone();
+            invalid[key] = value;
+            fs::write(&path, serde_json::to_vec(&invalid)?)?;
+            let error = load(&path).expect_err("invalid manifest must fail");
+            assert!(format!("{error:#}").contains(expected), "{key}: {error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_route_config_v2_rejects_invalid_families_and_mapping_overrides() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (path, _, family) = write_v2_fixture(directory.path())?;
+        for (pointer, value) in [
+            ("/routes", json!([])),
+            ("/mapping", json!(null)),
+            ("/mapping/id", json!("hidden")),
+            ("/mapping/topic", json!("hidden/topic")),
+            ("/mapping/sink_target", json!("hidden-target")),
+            ("/mapping/unknown", json!(true)),
+            ("/routes/0/fields", json!({})),
+            ("/routes/0/sink_target", json!(null)),
+            ("/routes/0/topic", json!(null)),
+            ("/unknown", json!(true)),
+        ] {
+            let mut invalid = family.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            invalid.pointer_mut(parent).unwrap()[key] = value;
+            fs::write(
+                directory.path().join("routes/nested/first.json"),
+                serde_json::to_vec(&invalid)?,
+            )?;
+            let error = load(&path).expect_err("invalid family must fail");
+            assert!(
+                format!("{error:#}").contains("first.json"),
+                "{pointer}: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_route_config_v2_rejects_cross_file_duplicate_ids_and_schema_escapes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (path, mut manifest, mut family) = write_v2_fixture(directory.path())?;
+        manifest["route_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("routes/duplicate.json"));
+        fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        fs::write(
+            directory.path().join("routes/duplicate.json"),
+            serde_json::to_vec(&family)?,
+        )?;
+        assert!(format!("{:#}", load(&path).unwrap_err()).contains("duplicate route id"));
+        family["routes"][0]["id"] = json!("other");
+        for property in ["schema", "output_schema"] {
+            let mut invalid = family.clone();
+            invalid["mapping"][property] = json!("../outside.json");
+            fs::write(
+                directory.path().join("routes/duplicate.json"),
+                serde_json::to_vec(&invalid)?,
+            )?;
+            assert!(format!("{:#}", load(&path).unwrap_err()).contains("escape"));
+        }
+        fs::write(
+            directory.path().join("routes/duplicate.json"),
+            serde_json::to_vec(&family)?,
+        )?;
+        manifest["schema_resources"] = json!({"https://schemas.test/outside": "../outside.json"});
+        fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        assert!(format!("{:#}", load(&path).unwrap_err()).contains("escape"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_route_config_v2_rejects_symlink_escapes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let (path, manifest, family) = write_v2_fixture(directory.path())?;
+        std::os::unix::fs::symlink(outside.path(), directory.path().join("outside"))?;
+        fs::write(outside.path().join("family.json"), "{}")?;
+        let mut invalid_manifest = manifest.clone();
+        invalid_manifest["route_files"] = json!(["outside/family.json"]);
+        fs::write(&path, serde_json::to_vec(&invalid_manifest)?)?;
+        assert!(format!("{:#}", load(&path).unwrap_err()).contains("escape"));
+        fs::write(outside.path().join("schema.json"), "{}")?;
+        fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        for property in ["schema", "output_schema"] {
+            let mut invalid = family.clone();
+            invalid["mapping"][property] = json!("outside/schema.json");
+            fs::write(
+                directory.path().join("routes/nested/first.json"),
+                serde_json::to_vec(&invalid)?,
+            )?;
+            assert!(format!("{:#}", load(&path).unwrap_err()).contains("escape"));
+        }
+        fs::write(
+            directory.path().join("routes/nested/first.json"),
+            serde_json::to_vec(&family)?,
+        )?;
+        invalid_manifest = manifest;
+        invalid_manifest["schema_resources"] =
+            json!({"https://schemas.test/outside": "outside/schema.json"});
+        fs::write(&path, serde_json::to_vec(&invalid_manifest)?)?;
+        assert!(format!("{:#}", load(&path).unwrap_err()).contains("escape"));
+        Ok(())
     }
 
     #[test]
@@ -639,11 +975,11 @@ mod tests {
     #[test]
     fn test_route_config_rejects_unsupported_version() {
         let mut bundle = valid_bundle();
-        bundle["version"] = json!(2);
+        bundle["version"] = json!(3);
 
         let err = load_value(&bundle).expect_err("unsupported version must fail");
 
-        assert!(format!("{err:#}").contains("only version 1 is supported"));
+        assert!(format!("{err:#}").contains("only versions 1 and 2 are supported"));
     }
 
     #[test]

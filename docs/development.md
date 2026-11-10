@@ -152,9 +152,11 @@ retention are recorded in `broker-settings.txt` (currently infinity and one day 
 These test settings do not establish the deployed broker's persistence, publisher QoS,
 outage budget, filesystem quota, or ARM64 capacity.
 
-The generated bundle reuses `config/routes.json`, its schemas, and the existing synthetic
-Zigbee fixture. Only test mappings add a scalar string `test_id`; no production per-event tags
-are introduced. Recovery publications use distinct device identities or millisecond timestamps
+The generated mutable v1 bundle reuses the frozen `tests/fixtures/routes/shipped-v1.json`,
+the shipped schemas, and the existing synthetic Zigbee fixture. It removes the shipped routes'
+explicit sink targets so every synthetic route uses the scenario's `INFLUX_BUCKET`, including
+scenario-owned recovery buckets. Only test mappings add a scalar string `test_id`; no
+production per-event tags are introduced. Recovery publications use distinct device identities or millisecond timestamps
 and compare actual output/quarantine ID sets, allowing duplicates but failing omissions or
 unexpected IDs. The separate collision test deliberately shares a point identity and verifies
 field merge plus last-value overwrite; Influx is not an event ledger. QoS 0 is observed as a
@@ -222,9 +224,11 @@ Never point this command at the Server project or production volume names.
 ## Add a telemetry route
 
 1. Add or update raw/output schemas under `config/schemas/`.
-2. Add a route to `config/routes.json` with its topic filter, identity source,
-   measurement, mappings, timestamp, and optional calculations/cache setting.
-3. Use schema paths relative to the route bundle. The bundle is compiled at startup;
+2. In a v2 bundle, add an `id`/`topic`/optional `sink_target` binding to a family with the
+   same mapping, or create a family file with its identity source, measurement, mappings,
+   timestamp and optional calculations/cache setting. List new files in `config/routes.json`.
+   V1 bundles continue to use inline routes. Keep production assignments in Server configuration.
+3. Use schema paths relative to the root manifest, including inside family files. The bundle is compiled at startup;
    invalid schemas, duplicate route IDs, overlapping filters, conflicting names,
    control characters in static output text, and incompatible field types fail startup.
 4. Add a focused route test and a pipeline integration case for the new payload.

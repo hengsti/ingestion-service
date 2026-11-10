@@ -34,8 +34,9 @@ These docs are written for:
 | `src/infrastructure/cache/` | Latest sensor state cache and HTTP/SSE API |
 | `src/infrastructure/sink/` | `Sink`/`Encoder` traits, the InfluxDB implementation, and the line protocol point builder |
 | `src/infrastructure/wal/` | WAL writer, reader subscription, cursor, recovery, and forwarder |
-| `config/routes.json` and `config/schemas/` | Shipped firmware routes and their runtime-loaded raw/output schemas |
+| `config/routes.json`, `config/routes/`, `config/schemas/` | Shipped manifest, route families and runtime-loaded raw/output schemas |
 | `config/examples/climate/` | Synthetic copyable route, schemas, and environment reference |
+| `config/examples/families/` | V2 manifest with shared mappings, multiple bindings and destinations |
 | `tests/` | Integration tests for pipeline, cache API, batching, and sink forwarding |
 | `.github/workflows/` | CI and CD workflows |
 

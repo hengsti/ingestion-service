@@ -1,11 +1,73 @@
 # Messages and Routing
 
 The route bundle is the contract between MQTT publishers and the ingest pipeline.
-Set `INGEST_ROUTES_FILE` to the v1 JSON bundle; the shipped configuration is
+Set `INGEST_ROUTES_FILE` to a v1 inline JSON bundle or v2 manifest; the shipped configuration is
 [`config/routes.json`](../config/routes.json). MQTT subscribes to the bundle's exact
 filters. Every subscribed topic, including firmware sensor and status topics, is a
 configured route. Route selection does not infer a message type from a topic suffix or
 publisher. Schema and schema-resource paths are relative to the bundle file.
+
+## Bundle files
+
+The shipped v2 manifest lists active files under [`config/routes/`](../config/routes/).
+Each file groups routes with exactly the same mapping:
+
+```json
+{
+  "version": 2,
+  "route_files": ["routes/climate.json", "routes/health.json"]
+}
+```
+
+A family file has `routes` (bindings) followed by `mapping`. Every binding supplies
+`id`, `topic`, and optionally `sink_target`. The mapping supplies the remaining existing
+route properties: raw/output schemas, identity, measurement, tags, fields, timestamp,
+calculations and cache policy. Add a device with the same format by adding a short binding;
+the field mapping stays in one place. Different mappings or fixed identities need separate
+files. Mapping overrides, inheritance and deep merging are unsupported. Unknown properties
+and binding keys inside a mapping are rejected.
+
+See the runnable [family example](../config/examples/families/README.md), which uses two
+climate bindings with different destinations and a separate health family. The manifest
+may also register shared schemas with the existing `schema_resources` URI-to-file map.
+
+All relative paths resolve from the **manifest directory**, including schema paths inside
+nested family files. V2 requires referenced files to exist inside that directory; absolute
+paths, traversal/symlink escapes and repeated family-file references fail. Only listed
+files are loaded, in manifest order and then binding order. Unlisted files are inactive;
+there is no directory discovery or recursive include mechanism. CD additionally disallows
+all symlinks in the runtime configuration.
+
+At startup the loader expands the files into ordinary flat routes, then the existing
+compiler validates the entire set. A failure prevents activation of the whole bundle.
+Duplicate IDs, overlapping filters and incompatible field types are checked across files.
+The same checks run with `--check-config`. There are extra file reads at startup; the
+compiled per-message path and runtime route storage model are unchanged.
+
+### Migrate v1 to v2
+
+V1 inline bundles remain supported without rewriting them. Migration is optional:
+
+1. Preserve the complete validated v1 directory and its compatible image as a rollback pair.
+   Prepare v2 in a separate directory with copies of the same schemas.
+2. For each route, move `id`, `topic` and its existing optional `sink_target` into a binding.
+   Move every other property unchanged into `mapping`. Group bindings only when their
+   mappings are identical; singleton families are valid.
+3. Replace the root inline `routes` array with an explicit `route_files` array, set
+   `version` to `2`, and keep `schema_resources` unchanged. Keep every schema path relative
+   to the manifest directory. Preserve binding order, route IDs and exact MQTT filters.
+4. With the normal runtime environment, validate the new directory using the candidate
+   binary: `INGEST_ROUTES_FILE=/path/to/candidate/routes.json smarthome-ingest --check-config`.
+   Confirm identical targets, types, timestamps, defaults, calculations and cache policy.
+5. Stop ingest before switching the selected configuration directory and compatible image,
+   then restart. Preserve MQTT identity/session and both journals. A layout-only migration
+   keeps subscriptions unchanged; actual filter changes follow the existing subscription
+   migration procedure below.
+
+Binaries predating v2 cannot read the new manifest. Rolling back to one requires explicitly
+selecting its compatible v1 directory as well as its image; CD never rewrites operator files
+from a snapshot. Pending WAL records keep their encoded payload and destination. The separate
+[WAL downgrade restrictions](wal-and-reliability.md#sink-target-migration) still apply.
 
 ## Synthetic climate walkthrough
 

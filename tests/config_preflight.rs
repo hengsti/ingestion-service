@@ -75,6 +75,105 @@ fn combined_output(output: &Output) -> String {
     )
 }
 
+fn copy_fixture_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_fixture_tree(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_check_config_v2_validates_complete_nested_bundle_from_another_cwd() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = directory.path().join("config");
+    copy_fixture_tree(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/examples/families"),
+        &config,
+    )?;
+    let path = config.join("routes.json");
+    let output = preflight_command(&directory, &path)
+        .current_dir(directory.path())
+        .arg("--check-config")
+        .output()?;
+    assert!(output.status.success(), "{}", combined_output(&output));
+    assert!(combined_output(&output).contains("3 routes"));
+
+    let family_path = config.join("routes/health.json");
+    let family: Value = serde_json::from_slice(&fs::read(&family_path)?)?;
+    for (pointer, value, expected) in [
+        (
+            "/routes/0/id",
+            json!("example-climate-a"),
+            "duplicate route id",
+        ),
+        (
+            "/routes/0/topic",
+            json!("example/climate-a/+"),
+            "overlapping",
+        ),
+        ("/routes/0/topic", json!("test/dlq"), "DLQ"),
+        (
+            "/routes/0/sink_target",
+            json!({"token": "sentinel-secret"}),
+            "sink_target",
+        ),
+        (
+            "/mapping/schema",
+            json!("schemas/missing.json"),
+            "missing.json",
+        ),
+        (
+            "/mapping/calculations",
+            json!(["missing_calculation"]),
+            "missing_calculation",
+        ),
+    ] {
+        let mut invalid = family.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        invalid.pointer_mut(parent).unwrap()[key] = value;
+        if expected == "DLQ" {
+            invalid["mapping"]["device_id"] = json!("dlq-fixture");
+        }
+        fs::write(&family_path, serde_json::to_vec(&invalid)?)?;
+        let output = preflight_command(&directory, &path)
+            .current_dir(directory.path())
+            .arg("--check-config")
+            .output()?;
+        let message = combined_output(&output);
+        assert!(!output.status.success(), "{pointer} accepted");
+        assert!(message.contains(expected), "{pointer}: {message}");
+        assert!(message.len() < 4096);
+        assert!(!message.contains("sentinel-secret"));
+        assert!(!message.contains("synthetic-preflight-token"));
+    }
+    let mut collision = family.clone();
+    collision["routes"][0]["sink_target"] = json!("example-sensors");
+    collision["mapping"]["measurement"] = json!("climate");
+    collision["mapping"]["fields"] = json!({"temp_c": {"pointer": "/code", "type": "boolean"}});
+    fs::write(&family_path, serde_json::to_vec(&collision)?)?;
+    let output = preflight_command(&directory, &path)
+        .arg("--check-config")
+        .output()?;
+    assert!(!output.status.success());
+    assert!(combined_output(&output).contains("type"));
+    fs::write(&family_path, "{ invalid JSON")?;
+    let output = preflight_command(&directory, &path)
+        .arg("--check-config")
+        .output()?;
+    assert!(!output.status.success());
+    assert!(combined_output(&output).contains("health.json"));
+    assert!(!directory.path().join("wal").exists());
+    assert!(!directory.path().join("quarantine").exists());
+    Ok(())
+}
+
 #[test]
 fn test_check_config_accepts_production_bundle_without_journal_side_effects() -> Result<()> {
     let directory = tempfile::tempdir()?;

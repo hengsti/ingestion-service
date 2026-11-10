@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "climate": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "Synthetic climate input",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temp_c": {
+          "type": "number"
+        },
+        "rel_hum_perc": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "site_label": {
+          "type": "string"
+        },
+        "sensor_label": {
+          "type": "string"
+        },
+        "time_ms": {
+          "type": "integer"
+        },
+        "time_valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "temp_c",
+        "rel_hum_perc",
+        "time_ms",
+        "time_valid"
+      ]
+    },
+    "health": {
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

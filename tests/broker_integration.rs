@@ -76,6 +76,25 @@ fn test_publication_oracle_rejects_omissions_and_unexpected_ids() -> Result<()> 
 }
 
 #[test]
+fn test_synthetic_routes_use_the_scenario_bucket() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    broker::write_routes(directory.path())?;
+    for bucket in ["scenario-a", "scenario-b"] {
+        let routes = RouteSet::compile(
+            routes::load(directory.path().join("routes.json"))?,
+            "ingest-it/dlq",
+            bucket,
+        )?;
+        for filter in routes.subscriptions() {
+            let topic = filter.replace('+', "fixture-device");
+            let route = routes.select(&topic).context("synthetic route")?;
+            assert_eq!(route.sink_target(), bucket, "route {}", route.id());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_synthetic_routes_preserve_scalar_oracle_and_distinct_point_identities() -> Result<()> {
     let dir = tempfile::tempdir()?;
     broker::write_routes(dir.path())?;

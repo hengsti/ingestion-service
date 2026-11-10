@@ -1,0 +1,24 @@
+{
+  "routes": [
+    {
+      "id": "example-health",
+      "topic": "example/health/+"
+    }
+  ],
+  "mapping": {
+    "schema": "schemas/health.schema.json",
+    "device_id": {
+      "topic_segment": 2
+    },
+    "measurement": "health",
+    "fields": {
+      "code": {
+        "pointer": "/code",
+        "type": "integer"
+      }
+    },
+    "timestamp": {
+      "source": "received_at"
+    }
+  }
+}
