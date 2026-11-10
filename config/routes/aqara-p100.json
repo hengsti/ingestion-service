@@ -1,0 +1,94 @@
+{
+  "routes": [
+    {
+      "id": "aqara-p100-buero",
+      "topic": "zigbee2mqtt/Buero-Aqara-P100",
+      "sink_target": "sensors"
+    }
+  ],
+  "mapping": {
+    "schema": "schemas/aqara-p100.schema.json",
+    "output_schema": "schemas/aqara-p100.output.schema.json",
+    "device_id": {
+      "topic_segment": 1
+    },
+    "measurement": "aqara_p100",
+    "tags": {
+      "device_class": "aqara-p100"
+    },
+    "fields": {
+      "contact": {
+        "pointer": "/contact",
+        "type": "boolean"
+      },
+      "linkquality": {
+        "pointer": "/linkquality",
+        "type": "integer"
+      },
+      "battery_perc": {
+        "pointer": "/battery",
+        "type": "float",
+        "optional": true
+      },
+      "voltage_mv": {
+        "pointer": "/voltage",
+        "type": "integer",
+        "optional": true
+      },
+      "device_mode": {
+        "pointer": "/device_mode",
+        "type": "string",
+        "optional": true
+      },
+      "device_posture": {
+        "pointer": "/device_posture",
+        "type": "string",
+        "optional": true
+      },
+      "door_window_type": {
+        "pointer": "/door_window_type",
+        "type": "string",
+        "optional": true
+      },
+      "fall_detection": {
+        "pointer": "/fall_detection",
+        "type": "string",
+        "optional": true
+      },
+      "movement_detection": {
+        "pointer": "/movement_detection",
+        "type": "string",
+        "optional": true
+      },
+      "orientation_detection": {
+        "pointer": "/orientation_detection",
+        "type": "string",
+        "optional": true
+      },
+      "report_interval": {
+        "pointer": "/report_interval",
+        "type": "integer",
+        "optional": true
+      },
+      "sensitivity": {
+        "pointer": "/sensitivity",
+        "type": "integer",
+        "optional": true
+      },
+      "triple_tap_detection": {
+        "pointer": "/triple_tap_detection",
+        "type": "string",
+        "optional": true
+      },
+      "vibration_detection": {
+        "pointer": "/vibration_detection",
+        "type": "string",
+        "optional": true
+      }
+    },
+    "timestamp": {
+      "source": "received_at"
+    },
+    "cache": false
+  }
+}

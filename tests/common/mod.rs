@@ -84,6 +84,21 @@ pub fn influx_encoder() -> Arc<dyn Encoder> {
     Arc::new(InfluxEncoder)
 }
 
+/// Writes the frozen v1 bundle with its schemas for compatibility tests.
+pub fn write_v1_shipped_bundle(directory: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let schemas = directory.join("schemas");
+    std::fs::create_dir_all(&schemas)?;
+    for entry in
+        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/schemas"))?
+    {
+        let entry = entry?;
+        std::fs::copy(entry.path(), schemas.join(entry.file_name()))?;
+    }
+    let path = directory.join("routes.json");
+    std::fs::write(&path, include_str!("../fixtures/routes/shipped-v1.json"))?;
+    Ok(path)
+}
+
 /// Builds the full ingest pipeline persisting to a temporary WAL.
 ///
 /// Returns the runner, the WAL subscription (to assert on persisted events),

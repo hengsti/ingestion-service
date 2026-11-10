@@ -1,0 +1,98 @@
+{
+  "routes": [
+    {
+      "id": "firmware-status",
+      "topic": "smarthome/+/status",
+      "sink_target": "sensors"
+    }
+  ],
+  "mapping": {
+    "schema": "schemas/status.schema.json",
+    "output_schema": "schemas/status.output.schema.json",
+    "device_id": {
+      "pointer": "/device_id",
+      "topic_segment": 1
+    },
+    "measurement": "device_status",
+    "tags": {
+      "device_class": {
+        "pointer": "/device_class"
+      }
+    },
+    "fields": {
+      "firmware_version": {
+        "pointer": "/fw_version",
+        "type": "string"
+      },
+      "ip_address": {
+        "pointer": "/ip",
+        "type": "string"
+      },
+      "time_valid": {
+        "pointer": "/time_valid",
+        "type": "boolean"
+      },
+      "time_iso": {
+        "pointer": "/time_iso",
+        "type": "string"
+      },
+      "rssi": {
+        "pointer": "/rssi",
+        "type": "integer"
+      },
+      "uptime": {
+        "pointer": "/uptime",
+        "type": "integer",
+        "default": 0
+      },
+      "free_mem": {
+        "pointer": "/free_mem",
+        "type": "integer",
+        "default": 0
+      },
+      "ssid": {
+        "pointer": "/ssid",
+        "type": "string",
+        "default": ""
+      },
+      "queued": {
+        "pointer": "/queued",
+        "type": "integer",
+        "optional": true
+      },
+      "dropped_total": {
+        "pointer": "/dropped_total",
+        "type": "integer",
+        "optional": true
+      },
+      "samples_failed_total": {
+        "pointer": "/samples_failed_total",
+        "type": "integer",
+        "optional": true
+      },
+      "mqtt_connects_total": {
+        "pointer": "/mqtt_connects_total",
+        "type": "integer",
+        "optional": true
+      },
+      "sensor_read_failures_total": {
+        "pointer": "/sensor_read_failures_total",
+        "type": "integer",
+        "optional": true
+      },
+      "reset_reason": {
+        "pointer": "/reset_reason",
+        "type": "string",
+        "optional": true
+      }
+    },
+    "timestamp": {
+      "source": "payload",
+      "pointer": "/time_ms",
+      "format": "epoch_ms",
+      "valid_flag": "/time_valid",
+      "fallback": "received_at"
+    },
+    "cache": false
+  }
+}

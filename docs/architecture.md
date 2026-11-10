@@ -16,6 +16,9 @@ Config + route bundle
   -> WAL forwarder -> sink
 ```
 
+The loader accepts v1 inline routes or expands explicit v2 family files into the same flat
+route model. V2 shares a mapping among short topic bindings; all files are loaded and
+validated before activation, with no runtime configuration lookup or file access.
 `main.rs` compiles the route bundle once. MQTT subscriptions come from that compiled set,
 and each message selects a route by its configured topic filter. The route's schemas,
 identity mapping, field mappings, calculations, measurement, sink target, output validation, and cache

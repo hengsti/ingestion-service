@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "schema_resources": {
+    "https://schemas.example.test/payloads": "schemas/payloads.schema.json"
+  },
+  "route_files": [
+    "routes/climate.json",
+    "routes/health.json"
+  ]
+}

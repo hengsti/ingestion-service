@@ -16,19 +16,23 @@ The service ingests messages through a swappable `Source` abstraction (see `docs
 
 | Variable | Required | Default | Description |
 |---|---:|---|---|
-| `INGEST_ROUTES_FILE` | Yes | None | Path to the v1 JSON route bundle. Subscriptions, schemas, mapping, calculations, output validation, measurements, and cache opt-in are loaded from this file. |
+| `INGEST_ROUTES_FILE` | Yes | None | Path to a v1 inline JSON bundle or v2 manifest listing route-family files. Subscriptions, schemas, mapping, calculations, output validation, measurements, and cache opt-in are loaded from the selected bundle. |
 
-The shipped bundle is [`config/routes.json`](../config/routes.json). It is compiled once at startup;
+The shipped v2 manifest is [`config/routes.json`](../config/routes.json), with family files in
+[`config/routes/`](../config/routes/). It is compiled once at startup;
 an empty route list or invalid route/schema fails startup. Schema-resource paths are relative to the
-bundle's directory. Keep the bundle and every referenced schema file together when deploying; the
+bundle's directory, including paths in nested family files. Keep the manifest, listed family files
+and every referenced schema file together when deploying; the
 repository's firmware bundle stores its schemas under `config/schemas/`. The image includes the
 repository bundle at `/app/config`; Compose can override it with a complete read-only bind mount.
 
 Every subscribed topic, including firmware sensor and status traffic, must be represented by one
 route in this bundle. The firmware sensor filter is `smarthome/+/bme680`; the status filter is
 `smarthome/+/status`. Their measurements, schemas, mappings, calculations, and cache policy are in
-[`config/routes.json`](../config/routes.json). For a complete synthetic route and payload, see
-[`config/examples/climate`](../config/examples/climate/README.md).
+[`config/routes/`](../config/routes/). For complete synthetic routes and payloads, see the
+[v1 climate example](../config/examples/climate/README.md) and
+[v2 family example](../config/examples/families/README.md). Existing v1 bundles remain supported;
+see [file structure and manual migration](messages-and-routing.md#bundle-files).
 
 The former `MQTT_TOPIC_SENSOR`, `MQTT_TOPIC_STATUS`, other non-DLQ `MQTT_TOPIC_*` variables, and
 `ENFORCE_TOPIC_DEVICE_MATCH` are rejected at startup with a migration hint to use the route bundle.

@@ -1,0 +1,53 @@
+{
+  "routes": [
+    {
+      "id": "example-climate-a",
+      "topic": "example/climate-a/+",
+      "sink_target": "example-sensors"
+    },
+    {
+      "id": "example-climate-b",
+      "topic": "example/climate-b/+",
+      "sink_target": "example-metrics"
+    }
+  ],
+  "mapping": {
+    "schema": "schemas/climate.schema.json",
+    "output_schema": "schemas/climate.output.schema.json",
+    "device_id": {
+      "topic_segment": 2
+    },
+    "measurement": "climate",
+    "fields": {
+      "temp_c": {
+        "pointer": "/temp_c",
+        "type": "float"
+      },
+      "rel_hum_perc": {
+        "pointer": "/rel_hum_perc",
+        "type": "float"
+      },
+      "site_label": {
+        "pointer": "/site_label",
+        "type": "string",
+        "default": "unassigned"
+      },
+      "sensor_label": {
+        "pointer": "/sensor_label",
+        "type": "string",
+        "optional": true
+      }
+    },
+    "timestamp": {
+      "source": "payload",
+      "pointer": "/time_ms",
+      "format": "epoch_ms",
+      "valid_flag": "/time_valid",
+      "fallback": "received_at"
+    },
+    "calculations": [
+      "dew_point"
+    ],
+    "cache": true
+  }
+}

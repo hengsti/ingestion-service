@@ -1,0 +1,62 @@
+{
+  "routes": [
+    {
+      "id": "shelly-plug-907069671340",
+      "topic": "shellyplugmg3-907069671340/status/switch:0",
+      "sink_target": "sensors"
+    },
+    {
+      "id": "shelly-plug-90706968bf88",
+      "topic": "shellyplugmg3-90706968bf88/status/switch:0",
+      "sink_target": "sensors"
+    }
+  ],
+  "mapping": {
+    "schema": "schemas/shelly-plug.schema.json",
+    "output_schema": "schemas/shelly-plug.output.schema.json",
+    "device_id": {
+      "topic_segment": 0
+    },
+    "measurement": "shelly_plug",
+    "fields": {
+      "output": {
+        "pointer": "/output",
+        "type": "boolean"
+      },
+      "power_w": {
+        "pointer": "/apower",
+        "type": "float"
+      },
+      "voltage_v": {
+        "pointer": "/voltage",
+        "type": "float"
+      },
+      "frequency_hz": {
+        "pointer": "/freq",
+        "type": "float",
+        "optional": true
+      },
+      "current_a": {
+        "pointer": "/current",
+        "type": "float"
+      },
+      "energy_wh": {
+        "pointer": "/aenergy/total",
+        "type": "float"
+      },
+      "returned_energy_wh": {
+        "pointer": "/ret_aenergy/total",
+        "type": "float",
+        "optional": true
+      },
+      "temp_c": {
+        "pointer": "/temperature/tC",
+        "type": "float"
+      }
+    },
+    "timestamp": {
+      "source": "received_at"
+    },
+    "cache": false
+  }
+}

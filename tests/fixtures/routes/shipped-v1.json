@@ -1,0 +1,377 @@
+{
+  "version": 1,
+  "schema_resources": {
+    "https://smarthome-ingest/base.schema.json": "schemas/base.schema.json"
+  },
+  "routes": [
+    {
+      "id": "firmware-sensor",
+      "topic": "smarthome/+/bme680",
+      "schema": "schemas/sensor.schema.json",
+      "output_schema": "schemas/sensor.output.schema.json",
+      "device_id": {
+        "pointer": "/device_id",
+        "topic_segment": 1
+      },
+      "sink_target": "sensors",
+      "measurement": "bme680",
+      "tags": {
+        "room": {
+          "pointer": "/room"
+        },
+        "device_class": {
+          "pointer": "/device_class"
+        }
+      },
+      "fields": {
+        "firmware_version": {
+          "pointer": "/fw_version",
+          "type": "string"
+        },
+        "temp_c": {
+          "pointer": "/data/temp_c",
+          "type": "float"
+        },
+        "rel_hum_perc": {
+          "pointer": "/data/rel_hum_perc",
+          "type": "float"
+        },
+        "pressure_hpa": {
+          "pointer": "/data/pressure_hpa",
+          "type": "float"
+        },
+        "gas_ohm": {
+          "pointer": "/data/gas_ohm",
+          "type": "float"
+        },
+        "altitude_m": {
+          "pointer": "/data/altitude_m",
+          "type": "float"
+        },
+        "time_valid": {
+          "pointer": "/time_valid",
+          "type": "boolean"
+        },
+        "time_iso": {
+          "pointer": "/time_iso",
+          "type": "string"
+        },
+        "boot_id": {
+          "pointer": "/boot_id",
+          "type": "unsigned",
+          "optional": true
+        },
+        "seq": {
+          "pointer": "/seq",
+          "type": "unsigned",
+          "optional": true
+        },
+        "warmed_up": {
+          "pointer": "/warmed_up",
+          "type": "boolean",
+          "optional": true
+        },
+        "replayed": {
+          "pointer": "/replayed",
+          "type": "boolean",
+          "optional": true
+        }
+      },
+      "timestamp": {
+        "source": "payload",
+        "pointer": "/time_ms",
+        "format": "epoch_ms",
+        "valid_flag": "/time_valid",
+        "fallback": "received_at"
+      },
+      "calculations": [
+        "dew_point",
+        "heat_index",
+        "iaq"
+      ],
+      "cache": true
+    },
+    {
+      "id": "firmware-status",
+      "topic": "smarthome/+/status",
+      "schema": "schemas/status.schema.json",
+      "output_schema": "schemas/status.output.schema.json",
+      "device_id": {
+        "pointer": "/device_id",
+        "topic_segment": 1
+      },
+      "sink_target": "sensors",
+      "measurement": "device_status",
+      "tags": {
+        "device_class": {
+          "pointer": "/device_class"
+        }
+      },
+      "fields": {
+        "firmware_version": {
+          "pointer": "/fw_version",
+          "type": "string"
+        },
+        "ip_address": {
+          "pointer": "/ip",
+          "type": "string"
+        },
+        "time_valid": {
+          "pointer": "/time_valid",
+          "type": "boolean"
+        },
+        "time_iso": {
+          "pointer": "/time_iso",
+          "type": "string"
+        },
+        "rssi": {
+          "pointer": "/rssi",
+          "type": "integer"
+        },
+        "uptime": {
+          "pointer": "/uptime",
+          "type": "integer",
+          "default": 0
+        },
+        "free_mem": {
+          "pointer": "/free_mem",
+          "type": "integer",
+          "default": 0
+        },
+        "ssid": {
+          "pointer": "/ssid",
+          "type": "string",
+          "default": ""
+        },
+        "queued": {
+          "pointer": "/queued",
+          "type": "integer",
+          "optional": true
+        },
+        "dropped_total": {
+          "pointer": "/dropped_total",
+          "type": "integer",
+          "optional": true
+        },
+        "samples_failed_total": {
+          "pointer": "/samples_failed_total",
+          "type": "integer",
+          "optional": true
+        },
+        "mqtt_connects_total": {
+          "pointer": "/mqtt_connects_total",
+          "type": "integer",
+          "optional": true
+        },
+        "sensor_read_failures_total": {
+          "pointer": "/sensor_read_failures_total",
+          "type": "integer",
+          "optional": true
+        },
+        "reset_reason": {
+          "pointer": "/reset_reason",
+          "type": "string",
+          "optional": true
+        }
+      },
+      "timestamp": {
+        "source": "payload",
+        "pointer": "/time_ms",
+        "format": "epoch_ms",
+        "valid_flag": "/time_valid",
+        "fallback": "received_at"
+      },
+      "cache": false
+    },
+    {
+      "id": "shelly-plug-907069671340",
+      "topic": "shellyplugmg3-907069671340/status/switch:0",
+      "schema": "schemas/shelly-plug.schema.json",
+      "output_schema": "schemas/shelly-plug.output.schema.json",
+      "device_id": {
+        "topic_segment": 0
+      },
+      "sink_target": "sensors",
+      "measurement": "shelly_plug",
+      "fields": {
+        "output": {
+          "pointer": "/output",
+          "type": "boolean"
+        },
+        "power_w": {
+          "pointer": "/apower",
+          "type": "float"
+        },
+        "voltage_v": {
+          "pointer": "/voltage",
+          "type": "float"
+        },
+        "frequency_hz": {
+          "pointer": "/freq",
+          "type": "float",
+          "optional": true
+        },
+        "current_a": {
+          "pointer": "/current",
+          "type": "float"
+        },
+        "energy_wh": {
+          "pointer": "/aenergy/total",
+          "type": "float"
+        },
+        "returned_energy_wh": {
+          "pointer": "/ret_aenergy/total",
+          "type": "float",
+          "optional": true
+        },
+        "temp_c": {
+          "pointer": "/temperature/tC",
+          "type": "float"
+        }
+      },
+      "timestamp": {
+        "source": "received_at"
+      },
+      "cache": false
+    },
+    {
+      "id": "shelly-plug-90706968bf88",
+      "topic": "shellyplugmg3-90706968bf88/status/switch:0",
+      "schema": "schemas/shelly-plug.schema.json",
+      "output_schema": "schemas/shelly-plug.output.schema.json",
+      "device_id": {
+        "topic_segment": 0
+      },
+      "sink_target": "sensors",
+      "measurement": "shelly_plug",
+      "fields": {
+        "output": {
+          "pointer": "/output",
+          "type": "boolean"
+        },
+        "power_w": {
+          "pointer": "/apower",
+          "type": "float"
+        },
+        "voltage_v": {
+          "pointer": "/voltage",
+          "type": "float"
+        },
+        "frequency_hz": {
+          "pointer": "/freq",
+          "type": "float",
+          "optional": true
+        },
+        "current_a": {
+          "pointer": "/current",
+          "type": "float"
+        },
+        "energy_wh": {
+          "pointer": "/aenergy/total",
+          "type": "float"
+        },
+        "returned_energy_wh": {
+          "pointer": "/ret_aenergy/total",
+          "type": "float",
+          "optional": true
+        },
+        "temp_c": {
+          "pointer": "/temperature/tC",
+          "type": "float"
+        }
+      },
+      "timestamp": {
+        "source": "received_at"
+      },
+      "cache": false
+    },
+    {
+      "id": "aqara-p100-buero",
+      "topic": "zigbee2mqtt/Buero-Aqara-P100",
+      "schema": "schemas/aqara-p100.schema.json",
+      "output_schema": "schemas/aqara-p100.output.schema.json",
+      "device_id": {
+        "topic_segment": 1
+      },
+      "sink_target": "sensors",
+      "measurement": "aqara_p100",
+      "tags": {
+        "device_class": "aqara-p100"
+      },
+      "fields": {
+        "contact": {
+          "pointer": "/contact",
+          "type": "boolean"
+        },
+        "linkquality": {
+          "pointer": "/linkquality",
+          "type": "integer"
+        },
+        "battery_perc": {
+          "pointer": "/battery",
+          "type": "float",
+          "optional": true
+        },
+        "voltage_mv": {
+          "pointer": "/voltage",
+          "type": "integer",
+          "optional": true
+        },
+        "device_mode": {
+          "pointer": "/device_mode",
+          "type": "string",
+          "optional": true
+        },
+        "device_posture": {
+          "pointer": "/device_posture",
+          "type": "string",
+          "optional": true
+        },
+        "door_window_type": {
+          "pointer": "/door_window_type",
+          "type": "string",
+          "optional": true
+        },
+        "fall_detection": {
+          "pointer": "/fall_detection",
+          "type": "string",
+          "optional": true
+        },
+        "movement_detection": {
+          "pointer": "/movement_detection",
+          "type": "string",
+          "optional": true
+        },
+        "orientation_detection": {
+          "pointer": "/orientation_detection",
+          "type": "string",
+          "optional": true
+        },
+        "report_interval": {
+          "pointer": "/report_interval",
+          "type": "integer",
+          "optional": true
+        },
+        "sensitivity": {
+          "pointer": "/sensitivity",
+          "type": "integer",
+          "optional": true
+        },
+        "triple_tap_detection": {
+          "pointer": "/triple_tap_detection",
+          "type": "string",
+          "optional": true
+        },
+        "vibration_detection": {
+          "pointer": "/vibration_detection",
+          "type": "string",
+          "optional": true
+        }
+      },
+      "timestamp": {
+        "source": "received_at"
+      },
+      "cache": false
+    }
+  ]
+}

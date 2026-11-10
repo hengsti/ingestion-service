@@ -162,14 +162,7 @@ async fn bounded_text(mut response: reqwest::Response) -> Result<String> {
 /// # Errors
 /// Returns an error on fixture I/O or malformed JSON.
 pub fn write_routes(dir: &Path) -> Result<()> {
-    let mut bundle = read_json(root().join("config").join("routes.json"))?;
-    fs::create_dir_all(dir.join("schemas"))?;
-    for entry in fs::read_dir(root().join("config").join("schemas"))? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            fs::copy(entry.path(), dir.join("schemas").join(entry.file_name()))?;
-        }
-    }
+    let mut bundle = read_json(crate::common::write_v1_shipped_bundle(dir)?)?;
     for route in bundle["routes"].as_array_mut().context("firmware routes")? {
         route["fields"]["test_id"] = json!({"pointer": "/test_id", "type": "string"});
     }

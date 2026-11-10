@@ -78,7 +78,9 @@ runtime directory and mounts it read-only at `/app/config`, with
 `INGEST_ROUTES_FILE=/app/config/routes.json`. It never overwrites a nonempty directory.
 Missing directories, absent/empty `routes.json`, symbolic links, and bundles that
 fail the candidate binary's validation stop deployment before activation. A fresh
-deployment must supply its own complete bundle. Keep the directory readable by the
+deployment must supply its own complete bundle. V2 includes every listed family file and
+its schemas. Snapshot copying and hashing recurse through the whole directory; candidate
+preflight follows the manifest references. Keep the directory readable by the
 non-root container user and do not edit it during deployment or preflight/restart.
 
 The deployment runner stores release pairs under
@@ -140,6 +142,13 @@ After success, `.env` records the stable directory. Verify the container's
 Recovery copies remain under `.deploy-state/` but are no longer the normal mount.
 
 ## Rollback compatibility
+
+V1 inline bundles and v2 manifests are supported by the current binary. Earlier binaries
+cannot read v2. Keep a complete v1 configuration directory paired with an older image
+before opting into v2, and explicitly select that compatible directory for rollback.
+Image rollback alone cannot restore format compatibility. See the
+[manual bundle migration](messages-and-routing.md#migrate-v1-to-v2); CD preserves operator
+files and does not convert formats or restore configuration snapshots automatically.
 
 Rollback is supported only when the selected binary can read the existing WAL
 and quarantine journal formats; CD does not migrate journal data. The current

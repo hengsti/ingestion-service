@@ -59,6 +59,13 @@ dispatch does not guarantee per-device processing order across workers.
   compilation, and bound copied mapping data before repeated pointers amplify it. Every
   encoder's allocation-free size bound must cover its encoded bytes and saturate on
   overflow. Validate it before cache/encoding and check actual size before WAL append.
+- **Bundle layouts share one runtime:** accept v1 inline bundles and v2 manifests listing
+  explicit family files. V2 bindings supply only `id`, `topic` and optional `sink_target`;
+  each family shares one mapping without overrides. Resolve all references from the
+  manifest directory, reject duplicate files and canonical path escapes, and validate the
+  complete expanded route set before activation. Keep discovery, recursive includes and
+  per-message configuration work out of the loader. Older binaries require a v1 config
+  directory for rollback; preserve Server-owned files and pending WAL destinations.
 - **Outcomes are explicit:** deterministic invalid input uses
   `ctx.mark_rejection(reason)` and is acknowledged only after durable quarantine.
   Operational stage errors and `ctx.mark_deferred(reason)` never become input rejections.

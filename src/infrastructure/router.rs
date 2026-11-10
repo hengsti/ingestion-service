@@ -92,7 +92,7 @@ impl RouteSet {
                 .sink_target
                 .get_or_insert_with(|| default_target.to_owned());
         }
-        if bundle.version != 1 {
+        if !matches!(bundle.version, 1 | 2) {
             bail!("unsupported route bundle version {}", bundle.version);
         }
         if bundle.routes.is_empty() {
