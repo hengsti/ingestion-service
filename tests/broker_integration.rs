@@ -1249,21 +1249,22 @@ async fn test_partial_influx_acceptance_keeps_whole_mixed_batch_replayable() -> 
             retained.iter().map(|e| &e.payload).collect::<Vec<_>>()
         );
         harness.stop()?;
-        // Repair by selecting a fresh owned bucket; no journal or historical data is deleted.
-        harness.use_owned_bucket("repaired");
+        // Changing the fallback cannot retarget records already persisted in the WAL.
+        harness.use_owned_bucket("new-default");
         harness.create_bucket().await?;
-        harness.start(None)?;
+        harness.start_with_env(None, &[("BATCH_SIZE", "2"), ("FLUSH_INTERVAL_MS", "1000")])?;
         harness.wait_ready().await?;
-        let fields = harness.query_fields(&format!("{zigbee}-2")).await?;
-        assert_field(&fields, "temp_c", "22.5", "double")?;
+        harness.wait_metric("wal_forwarder_retry_total", 1.0).await?;
+        assert_eq!(harness.output_ids(&sensor).await?, BTreeSet::new());
+        assert_eq!(harness.output_ids(&zigbee).await?, BTreeSet::new());
+        assert!(!harness.dir.join("wal").join("commit.cursor").exists());
+        assert_eq!(
+            harness.journal_records("wal")?.iter().map(|e| (&e.sink_target, &e.payload)).collect::<Vec<_>>(),
+            retained.iter().map(|e| (&e.sink_target, &e.payload)).collect::<Vec<_>>()
+        );
+        harness.use_owned_bucket("poison");
         harness.query_fields(&format!("{sensor}-1")).await?;
-        harness.wait_committed(2).await?;
-        let output = harness.output_ids(&sensor).await?.union(&harness.output_ids(&zigbee).await?).cloned().collect();
-        broker::assert_publication_ids(
-            &BTreeSet::from([format!("{sensor}-1"), format!("{zigbee}-2")]),
-            &output,
-            &BTreeSet::new(),
-        )?;
+        assert_eq!(harness.output_ids(&zigbee).await?, BTreeSet::new());
         Ok(())
     }.await;
     harness.finish(result).await
