@@ -7,8 +7,8 @@
     }
   ],
   "mapping": {
-    "schema": "schemas/aqara-p100.schema.json",
-    "output_schema": "schemas/aqara-p100.output.schema.json",
+    "schema": "schemas/aqara/aqara-p100.schema.json",
+    "output_schema": "schemas/aqara/aqara-p100.output.schema.json",
     "device_id": {
       "topic_segment": 1
     },

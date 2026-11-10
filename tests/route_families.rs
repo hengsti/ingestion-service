@@ -1,6 +1,6 @@
 mod common;
 
-use std::{fs, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -165,20 +165,77 @@ async fn shared_family_bindings_keep_targets_fallback_and_mapping_policies() -> 
 
 #[test]
 fn shipped_v2_expands_to_the_frozen_v1_configuration() -> Result<()> {
-    let baseline: Value = serde_json::from_str(include_str!("fixtures/routes/shipped-v1.json"))?;
-    let manifest: Value = serde_json::from_slice(&fs::read("config/routes.json")?)?;
+    let directory = tempfile::tempdir()?;
+    let legacy = common::write_v1_shipped_bundle(directory.path())?;
+    let mut baseline: Value = serde_json::from_slice(&fs::read(legacy)?)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read("config/routes.json")?)?;
     let mut expanded = Vec::new();
     for file in manifest["route_files"].as_array().context("family files")? {
-        let family: Value = serde_json::from_slice(&fs::read(
-            std::path::Path::new("config").join(file.as_str().unwrap()),
-        )?)?;
+        let family: Value =
+            serde_json::from_slice(&fs::read(Path::new("config").join(file.as_str().unwrap()))?)?;
         for binding in family["routes"].as_array().context("bindings")? {
             let mut route = family["mapping"].as_object().unwrap().clone();
             route.extend(binding.as_object().unwrap().clone());
             expanded.push(Value::Object(route));
         }
     }
-    assert_eq!(Value::Array(expanded), baseline["routes"]);
+    manifest["routes"] = Value::Array(expanded);
+    resolve_schema_contents(&mut manifest, Path::new("config"))?;
+    resolve_schema_contents(&mut baseline, directory.path())?;
+    assert_eq!(manifest["routes"], baseline["routes"]);
     assert_eq!(manifest["schema_resources"], baseline["schema_resources"]);
+    Ok(())
+}
+
+fn resolve_schema_contents(bundle: &mut Value, root: &Path) -> Result<()> {
+    for route in bundle["routes"].as_array_mut().context("routes")? {
+        for key in ["schema", "output_schema"] {
+            if let Some(reference) = route.get(key).and_then(Value::as_str) {
+                route[key] = serde_json::from_slice(&fs::read(root.join(reference))?)?;
+            }
+        }
+    }
+    for reference in bundle["schema_resources"]
+        .as_object_mut()
+        .context("schema resources")?
+        .values_mut()
+    {
+        let path = reference.as_str().context("schema resource path")?;
+        *reference = serde_json::from_slice(&fs::read(root.join(path))?)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn schema_comparison_allows_relocation_but_detects_changed_contents() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bundle = |folder| {
+        json!({
+            "routes": [{"schema": format!("{folder}/input.json"), "output_schema": format!("{folder}/output.json")}],
+            "schema_resources": {"https://schemas.test/shared": format!("{folder}/shared.json")}
+        })
+    };
+    for folder in ["before", "after"] {
+        fs::create_dir(directory.path().join(folder))?;
+        for filename in ["input.json", "output.json", "shared.json"] {
+            fs::write(
+                directory.path().join(folder).join(filename),
+                r#"{"type":"object"}"#,
+            )?;
+        }
+    }
+    let mut baseline = bundle("before");
+    resolve_schema_contents(&mut baseline, directory.path())?;
+    let mut relocated = bundle("after");
+    resolve_schema_contents(&mut relocated, directory.path())?;
+    assert_eq!(baseline, relocated);
+    for filename in ["input.json", "output.json", "shared.json"] {
+        let path = directory.path().join("after").join(filename);
+        fs::write(&path, r#"{"type":"string"}"#)?;
+        let mut changed = bundle("after");
+        resolve_schema_contents(&mut changed, directory.path())?;
+        assert_ne!(baseline, changed, "changed {filename} must remain visible");
+        fs::write(path, r#"{"type":"object"}"#)?;
+    }
     Ok(())
 }

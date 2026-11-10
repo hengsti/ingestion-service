@@ -7,8 +7,8 @@
     }
   ],
   "mapping": {
-    "schema": "schemas/status.schema.json",
-    "output_schema": "schemas/status.output.schema.json",
+    "schema": "schemas/esp32-bme680/status.schema.json",
+    "output_schema": "schemas/esp32-bme680/status.output.schema.json",
     "device_id": {
       "pointer": "/device_id",
       "topic_segment": 1

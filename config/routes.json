@@ -1,7 +1,7 @@
 {
   "version": 2,
   "schema_resources": {
-    "https://smarthome-ingest/base.schema.json": "schemas/base.schema.json"
+    "https://smarthome-ingest/base.schema.json": "schemas/esp32-bme680/base.schema.json"
   },
   "route_files": [
     "routes/firmware-sensor.json",

@@ -12,8 +12,8 @@
     }
   ],
   "mapping": {
-    "schema": "schemas/shelly-plug.schema.json",
-    "output_schema": "schemas/shelly-plug.output.schema.json",
+    "schema": "schemas/shelly/shelly-plug.schema.json",
+    "output_schema": "schemas/shelly/shelly-plug.output.schema.json",
     "device_id": {
       "topic_segment": 0
     },

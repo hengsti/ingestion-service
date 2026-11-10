@@ -88,11 +88,30 @@ pub fn influx_encoder() -> Arc<dyn Encoder> {
 pub fn write_v1_shipped_bundle(directory: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let schemas = directory.join("schemas");
     std::fs::create_dir_all(&schemas)?;
-    for entry in
-        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/schemas"))?
-    {
-        let entry = entry?;
-        std::fs::copy(entry.path(), schemas.join(entry.file_name()))?;
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/schemas");
+    for (family, filenames) in [
+        (
+            "esp32-bme680",
+            &[
+                "base.schema.json",
+                "sensor.schema.json",
+                "sensor.output.schema.json",
+                "status.schema.json",
+                "status.output.schema.json",
+            ][..],
+        ),
+        (
+            "aqara",
+            &["aqara-p100.schema.json", "aqara-p100.output.schema.json"][..],
+        ),
+        (
+            "shelly",
+            &["shelly-plug.schema.json", "shelly-plug.output.schema.json"][..],
+        ),
+    ] {
+        for filename in filenames {
+            std::fs::copy(source.join(family).join(filename), schemas.join(filename))?;
+        }
     }
     let path = directory.join("routes.json");
     std::fs::write(&path, include_str!("../fixtures/routes/shipped-v1.json"))?;
