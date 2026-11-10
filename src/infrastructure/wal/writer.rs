@@ -633,8 +633,12 @@ mod tests {
             Ok(())
         }));
         let request = |event: WalEvent, ack| {
-            let bytes = codec::wal_record_frame_size(event.topic.len(), event.payload.len())
-                .expect("frame size") as u64;
+            let bytes = codec::wal_record_frame_size_with_target(
+                event.topic.len(),
+                event.payload.len(),
+                event.sink_target.as_deref(),
+            )
+            .expect("frame size") as u64;
             let reservation = capacity
                 .reserve(bytes + SEGMENT_ALLOWANCE_BYTES)
                 .expect("capacity");
@@ -698,8 +702,12 @@ mod tests {
             Ok(())
         }));
         let request = |event: WalEvent, ack| {
-            let bytes = codec::wal_record_frame_size(event.topic.len(), event.payload.len())
-                .expect("frame size") as u64
+            let bytes = codec::wal_record_frame_size_with_target(
+                event.topic.len(),
+                event.payload.len(),
+                event.sink_target.as_deref(),
+            )
+            .expect("frame size") as u64
                 + SEGMENT_ALLOWANCE_BYTES;
             (
                 WriteRequest {

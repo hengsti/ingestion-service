@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "id": "example-samples",
+      "topic": "example/samples/+",
+      "schema": "schema.json",
+      "device_id": { "topic_segment": 2 },
+      "measurement": "sample",
+      "sink_target": "example-sensors",
+      "fields": {
+        "temperature": { "pointer": "/temperature", "type": "float" },
+        "count": { "pointer": "/count", "type": "unsigned" },
+        "active": { "pointer": "/active", "type": "boolean" },
+        "label": { "pointer": "/label", "type": "string" }
+      },
+      "timestamp": { "source": "payload", "pointer": "/time", "format": "epoch_ms" }
+    },
+    {
+      "id": "example-health",
+      "topic": "example/health/+",
+      "schema": "schema.json",
+      "device_id": { "topic_segment": 2 },
+      "measurement": "health",
+      "sink_target": "example-metrics",
+      "fields": {
+        "code": { "pointer": "/code", "type": "integer" },
+        "active": { "pointer": "/active", "type": "boolean" }
+      },
+      "timestamp": { "source": "payload", "pointer": "/time", "format": "epoch_ms" }
+    }
+  ]
+}

@@ -35,6 +35,9 @@ pub struct RouteConfig {
     pub device_id: DeviceIdSource,
     /// Influx measurement name.
     pub measurement: String,
+    /// Destination bucket; omitted routes inherit `INFLUX_BUCKET` at startup.
+    #[serde(default, deserialize_with = "deserialize_sink_target")]
+    pub sink_target: Option<String>,
     /// Explicit tag mappings.
     #[serde(default)]
     pub tags: BTreeMap<String, TagValue>,
@@ -246,6 +249,9 @@ impl RouteConfig {
     }
 
     pub(crate) fn validate_static(&self) -> Result<()> {
+        if let Some(target) = &self.sink_target {
+            validate_sink_target(target)?;
+        }
         if self.id.is_empty() {
             bail!("route id must not be empty");
         }
@@ -281,6 +287,31 @@ impl RouteConfig {
 
         Ok(())
     }
+}
+
+/// Validates a literal bucket name without including its value in diagnostics.
+///
+/// # Errors
+/// Returns an error for empty, oversized, padded, or control-containing names.
+pub fn validate_sink_target(target: &str) -> Result<()> {
+    if target.is_empty()
+        || target.len() > 255
+        || target.trim() != target
+        || target.chars().any(char::is_control)
+    {
+        bail!(
+            "sink_target must be 1..255 bytes with no surrounding whitespace or control characters"
+        );
+    }
+    Ok(())
+}
+
+fn deserialize_sink_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("sink_target must be a bucket-name string"))
 }
 
 fn validate_device_id(source: &DeviceIdSource) -> Result<()> {

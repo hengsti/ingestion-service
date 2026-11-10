@@ -79,6 +79,7 @@ mod tests {
         let routes = Arc::new(RouteSet::compile(
             routes::load("config/routes.json")?,
             "smarthome/_dlq/ingest",
+            "test_bucket",
         )?);
         let route = routes
             .select(topic)

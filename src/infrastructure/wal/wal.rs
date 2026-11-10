@@ -10,10 +10,12 @@ use tracing::warn;
 
 use crate::infrastructure::wal::{
     capacity::{self, Capacity, SEGMENT_ALLOWANCE_BYTES},
-    codec::wal_record_frame_size,
+    codec::wal_record_frame_size_with_target,
     cursor::read_cursor,
     journal::Journal,
-    recover::{last_valid_offset, truncate_to, validate_committed_offset},
+    recover::{
+        last_valid_offset, last_valid_output_offset, truncate_to, validate_committed_offset,
+    },
     segment::{list_segments, segment_path, sync_directory},
     subscription::WalSubscription,
     types::{AppendDurableError, TryAppendError, WalEvent, WalOffset, WalOptions},
@@ -31,12 +33,25 @@ pub struct Wal {
 
 impl Wal {
     pub async fn open(options: WalOptions) -> Result<(Self, WalSubscription)> {
-        tokio::task::spawn_blocking(move || Self::open_blocking(options))
+        tokio::task::spawn_blocking(move || Self::open_blocking(options, false))
             .await
             .context("WAL initialization task failed")?
     }
 
-    fn open_blocking(options: WalOptions) -> Result<(Self, WalSubscription)> {
+    /// Opens output storage, refusing pending legacy records with unknown destinations.
+    ///
+    /// # Errors
+    /// Returns journal/recovery errors, or a drain-before-upgrade migration diagnostic.
+    pub async fn open_output(options: WalOptions) -> Result<(Self, WalSubscription)> {
+        tokio::task::spawn_blocking(move || Self::open_blocking(options, true))
+            .await
+            .context("WAL initialization task failed")?
+    }
+
+    fn open_blocking(
+        options: WalOptions,
+        require_targets: bool,
+    ) -> Result<(Self, WalSubscription)> {
         if options.queue_capacity == 0 {
             anyhow::bail!("WAL_QUEUE_CAPACITY must be greater than zero");
         }
@@ -47,6 +62,19 @@ impl Wal {
             .with_context(|| format!("listing WAL segments in {}", options.dir.display()))?;
 
         let committed = read_cursor(&options.dir)?;
+        let recover_offset = |id| {
+            let path = segment_path(&options.dir, id);
+            if require_targets {
+                let pending_from = match committed {
+                    Some(offset) if id < offset.segment_id => u64::MAX,
+                    Some(offset) if id == offset.segment_id => offset.byte_offset,
+                    _ => 0,
+                };
+                last_valid_output_offset(&path, pending_from)
+            } else {
+                last_valid_offset(&path)
+            }
+        };
         if let Some(off) = committed {
             if segments.binary_search(&off.segment_id).is_err() {
                 return Err(anyhow::anyhow!(
@@ -67,7 +95,7 @@ impl Wal {
             let file_len = fs::metadata(&path)
                 .with_context(|| format!("stat sealed WAL segment {id}"))?
                 .len();
-            let valid_len = last_valid_offset(&path)?;
+            let valid_len = recover_offset(id)?;
             if valid_len != file_len {
                 anyhow::bail!(
                     "sealed WAL segment {id} has an incomplete record at offset {valid_len}"
@@ -88,7 +116,7 @@ impl Wal {
                 let file_len = fs::metadata(&path)
                     .with_context(|| format!("stat WAL segment {id}"))?
                     .len();
-                let valid = last_valid_offset(&path)?;
+                let valid = recover_offset(id)?;
                 if valid < file_len {
                     truncate_to(&path, valid)
                         .with_context(|| format!("truncating torn WAL segment {id}"))?;
@@ -200,7 +228,11 @@ impl Wal {
         if self.writer_failure().is_some() || self.state.stopped() {
             return Err(TryAppendError::Closed(event));
         }
-        let frame_bytes = match wal_record_frame_size(event.topic.len(), event.payload.len()) {
+        let frame_bytes = match wal_record_frame_size_with_target(
+            event.topic.len(),
+            event.payload.len(),
+            event.sink_target.as_deref(),
+        ) {
             Ok(bytes) => bytes as u64,
             Err(_) => return Err(TryAppendError::TooLarge(event)),
         };
@@ -231,7 +263,11 @@ impl Wal {
         if self.writer_failure().is_some() || self.state.stopped() {
             return Err(AppendDurableError::Closed(event));
         }
-        let frame_bytes = match wal_record_frame_size(event.topic.len(), event.payload.len()) {
+        let frame_bytes = match wal_record_frame_size_with_target(
+            event.topic.len(),
+            event.payload.len(),
+            event.sink_target.as_deref(),
+        ) {
             Ok(bytes) => bytes as u64,
             Err(_) => return Err(AppendDurableError::TooLarge(event)),
         };
@@ -292,11 +328,55 @@ mod tests {
 
     fn maximum_event() -> WalEvent {
         WalEvent {
+            sink_target: None,
             topic: "t".to_string(),
             ts_ms: 1,
             payload: "x"
                 .repeat(crate::infrastructure::wal::codec::MAX_WAL_RECORD_PAYLOAD_BYTES - 25),
         }
+    }
+
+    #[tokio::test]
+    async fn output_startup_refuses_pending_legacy_and_accepts_drained_legacy() -> Result<()> {
+        let directory = tempdir()?;
+        let (wal, mut sub) = Wal::open(opts(directory.path(), 1024, 10)).await?;
+        assert!(wal.append_durable(sample_event(0)).await.is_ok());
+        let entry = sub.next().await?.context("legacy entry")?;
+        drop(wal);
+        drop(sub);
+        let path = crate::infrastructure::wal::segment::segment_path(directory.path(), 1);
+        let original = fs::read(&path)?;
+        let error = match Wal::open_output(opts(directory.path(), 1024, 10)).await {
+            Ok(_) => anyhow::bail!("pending legacy output must prevent startup"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("drain with the previous version"));
+        assert_eq!(fs::read(&path)?, original);
+        assert!(read_cursor(directory.path())?.is_none());
+
+        // The old path can drain the legacy record without modifying its payload.
+        let (wal, mut sub) = Wal::open(opts(directory.path(), 1024, 10)).await?;
+        let replayed = sub.next().await?.context("legacy replay")?;
+        assert_eq!(replayed.event.payload, entry.event.payload);
+        sub.commit(replayed.offset_after).await?;
+        drop(wal);
+        drop(sub);
+        let (wal, mut sub) = Wal::open_output(opts(directory.path(), 1024, 10)).await?;
+        let mut targeted = sample_event(1);
+        targeted.sink_target = Some("synthetic-bucket".to_owned());
+        assert!(wal.append_durable(targeted).await.is_ok());
+        assert_eq!(
+            sub.next()
+                .await?
+                .context("new record")?
+                .event
+                .sink_target
+                .as_deref(),
+            Some("synthetic-bucket")
+        );
+        Ok(())
     }
 
     #[tokio::test]

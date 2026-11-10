@@ -37,6 +37,7 @@ services:
       OUTPUT_SINK: influx
       INFLUX_URL: ${INFLUX_URL:?set INFLUX_URL (http:// or https://)}
       INFLUX_ORG: ${INFLUX_ORG:?set INFLUX_ORG}
+      # Fallback for routes without sink_target; explicit route targets select other buckets.
       INFLUX_BUCKET: ${INFLUX_BUCKET:?set INFLUX_BUCKET}
       INFLUX_TOKEN: ${INFLUX_TOKEN:?set INFLUX_TOKEN (InfluxDB write token)}
       BATCH_SIZE: "500"

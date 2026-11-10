@@ -10,7 +10,7 @@ use metrics::{counter, histogram};
 use crate::{
     infrastructure::sink::Encoder,
     infrastructure::wal::{
-        codec::wal_record_frame_size,
+        codec::wal_record_frame_size_with_target,
         types::{AppendDurableError, WalEvent},
         wal::Wal,
     },
@@ -78,10 +78,15 @@ impl PipelineStage for PersistStage {
             let record = ctx.telemetry_record()?;
             let mut payload = String::new();
             self.encoder.encode(record, &mut payload);
-            wal_record_frame_size(ctx.topic().len(), payload.len())
-                .context("encoded telemetry exceeds the WAL reader record limit")?;
+            wal_record_frame_size_with_target(
+                ctx.topic().len(),
+                payload.len(),
+                Some(ctx.route()?.sink_target()),
+            )
+            .context("encoded telemetry exceeds the WAL reader record limit")?;
 
             let mut event = WalEvent {
+                sink_target: Some(ctx.route()?.sink_target().to_owned()),
                 topic: ctx.topic().to_string(),
                 ts_ms: chrono::Utc::now().timestamp_millis(),
                 payload,
@@ -218,6 +223,7 @@ mod tests {
             let routes = RouteSet::compile(
                 routes::load("config/routes.json").expect("load routes"),
                 "smarthome/_dlq/ingest",
+                "test_bucket",
             )
             .expect("compile routes");
             routes
@@ -311,6 +317,7 @@ mod tests {
         .await?;
         let wal = Arc::new(wal);
         let event = WalEvent {
+            sink_target: None,
             topic: "t".to_string(),
             ts_ms: 1,
             payload: "x"
@@ -324,6 +331,7 @@ mod tests {
         let frame_bytes =
             (max - used - crate::infrastructure::wal::capacity::SEGMENT_ALLOWANCE_BYTES) as usize;
         wal.append_durable(WalEvent {
+            sink_target: None,
             topic: "t".to_string(),
             ts_ms: 2,
             payload: "x".repeat(frame_bytes - 29),
@@ -372,6 +380,7 @@ mod tests {
         .await?;
         let wal = Arc::new(wal);
         let event = WalEvent {
+            sink_target: None,
             topic: "t".to_owned(),
             ts_ms: 1,
             payload: "x"
@@ -385,6 +394,7 @@ mod tests {
         let frame_bytes =
             (max - used - crate::infrastructure::wal::capacity::SEGMENT_ALLOWANCE_BYTES) as usize;
         wal.append_durable(WalEvent {
+            sink_target: None,
             topic: "t".to_owned(),
             ts_ms: 2,
             payload: "x".repeat(frame_bytes - 29),
@@ -449,6 +459,7 @@ mod tests {
         .await?;
         let wal = Arc::new(wal);
         let large = WalEvent {
+            sink_target: None,
             topic: "t".to_owned(),
             ts_ms: 1,
             payload: "x"
@@ -462,6 +473,7 @@ mod tests {
         let frame_bytes =
             (max - used - crate::infrastructure::wal::capacity::SEGMENT_ALLOWANCE_BYTES) as usize;
         wal.append_durable(WalEvent {
+            sink_target: None,
             topic: "t".to_owned(),
             ts_ms: 2,
             payload: "x".repeat(frame_bytes - 29),
@@ -512,6 +524,7 @@ mod tests {
             Ok(())
         }));
         let small = WalEvent {
+            sink_target: None,
             topic: "queue".to_owned(),
             ts_ms: 3,
             payload: "value".to_owned(),
@@ -583,6 +596,7 @@ mod tests {
             Ok(())
         }));
         let event = WalEvent {
+            sink_target: None,
             topic: "queue".into(),
             ts_ms: 1,
             payload: "value".into(),

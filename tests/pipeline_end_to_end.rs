@@ -184,7 +184,11 @@ fn synthetic_zigbee_routes(
         "schema_resources": {},
         "routes": [route]
     }))?;
-    Ok(Arc::new(RouteSet::compile(bundle, "zigbee/dlq")?))
+    Ok(Arc::new(RouteSet::compile(
+        bundle,
+        "zigbee/dlq",
+        "test_bucket",
+    )?))
 }
 
 #[tokio::test]
@@ -393,6 +397,7 @@ async fn oversized_encoded_output_is_rejected_before_cache_update() -> Result<()
     let routes = Arc::new(RouteSet::compile(
         routes::load("config/routes.json")?,
         "smarthome/_dlq/ingest",
+        "test_bucket",
     )?);
     let called = Arc::new(AtomicBool::new(false));
     let encoder = Arc::new(OversizedEncoder(called.clone()));

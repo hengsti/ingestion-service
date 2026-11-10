@@ -12,6 +12,7 @@ use crate::model::topic::MqttTopicFilter;
 /// An immutable route with schemas and topic filters compiled at startup.
 pub struct CompiledRoute {
     config: RouteConfig,
+    sink_target: Arc<str>,
     metric_label: Arc<str>,
     topic_filter: MqttTopicFilter,
     raw_schema: CompiledSchema,
@@ -20,6 +21,12 @@ pub struct CompiledRoute {
 }
 
 impl CompiledRoute {
+    /// Returns the destination resolved at startup, including the legacy fallback.
+    #[must_use]
+    pub fn sink_target(&self) -> &str {
+        &self.sink_target
+    }
+
     /// Returns this route's configured identifier.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -75,8 +82,16 @@ impl RouteSet {
     /// # Errors
     ///
     /// Returns an error for an invalid DLQ topic, unsupported bundle version, empty route
-    /// set, invalid/overlapping filters, DLQ feedback, or schema compilation failure.
-    pub fn compile(bundle: RouteBundle, dlq_topic: &str) -> Result<Self> {
+    /// set, invalid/overlapping filters, invalid sink targets or fallback, DLQ feedback,
+    /// or schema compilation failure. Omitted targets inherit `default_target`.
+    pub fn compile(mut bundle: RouteBundle, dlq_topic: &str, default_target: &str) -> Result<Self> {
+        crate::config::routes::validate_sink_target(default_target)
+            .context("invalid INFLUX_BUCKET fallback")?;
+        for route in &mut bundle.routes {
+            route
+                .sink_target
+                .get_or_insert_with(|| default_target.to_owned());
+        }
         if bundle.version != 1 {
             bail!("unsupported route bundle version {}", bundle.version);
         }
@@ -176,6 +191,12 @@ impl RouteSet {
                     Arc::from(route.id.as_str())
                 };
                 Ok(Arc::new(CompiledRoute {
+                    sink_target: Arc::from(
+                        route
+                            .sink_target
+                            .as_deref()
+                            .context("unresolved sink_target")?,
+                    ),
                     config: route,
                     metric_label,
                     topic_filter,
@@ -213,12 +234,16 @@ impl RouteSet {
 }
 
 fn register_field_type(
-    field_types: &mut HashMap<(String, String), (FieldType, String)>,
+    field_types: &mut HashMap<(Option<String>, String, String), (FieldType, String)>,
     route: &RouteConfig,
     field: &str,
     field_type: FieldType,
 ) -> Result<()> {
-    let key = (route.measurement.clone(), field.to_owned());
+    let key = (
+        route.sink_target.clone(),
+        route.measurement.clone(),
+        field.to_owned(),
+    );
     if let Some((existing_type, existing_route)) = field_types.get(&key) {
         if *existing_type != field_type {
             bail!(
@@ -345,7 +370,7 @@ mod configured_route_tests {
             "https://schemas.test/identity".to_owned(),
             identity_schema_path.clone(),
         );
-        let routes = RouteSet::compile(route_bundle, "smarthome/dlq")?;
+        let routes = RouteSet::compile(route_bundle, "smarthome/dlq", "test_bucket")?;
 
         fs::remove_file(sensor_schema_path)?;
         fs::remove_file(status_schema_path)?;
@@ -393,7 +418,7 @@ mod configured_route_tests {
             "rel_hum_perc": {"pointer": "/rel_hum_perc", "type": "float"}
         });
         configured["calculations"] = json!(["dew_point"]);
-        let routes = RouteSet::compile(bundle(vec![configured])?, "home/dlq")?;
+        let routes = RouteSet::compile(bundle(vec![configured])?, "home/dlq", "test_bucket")?;
         let compiled = routes
             .select("home/lab/sensor")
             .context("configured route should match")?;
@@ -441,10 +466,23 @@ mod configured_route_tests {
             "dew_point_c": {"pointer": "/dew_point_c", "type": "integer"}
         });
 
-        let error = match RouteSet::compile(bundle(vec![calculated, mapped])?, "home/dlq") {
-            Ok(_) => anyhow::bail!("conflicting field types must fail compilation"),
-            Err(error) => error,
-        };
+        let mut independent = mapped.clone();
+        independent["sink_target"] = json!("independent-bucket");
+        assert!(
+            RouteSet::compile(
+                bundle(vec![calculated.clone(), independent])?,
+                "home/dlq",
+                "test_bucket"
+            )
+            .is_ok(),
+            "field types may differ in independent buckets"
+        );
+
+        let error =
+            match RouteSet::compile(bundle(vec![calculated, mapped])?, "home/dlq", "test_bucket") {
+                Ok(_) => anyhow::bail!("conflicting field types must fail compilation"),
+                Err(error) => error,
+            };
         let message = format!("{error:#}");
 
         assert!(message.contains("dew_point_c"));
@@ -467,7 +505,7 @@ mod configured_route_tests {
         });
         configured["calculations"] = json!(["dew_point"]);
 
-        assert!(RouteSet::compile(bundle(vec![configured])?, "home/dlq").is_err());
+        assert!(RouteSet::compile(bundle(vec![configured])?, "home/dlq", "test_bucket").is_err());
         Ok(())
     }
 
@@ -481,7 +519,7 @@ mod configured_route_tests {
             route("duplicate", "home/+/status", &schema_path),
         ])?;
 
-        assert!(RouteSet::compile(routes, "home/dlq").is_err());
+        assert!(RouteSet::compile(routes, "home/dlq", "test_bucket").is_err());
         Ok(())
     }
 
@@ -492,10 +530,10 @@ mod configured_route_tests {
         write_schema(&schema_path, json!({"$schema": DRAFT_7, "type": "object"}))?;
 
         let variable_suffix = bundle(vec![route("suffix", "example/#", &schema_path)])?;
-        assert!(RouteSet::compile(variable_suffix, "dlq/topic").is_err());
+        assert!(RouteSet::compile(variable_suffix, "dlq/topic", "test_bucket").is_err());
 
         let fixed_segment = bundle(vec![route("fixed", "example/+/status/#", &schema_path)])?;
-        assert!(RouteSet::compile(fixed_segment, "other/dlq").is_ok());
+        assert!(RouteSet::compile(fixed_segment, "other/dlq", "test_bucket").is_ok());
         Ok(())
     }
 
@@ -509,13 +547,13 @@ mod configured_route_tests {
             route("wildcard", "home/+", &schema_path),
             route("literal", "home/lab", &schema_path),
         ])?;
-        assert!(RouteSet::compile(overlap, "home/dlq").is_err());
+        assert!(RouteSet::compile(overlap, "home/dlq", "test_bucket").is_err());
 
         let feedback = bundle(vec![route("all-home", "home/#", &schema_path)])?;
-        assert!(RouteSet::compile(feedback, "home/dlq").is_err());
+        assert!(RouteSet::compile(feedback, "home/dlq", "test_bucket").is_err());
 
         let wildcard_dlq = bundle(vec![route("sensor", "home/sensor", &schema_path)])?;
-        assert!(RouteSet::compile(wildcard_dlq, "home/+").is_err());
+        assert!(RouteSet::compile(wildcard_dlq, "home/+", "test_bucket").is_err());
         Ok(())
     }
 }

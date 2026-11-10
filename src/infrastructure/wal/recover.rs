@@ -54,6 +54,14 @@ pub(super) fn validate_committed_offset(path: &Path, offset: u64) -> Result<()> 
 /// Returns an error if the segment cannot be read, contains an invalid length,
 /// or contains a complete corrupt record.
 pub fn last_valid_offset(path: &Path) -> Result<u64> {
+    scan_segment(path, None)
+}
+
+pub(super) fn last_valid_output_offset(path: &Path, pending_from: u64) -> Result<u64> {
+    scan_segment(path, Some(pending_from))
+}
+
+fn scan_segment(path: &Path, pending_from: Option<u64>) -> Result<u64> {
     let file = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -66,7 +74,12 @@ pub fn last_valid_offset(path: &Path) -> Result<u64> {
 
     loop {
         match codec::decode_for_recovery(&mut reader, &mut payload)? {
-            codec::DecodeOutcome::ValidRecord(_, consumed) => {
+            codec::DecodeOutcome::ValidRecord(event, consumed) => {
+                if pending_from.is_some_and(|offset| valid_len >= offset)
+                    && event.sink_target.is_none()
+                {
+                    bail!("pending legacy WAL output has no sink_target; drain with the previous version and original INFLUX_BUCKET before upgrading");
+                }
                 valid_len += consumed as u64;
             }
             codec::DecodeOutcome::CleanEof => {

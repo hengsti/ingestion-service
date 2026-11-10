@@ -86,6 +86,7 @@ async fn test_durable_readiness_checks_both_journal_capacities_independently() -
     })
     .await?;
     let event = WalEvent {
+        sink_target: None,
         topic: "test".to_owned(),
         ts_ms: 1,
         payload: "x".repeat(1024 * 1024 - 64),

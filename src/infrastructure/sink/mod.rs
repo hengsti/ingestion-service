@@ -46,7 +46,7 @@ impl std::error::Error for SinkError {}
 /// (`Arc<dyn Sink>`) and usable from spawned tasks — mirroring the
 /// `PipelineStage` convention.
 pub trait Sink: Send + Sync {
-    /// Writes a batch of events to the underlying store.
+    /// Writes consecutive events with one saved sink target to the underlying store.
     ///
     /// # Errors
     /// Returns [`SinkError::Retryable`] for transient failures or

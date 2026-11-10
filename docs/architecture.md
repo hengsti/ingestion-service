@@ -18,7 +18,7 @@ Config + route bundle
 
 `main.rs` compiles the route bundle once. MQTT subscriptions come from that compiled set,
 and each message selects a route by its configured topic filter. The route's schemas,
-identity mapping, field mappings, calculations, measurement, output validation, and cache
+identity mapping, field mappings, calculations, measurement, sink target, output validation, and cache
 opt-in determine processing. There is no message-type inference from topic suffixes or
 publisher origins.
 
@@ -80,8 +80,10 @@ persistence rejects the actual output.
 The Influx encoder uses the existing point builder for sorting and escaping, handles every
 configured scalar type, and always writes the record timestamp with `precision=ms`.
 
-The payload is encoded once before WAL append. `WalEvent` serialization and the on-disk WAL
-format are unchanged. A WAL append receipt follows a buffer flush and file sync; segment
+The payload is encoded once before WAL append. Output WAL records also freeze the resolved
+destination, using the [targeted frame format](wal-and-reliability.md#data-stored).
+The forwarder keeps one bounded batch, flushes before a destination change, and writes
+serially so the cursor never skips a failed target. A WAL append receipt follows a buffer flush and file sync; segment
 creation and cursor replacement also sync their directory metadata. These guarantees depend
 on the filesystem and storage honoring sync. For QoS 1 input, PUBACK is eligible only after
 the output WAL or quarantine append is durable. The WAL reader consumes only the published

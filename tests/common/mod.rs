@@ -94,6 +94,7 @@ pub async fn build_pipeline() -> (PipelineRunner, WalSubscription, CacheState, T
         RouteSet::compile(
             routes::load(routes_path).expect("load configured routes"),
             "smarthome/_dlq/ingest",
+            "test_bucket",
         )
         .expect("compile configured routes"),
     );

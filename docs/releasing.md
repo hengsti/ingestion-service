@@ -148,6 +148,12 @@ sink payloads (see [WAL and reliability](wal-and-reliability.md)). Preserve both
 journal volumes across recreate and rollback; never delete them to make a
 downgrade start.
 
+Targeted output frames require the new binary. Drain legacy output with the old
+binary before upgrade; a binary downgrade needs a fully drained, preserved journal
+and a separate fresh output WAL. See the exact
+[sink-target migration policy](wal-and-reliability.md#sink-target-migration) before
+selecting an older image. CD does not perform this migration.
+
 Keep the stable MQTT client identity, persistent broker session, and
 subscription manifest in `WAL_DIR` during rollback. Deployment does not clear
 the broker session or remove the manifest. Route changes reconcile known

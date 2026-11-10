@@ -109,6 +109,7 @@ fn make_sink(url: &str) -> Arc<dyn Sink> {
 
 fn status_event(device_id: &str) -> WalEvent {
     WalEvent {
+        sink_target: Some("test_bucket".to_owned()),
         topic: format!("smarthome/{device_id}/status"),
         ts_ms: 1_700_000_000_000,
         payload: format!(
@@ -400,6 +401,7 @@ async fn forwarder_replays_mixed_type_conflict_batch_after_http_400() {
 
         let valid = status_event("dev-conflict");
         let conflicting = WalEvent {
+            sink_target: Some("test_bucket".to_owned()),
             payload: "device_status,device_id=dev-conflict rssi=\"wrong-type\" 1700000000000"
                 .to_string(),
             ..status_event("dev-conflict")

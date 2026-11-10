@@ -94,6 +94,61 @@ fn test_check_config_accepts_production_bundle_without_journal_side_effects() ->
 }
 
 #[test]
+fn test_check_config_rejects_invalid_fallback_bucket_with_bounded_diagnostic() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let output = preflight_command(&directory, &climate_routes())
+        .env("INFLUX_BUCKET", "x".repeat(10_000))
+        .arg("--check-config")
+        .output()?;
+    assert!(!output.status.success());
+    let message = combined_output(&output);
+    assert!(message.contains("INFLUX_BUCKET"));
+    assert!(message.len() < 4096);
+    assert!(!message.contains("synthetic-preflight-token"));
+    assert!(!directory.path().join("wal").exists());
+    assert!(!directory.path().join("quarantine").exists());
+    Ok(())
+}
+
+#[test]
+fn test_check_config_accepts_explicit_sink_target_and_rejects_invalid_targets() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut bundle: Value =
+        serde_json::from_str(include_str!("../config/examples/climate/routes.json"))?;
+    bundle["routes"][0]["sink_target"] = json!("synthetic-metrics");
+    let path = write_route_bundle(
+        &directory,
+        &bundle,
+        include_str!("../config/examples/climate/schemas/climate.schema.json"),
+    )?;
+    let output = preflight_command(&directory, &path)
+        .arg("--check-config")
+        .output()?;
+    assert!(output.status.success(), "{}", combined_output(&output));
+
+    for target in [
+        json!(null),
+        json!(""),
+        json!("bad\nbucket"),
+        json!("x".repeat(256)),
+        json!({"token": "secret"}),
+    ] {
+        bundle["routes"][0]["sink_target"] = target;
+        fs::write(&path, serde_json::to_vec(&bundle)?)?;
+        let output = preflight_command(&directory, &path)
+            .arg("--check-config")
+            .output()?;
+        assert!(!output.status.success());
+        assert!(combined_output(&output).contains("sink_target"));
+        assert!(!combined_output(&output).contains("secret"));
+        assert!(combined_output(&output).len() < 4096);
+    }
+    assert!(!directory.path().join("wal").exists());
+    assert!(!directory.path().join("quarantine").exists());
+    Ok(())
+}
+
+#[test]
 fn test_check_config_accepts_synthetic_climate_bundle() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let output = preflight_command(&directory, &climate_routes())

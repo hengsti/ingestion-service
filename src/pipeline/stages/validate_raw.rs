@@ -88,6 +88,7 @@ mod tests {
         Ok(Arc::new(RouteSet::compile(
             bundle,
             "smarthome/_dlq/ingest",
+            "test_bucket",
         )?))
     }
 

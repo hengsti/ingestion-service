@@ -6,13 +6,19 @@ The WAL is the service boundary between ingestion and output-sink availability. 
 
 The persist stage stores already-rendered sink payloads, not raw JSON. With the current `InfluxEncoder`, that payload is a single InfluxDB line-protocol line.
 
-Each WAL record is a bincode-serialized `WalEvent` framed as:
+Each WAL record has a bincode body with a four-byte prefix:
 
 ```text
-[u32 little-endian payload length][bincode WalEvent payload]
+[u32 little-endian length and format flag][bincode body]
 ```
 
-Maximum WAL record payload length is 1 MiB.
+The low 31 bits encode the body length, limited to 1 MiB. Bit 31 marks targeted
+output: the body is `(topic: String, ts_ms: i64, payload: String, sink_target: String)`.
+Unflagged legacy/quarantine bodies remain `(topic: String, ts_ms: i64, payload: String)`.
+All strings use bincode's fixed-width length encoding. Targeted frames account for
+eight length bytes plus the target bytes in the existing size and capacity limits.
+Older binaries reject the flagged prefix as an oversized frame rather than sending
+targeted records to their global bucket.
 
 `WalEvent` fields:
 
@@ -21,6 +27,35 @@ Maximum WAL record payload length is 1 MiB.
 | `topic` | Source topic string (MQTT today) |
 | `ts_ms` | Ingest time when the WAL event was created |
 | `payload` | Complete sink payload (InfluxDB line protocol today) |
+| `sink_target` | Frozen bucket name for output; absent on legacy/quarantine records |
+
+## Sink target migration
+
+Older route bundles remain valid: an omitted `sink_target` inherits `INFLUX_BUCKET`.
+New output records always save that resolved bucket. Route edits and fallback-bucket
+changes never reinterpret pending records. Keep the InfluxDB server and organization
+unchanged while output is pending; these connection settings are not stored per record.
+
+Legacy pending output has no bucket metadata. Before upgrading:
+
+1. Keep the old binary, original routes, and original `INFLUX_BUCKET` active. Quiesce
+   publishers or otherwise stop new intake without clearing the persistent MQTT session.
+2. Let the old forwarder drain, then stop ingest cleanly. Verify its committed cursor
+   reaches the durable WAL head, including any final partial batch. Back up both journals
+   and the route bundle while stopped. Do not delete WAL files to force an upgrade.
+3. Start the new binary with the existing journal directories. Startup scans pending
+   output as part of recovery and refuses any legacy record without changing its bytes
+   or cursor. If refused, run the old version with the original bucket and finish draining.
+   Committed legacy records and existing quarantine records remain readable.
+
+For binary rollback, an old binary cannot reuse a WAL containing targeted frames,
+including committed frames retained in the active segment. Drain with the new binary,
+stop ingest, verify cursor equals durable head, and preserve that journal. A downgrade
+requires a separate fresh output WAL and the old-compatible route bundle; preserve the
+quarantine journal and trusted MQTT subscription history using the
+[stopped-ingest migration procedure](operations.md#route-changes-and-subscription-migration).
+Never point an older binary at pending targeted output or clear the broker session.
+Rolling back only route targets while staying on the new binary does not require a drain.
 
 ## Files
 
@@ -163,6 +198,7 @@ The forwarder flushes when:
 
 - Batch length reaches `BATCH_SIZE`.
 - `FLUSH_INTERVAL_MS` ticks with a non-empty batch.
+- The next record has a different saved sink target.
 - The WAL closes and a final partial batch remains.
 
 Sink outcomes:
@@ -179,6 +215,12 @@ Retry backoff:
 - Delay doubles up to 5000 ms.
 
 Cursor commit failures after a successful sink write are retried in-loop. The sink write is not repeated while the cursor commit is being retried.
+
+Only consecutive records with the same saved destination share a batch. The forwarder
+retains at most `BATCH_SIZE` events plus one lookahead entry while flushing at a target
+boundary, and sends one HTTP request at a time. Alternating targets produce smaller
+batches and more requests; no per-target queues or forwarding tasks are added. A failed
+target blocks later destinations until repaired, preserving the single ordered cursor.
 
 ## Delivery Semantics
 
