@@ -13,6 +13,7 @@
         "pointer": "/device_id",
         "topic_segment": 1
       },
+      "sink_target": "sensors",
       "measurement": "bme680",
       "tags": {
         "room": {
@@ -99,6 +100,7 @@
         "pointer": "/device_id",
         "topic_segment": 1
       },
+      "sink_target": "sensors",
       "measurement": "device_status",
       "tags": {
         "device_class": {
@@ -189,6 +191,7 @@
       "device_id": {
         "topic_segment": 0
       },
+      "sink_target": "sensors",
       "measurement": "shelly_plug",
       "fields": {
         "output": {
@@ -239,6 +242,7 @@
       "device_id": {
         "topic_segment": 0
       },
+      "sink_target": "sensors",
       "measurement": "shelly_plug",
       "fields": {
         "output": {
@@ -289,6 +293,7 @@
       "device_id": {
         "topic_segment": 1
       },
+      "sink_target": "sensors",
       "measurement": "aqara_p100",
       "tags": {
         "device_class": "aqara-p100"
