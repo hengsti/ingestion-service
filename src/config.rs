@@ -201,6 +201,7 @@ impl Config {
                     .context("INFLUX_ORG is required when OUTPUT_SINK=influx")?;
                 let bucket = env_var("INFLUX_BUCKET")
                     .context("INFLUX_BUCKET is required when OUTPUT_SINK=influx")?;
+                routes::validate_sink_target(&bucket).context("INFLUX_BUCKET is invalid")?;
                 let token = env_var("INFLUX_TOKEN")
                     .context("INFLUX_TOKEN is required when OUTPUT_SINK=influx")?;
 

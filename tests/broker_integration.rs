@@ -82,6 +82,7 @@ fn test_synthetic_routes_preserve_scalar_oracle_and_distinct_point_identities() 
     let routes = RouteSet::compile(
         routes::load(dir.path().join("routes.json"))?,
         "ingest-it/dlq",
+        "test_bucket",
     )?;
     for (topic, payload) in [
         broker::sensor_payload("fixture-sensor", 1)?,

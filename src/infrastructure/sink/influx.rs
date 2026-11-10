@@ -39,25 +39,26 @@ pub struct InfluxSink {
 }
 
 impl InfluxSink {
-    /// Builds a new sink targeting an InfluxDB v2 write endpoint.
+    /// Builds an InfluxDB v2 client; each batch supplies its saved bucket target.
+    /// The legacy `bucket` argument validates the configured fallback only.
     ///
     /// The `token` is kept wrapped in [`SecretString`] and only exposed when
     /// building the `Authorization` header, so it is never logged or surfaced
     /// via `Debug`.
     ///
     /// # Errors
-    /// Returns an error if the underlying HTTP client cannot be constructed.
+    /// Returns an error for an invalid fallback bucket or HTTP client failure.
     pub fn new(url: &str, org: &str, bucket: &str, token: SecretString) -> Result<Self> {
+        crate::config::routes::validate_sink_target(bucket)?;
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .context("Failed to build reqwest client")?;
 
         let write_url = format!(
-            "{}/api/v2/write?org={}&bucket={}&precision=ms",
+            "{}/api/v2/write?org={}&precision=ms",
             url.trim_end_matches('/'),
-            urlencoding::encode(org),
-            urlencoding::encode(bucket)
+            urlencoding::encode(org)
         );
 
         Ok(Self {
@@ -94,6 +95,20 @@ impl Sink for InfluxSink {
                 return Ok(());
             }
 
+            let target = batch[0].sink_target.as_deref().ok_or_else(|| SinkError::Permanent(
+                anyhow::anyhow!("legacy WAL output has no sink_target; drain with the previous version before upgrading")
+            ))?;
+            crate::config::routes::validate_sink_target(target).map_err(SinkError::Permanent)?;
+            if batch
+                .iter()
+                .any(|event| event.sink_target.as_deref() != Some(target))
+            {
+                return Err(SinkError::Permanent(anyhow::anyhow!(
+                    "mixed sink targets in one batch"
+                )));
+            }
+            let write_url = format!("{}&bucket={}", self.write_url, urlencoding::encode(target));
+
             let body = build_body(batch);
             let lines = batch.len();
 
@@ -108,7 +123,7 @@ impl Sink for InfluxSink {
 
                 let send_result = self
                     .client
-                    .post(&self.write_url)
+                    .post(&write_url)
                     .header(
                         "Authorization",
                         format!("Token {}", self.token.expose_secret()),
@@ -173,6 +188,7 @@ mod tests {
 
     fn sample_sensor() -> WalEvent {
         WalEvent {
+            sink_target: None,
             topic: "smarthome/dev-1/sensor".to_string(),
             ts_ms: 1_700_000_000_000,
             payload: "bme680,device_id=dev-1 temp_c=21.5 1700000000000".to_string(),
@@ -181,6 +197,7 @@ mod tests {
 
     fn sample_status() -> WalEvent {
         WalEvent {
+            sink_target: None,
             topic: "smarthome/dev-1/status".to_string(),
             ts_ms: 1_700_000_000_000,
             payload: "device_status,device_id=dev-1 rssi=-55i 1700000000000".to_string(),

@@ -118,7 +118,7 @@ The variables below are **only required when `OUTPUT_SINK=influx`** (see [Output
 |---|---:|---|---|
 | `INFLUX_URL` | Only if `OUTPUT_SINK=influx` | None | Base URL. Must start with `http://` or `https://` |
 | `INFLUX_ORG` | Only if `OUTPUT_SINK=influx` | None | InfluxDB organization |
-| `INFLUX_BUCKET` | Only if `OUTPUT_SINK=influx` | None | InfluxDB bucket |
+| `INFLUX_BUCKET` | Only if `OUTPUT_SINK=influx` | None | Fallback bucket for routes omitting `sink_target` |
 | `INFLUX_TOKEN` | Only if `OUTPUT_SINK=influx` | None | InfluxDB v2 write token. Stored as `SecretString` and redacted from `Debug` output |
 
 The write endpoint is built as:
@@ -126,6 +126,19 @@ The write endpoint is built as:
 ```text
 <INFLUX_URL>/api/v2/write?org=<urlencoded org>&bucket=<urlencoded bucket>&precision=ms
 ```
+
+Each route may set `"sink_target": "example-metrics"` to select a different literal
+bucket name. Omitted targets inherit `INFLUX_BUCKET`; both are resolved at startup
+and saved with every output WAL record. Bucket names must contain 1..255 UTF-8 bytes,
+without control characters or surrounding whitespace. Invalid names fail startup and
+`--check-config` with value-free diagnostics. Names are literal buckets, with no aliases
+or environment expansion. Preflight is offline: it does not check bucket existence or
+token permissions. Missing buckets and denied writes retain pending output for retry.
+
+All targets share `INFLUX_URL`, `INFLUX_ORG`, and `INFLUX_TOKEN`. Keep credentials out
+of route JSON, provision the buckets separately, and grant the token write access to
+each. See the [synthetic example](../config/examples/sink-targets/README.md) and the
+[WAL upgrade/rollback procedure](wal-and-reliability.md#sink-target-migration).
 
 ## Output sink
 

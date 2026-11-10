@@ -347,7 +347,11 @@ mod tests {
     #[tokio::test]
     async fn test_telemetry_mapping_rejects_invalid_route_payload() -> Result<()> {
         let bundle_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/routes.json");
-        let routes = RouteSet::compile(routes::load(bundle_path)?, "smarthome/_dlq/ingest")?;
+        let routes = RouteSet::compile(
+            routes::load(bundle_path)?,
+            "smarthome/_dlq/ingest",
+            "test_bucket",
+        )?;
         let topic = "smarthome/esp32-1/bme680";
         let route = routes.select(topic).expect("configured sensor route");
         let mut ctx = PipelineContext::new(topic, Vec::<u8>::new());

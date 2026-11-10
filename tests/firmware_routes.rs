@@ -28,7 +28,7 @@ fn test_firmware_routes_loads_and_compiles_two_routes() -> anyhow::Result<()> {
     let status_is_uncached = !bundle.routes[1].cache;
     let status_has_no_calculations = bundle.routes[1].calculations.is_empty();
 
-    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
+    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest", "test_bucket")?;
 
     let sensor = route_set
         .select("smarthome/test-sensor/bme680")
@@ -77,7 +77,7 @@ fn test_firmware_routes_loads_and_compiles_two_routes() -> anyhow::Result<()> {
 #[test]
 fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> anyhow::Result<()> {
     let bundle = routes::load("config/routes.json")?;
-    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
+    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest", "test_bucket")?;
     let sensor = route_set
         .select("smarthome/test-sensor/bme680")
         .context("sensor route was not selected")?;
@@ -141,7 +141,7 @@ fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> any
 fn test_firmware_routes_status_output_schema_requires_nonempty_ip_and_valid_time(
 ) -> anyhow::Result<()> {
     let bundle = routes::load("config/routes.json")?;
-    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
+    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest", "test_bucket")?;
     let status = route_set
         .select("smarthome/test-sensor/status")
         .context("status route was not selected")?;
@@ -189,7 +189,7 @@ fn test_firmware_routes_status_output_schema_requires_nonempty_ip_and_valid_time
 #[test]
 fn test_firmware_routes_raw_schema_rejects_malformed_rfc3339() -> anyhow::Result<()> {
     let bundle = routes::load("config/routes.json")?;
-    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
+    let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest", "test_bucket")?;
     let sensor = route_set
         .select("smarthome/test-sensor/bme680")
         .context("sensor route was not selected")?;

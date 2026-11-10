@@ -265,6 +265,7 @@ mod tests {
         let routes = RouteSet::compile(
             crate::config::routes::load("config/routes.json")?,
             "smarthome/_dlq/ingest",
+            "test_bucket",
         )?;
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -290,6 +291,7 @@ mod tests {
         let routes = RouteSet::compile(
             crate::config::routes::load("config/routes.json")?,
             "smarthome/_dlq/ingest",
+            "test_bucket",
         )?;
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -312,6 +314,7 @@ mod tests {
         let routes = RouteSet::compile(
             crate::config::routes::load("config/routes.json")?,
             "smarthome/_dlq/ingest",
+            "test_bucket",
         )?;
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -334,7 +337,7 @@ mod tests {
     fn test_register_metrics_exports_configured_route_counters_at_zero() -> Result<()> {
         let bundle = crate::config::routes::load("config/routes.json")?;
         let route_ids: Vec<_> = bundle.routes.iter().map(|route| route.id.clone()).collect();
-        let routes = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
+        let routes = RouteSet::compile(bundle, "smarthome/_dlq/ingest", "test_bucket")?;
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
 
@@ -373,7 +376,7 @@ mod tests {
             for (route, id) in bundle.routes.iter_mut().zip(ids) {
                 route.id = id.to_owned();
             }
-            let routes = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
+            let routes = RouteSet::compile(bundle, "smarthome/_dlq/ingest", "test_bucket")?;
             let recorder = PrometheusBuilder::new().build_recorder();
             let handle = recorder.handle();
 

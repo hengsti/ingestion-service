@@ -114,6 +114,7 @@ impl Quarantine {
         )?;
         let payload = String::from_utf8(payload).context("quarantine envelope was not UTF-8")?;
         let event = WalEvent {
+            sink_target: None,
             topic: rejection.topic.to_owned(),
             ts_ms: rejection.received_at_ms,
             payload,

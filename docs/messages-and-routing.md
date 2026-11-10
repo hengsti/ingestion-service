@@ -38,7 +38,8 @@ For each subscribed message, the service:
    and runs the route's named calculations.
 4. Adds the reserved `device_id` tag and `mqtt_retained` boolean field, validates the
    normalized record against its output schema and runtime constraints, then encodes it.
-5. Appends the resulting line protocol to the WAL before forwarding it to InfluxDB.
+5. Appends the resulting line protocol and resolved `sink_target` to the WAL before
+   forwarding it to that InfluxDB bucket.
 
 At startup, routes with duplicate IDs, reserved or colliding tag/field names, collisions
 with calculated fields, or control characters in static output names or values are
@@ -105,6 +106,14 @@ delivery. The `route` metric label replaces the old `kind=sensor|status` label; 
 [HTTP API and Metrics](http-and-metrics.md#dashboard-and-alert-compatibility).
 
 ## InfluxDB output
+
+`sink_target` selects a literal bucket on the configured server and organization.
+Older v1 bundles can omit it to inherit `INFLUX_BUCKET`. Changing a route target only
+affects newly admitted records: pending WAL output retains its saved destination.
+Field-type compatibility is checked across routes sharing a bucket and measurement;
+independent buckets may use different field types. The
+[synthetic sink-target example](../config/examples/sink-targets/README.md) demonstrates
+separate sample and health destinations without production device assignments.
 
 One encoder renders every normalized record. It writes the configured measurement, sorted
 tags and fields, and the record's validated epoch-millisecond timestamp using

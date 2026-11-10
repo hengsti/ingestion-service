@@ -12,7 +12,7 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use config::Config;
 use infrastructure::cache::{http, state::CacheState};
 use infrastructure::operations::Operations;
@@ -154,7 +154,11 @@ async fn main() -> Result<()> {
 
     let route_bundle = config::routes::load(&cfg.routes_file)?;
     let dlq_topic = cfg.dlq_topic.clone();
-    let routes = Arc::new(RouteSet::compile(route_bundle, &dlq_topic)?);
+    let routes = Arc::new(RouteSet::compile(
+        route_bundle,
+        &dlq_topic,
+        &cfg.influx.as_ref().context("missing influx config")?.bucket,
+    )?);
 
     // Cache / HTTP state.
     let app_state = CacheState::new(cfg.cache_ttl_ms, cfg.cache_buffer);
@@ -172,7 +176,7 @@ async fn main() -> Result<()> {
     let quarantine_capacity = quarantine.capacity_handle();
 
     // WAL, configured sink, and forwarder.
-    let (wal, wal_sub) = Wal::open(WalOptions {
+    let (wal, wal_sub) = Wal::open_output(WalOptions {
         dir: cfg.wal_dir.clone(),
         max_bytes: cfg.wal_max_bytes,
         segment_bytes: cfg.wal_segment_bytes,
@@ -482,7 +486,11 @@ fn run_config_check_command() -> Result<bool> {
 fn check_config() -> Result<()> {
     let cfg = Config::from_env()?;
     let route_bundle = config::routes::load(&cfg.routes_file)?;
-    let routes = RouteSet::compile(route_bundle, &cfg.dlq_topic)?;
+    let routes = RouteSet::compile(
+        route_bundle,
+        &cfg.dlq_topic,
+        &cfg.influx.as_ref().context("missing influx config")?.bucket,
+    )?;
     println!(
         "Configuration is valid ({} routes).",
         routes.subscriptions().len()

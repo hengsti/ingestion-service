@@ -77,6 +77,12 @@ dispatch does not guarantee per-device processing order across workers.
   depend on the filesystem and storage honoring sync, and do not yet imply durable
   MQTT acknowledgement. WAL records contain already encoded sink payloads, not raw
   input JSON; account for queued records when changing encoders or serialization.
+- **Destinations survive replay:** each output WAL record freezes the route's resolved
+  `sink_target` (literal bucket, falling back to `INFLUX_BUCKET`). Batch consecutive
+  compatible targets only; a failed target blocks the single ordered cursor. Output
+  startup refuses pending legacy records without destinations: drain with the old binary
+  and original bucket first. Targeted frame prefixes are deliberately rejected by old
+  binaries, including on rollback; quarantine keeps its legacy framing.
 - **Replay and commit are coupled:** both retryable and permanent sink errors retain
   the batch without advancing the cursor. Only successful sink writes advance through
   `offset_after`, never past the synced WAL head. Retry cursor commits without

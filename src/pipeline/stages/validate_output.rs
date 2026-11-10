@@ -9,7 +9,9 @@ use tracing::warn;
 use crate::{
     calculations::output_can_be_omitted,
     config::routes::FieldType,
-    infrastructure::{router::CompiledRoute, sink::Encoder, wal::codec::wal_record_frame_size},
+    infrastructure::{
+        router::CompiledRoute, sink::Encoder, wal::codec::wal_record_frame_size_with_target,
+    },
     model::messages::telemetry::{validate_line_text, TelemetryRecord, TelemetryValue},
     pipeline::{
         context::PipelineContext,
@@ -155,7 +157,7 @@ fn validate_record(
     validate_line_text(&record.source_topic, "source topic")?;
 
     let line_bytes = encoder.encoded_size_upper_bound(record);
-    wal_record_frame_size(topic.len(), line_bytes)
+    wal_record_frame_size_with_target(topic.len(), line_bytes, Some(route.sink_target()))
         .context("rendered telemetry exceeds the WAL reader record limit")?;
 
     if let Some(schema) = route.output_schema() {
@@ -277,7 +279,7 @@ mod tests {
                 "timestamp": {"source": "received_at"}
             }]
         }))?;
-        let routes = Arc::new(RouteSet::compile(bundle, "home/dlq")?);
+        let routes = Arc::new(RouteSet::compile(bundle, "home/dlq", "test_bucket")?);
         let route = routes.select(TOPIC).context("test route should match")?;
         let record = TelemetryRecord {
             route_id: "test-route".to_owned(),
@@ -404,7 +406,7 @@ mod tests {
                 "calculations": ["iaq"]
             }]
         }))?;
-        let routes = RouteSet::compile(bundle, "home/dlq")?;
+        let routes = RouteSet::compile(bundle, "home/dlq", "test_bucket")?;
         let route = routes.select(TOPIC).context("IAQ route should match")?;
         let mut record = TelemetryRecord {
             route_id: "iaq-route".to_owned(),

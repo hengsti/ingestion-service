@@ -27,6 +27,9 @@ impl WalOffset {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalEvent {
+    /// Frozen destination. `None` identifies legacy output or quarantine records.
+    #[serde(default)]
+    pub sink_target: Option<String>,
     pub topic: String,
     pub ts_ms: i64,
     pub payload: String,

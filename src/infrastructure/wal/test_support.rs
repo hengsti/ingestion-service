@@ -33,6 +33,7 @@ pub(crate) fn run_test_io_hook(hook: &TestIoHookSlot, step: TestIoStep) -> io::R
 
 pub(crate) fn sample_event(seq: u64) -> WalEvent {
     WalEvent {
+        sink_target: None,
         topic: format!("smarthome/dev-{seq}/status"),
         ts_ms: 1_700_000_000_000 + seq as i64,
         payload: format!(

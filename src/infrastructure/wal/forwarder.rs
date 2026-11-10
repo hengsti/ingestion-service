@@ -73,6 +73,9 @@ pub async fn run_forwarder(
                 };
                 match maybe {
                     Some(entry) => {
+                        if batch.first().is_some_and(|first| first.event.sink_target != entry.event.sink_target) {
+                            flush(&sink, &mut batch, &mut sub, flush_interval_ms).await?;
+                        }
                         if batch.is_empty() {
                             state.set_oldest_pending(entry.event.ts_ms);
                             state.batch_pending.store(true, Ordering::Relaxed);
@@ -330,6 +333,7 @@ mod tests {
         options.max_bytes = 3 * 1024 * 1024;
         let (wal, sub) = Wal::open(options).await?;
         let event = WalEvent {
+            sink_target: None,
             topic: "t".to_string(),
             ts_ms: 1,
             payload: "x"
