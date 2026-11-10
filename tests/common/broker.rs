@@ -164,6 +164,11 @@ async fn bounded_text(mut response: reqwest::Response) -> Result<String> {
 pub fn write_routes(dir: &Path) -> Result<()> {
     let mut bundle = read_json(crate::common::write_v1_shipped_bundle(dir)?)?;
     for route in bundle["routes"].as_array_mut().context("firmware routes")? {
+        // Each scenario owns its destination through INFLUX_BUCKET.
+        route
+            .as_object_mut()
+            .context("route object")?
+            .remove("sink_target");
         route["fields"]["test_id"] = json!({"pointer": "/test_id", "type": "string"});
     }
     let mut zigbee = read_json(

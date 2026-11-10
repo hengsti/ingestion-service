@@ -153,9 +153,10 @@ These test settings do not establish the deployed broker's persistence, publishe
 outage budget, filesystem quota, or ARM64 capacity.
 
 The generated mutable v1 bundle reuses the frozen `tests/fixtures/routes/shipped-v1.json`,
-the shipped schemas, and the existing synthetic
-Zigbee fixture. Only test mappings add a scalar string `test_id`; no production per-event tags
-are introduced. Recovery publications use distinct device identities or millisecond timestamps
+the shipped schemas, and the existing synthetic Zigbee fixture. It removes the shipped routes'
+explicit sink targets so every synthetic route uses the scenario's `INFLUX_BUCKET`, including
+scenario-owned recovery buckets. Only test mappings add a scalar string `test_id`; no
+production per-event tags are introduced. Recovery publications use distinct device identities or millisecond timestamps
 and compare actual output/quarantine ID sets, allowing duplicates but failing omissions or
 unexpected IDs. The separate collision test deliberately shares a point identity and verifies
 field merge plus last-value overwrite; Influx is not an event ledger. QoS 0 is observed as a

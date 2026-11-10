@@ -175,6 +175,9 @@ content/path review, not a Rust build.
 - The shared DLQ client's event loop is intentionally dropped: publish warnings are
   expected, and these tests do not prove delivery to a broker. Sink integration tests
   use local mock HTTP servers. Prefer these fixtures to real external services.
+- Changes to broker fixtures, routes, or sink/WAL behavior also require the isolated
+  real-container suite in `docs\development.md`. Ordinary `cargo test` skips it;
+  update affected test expectations and report the actual container results separately.
 - For WAL changes, cover the affected flush, recovery, rotation, commit, replay,
   overflow, or shutdown guarantee in WAL unit tests and relevant integration tests.
 
