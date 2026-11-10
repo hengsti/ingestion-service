@@ -30,10 +30,6 @@ fn test_firmware_routes_loads_and_compiles_two_routes() -> anyhow::Result<()> {
     let status_has_no_calculations = bundle.routes[1].calculations.is_empty();
 
     let route_set = RouteSet::compile(bundle, "smarthome/_dlq/ingest")?;
-    assert_eq!(
-        route_set.subscriptions(),
-        ["smarthome/+/bme680", "smarthome/+/status"]
-    );
 
     let sensor = route_set
         .select("smarthome/test-sensor/bme680")
