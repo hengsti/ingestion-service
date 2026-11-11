@@ -7,6 +7,7 @@
     "routes/firmware-sensor.json",
     "routes/firmware-status.json",
     "routes/shelly-plug.json",
-    "routes/aqara-p100.json"
+    "routes/aqara-p100.json",
+    "routes/zigbee2mqtt-bridge-health.json"
   ]
 }

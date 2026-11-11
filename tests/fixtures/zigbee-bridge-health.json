@@ -1,0 +1,33 @@
+{
+  "response_time": 1794382773699,
+  "os": {
+    "load_average": [1.99, 4.43, 6.14],
+    "memory_used_mb": 3794.32,
+    "memory_percent": 48.5224
+  },
+  "process": {
+    "uptime_sec": 1039858,
+    "memory_used_mb": 128.43,
+    "memory_percent": 1.6423
+  },
+  "mqtt": {
+    "connected": true,
+    "queued": 0,
+    "published": 4340,
+    "received": 13
+  },
+  "devices": {
+    "0x54ef44100171342e": {
+      "messages": 1217,
+      "messages_per_sec": 0.0012,
+      "leave_count": 0,
+      "network_address_changes": 0
+    },
+    "0x00124b0038a8eae2": {
+      "messages": 1,
+      "messages_per_sec": 0,
+      "leave_count": 0,
+      "network_address_changes": 0
+    }
+  }
+}

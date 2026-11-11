@@ -1,0 +1,114 @@
+{
+  "routes": [
+    {
+      "id": "zigbee2mqtt-bridge-health",
+      "topic": "zigbee2mqtt/bridge/health",
+      "sink_target": "metrics"
+    }
+  ],
+  "mapping": {
+    "schema": "schemas/zigbee2mqtt/bridge-health.schema.json",
+    "output_schema": "schemas/zigbee2mqtt/bridge-health.output.schema.json",
+    "device_id": "zigbee2mqtt-bridge",
+    "measurement": "zigbee2mqtt_bridge_health",
+    "tags": {
+      "device_class": "zigbee2mqtt-bridge"
+    },
+    "fields": {
+      "os_load_1m": {
+        "pointer": "/os/load_average/0",
+        "type": "float"
+      },
+      "os_load_5m": {
+        "pointer": "/os/load_average/1",
+        "type": "float"
+      },
+      "os_load_15m": {
+        "pointer": "/os/load_average/2",
+        "type": "float"
+      },
+      "os_memory_used_mib": {
+        "pointer": "/os/memory_used_mb",
+        "type": "float"
+      },
+      "os_memory_perc": {
+        "pointer": "/os/memory_percent",
+        "type": "float"
+      },
+      "process_uptime_sec": {
+        "pointer": "/process/uptime_sec",
+        "type": "integer"
+      },
+      "process_memory_rss_mib": {
+        "pointer": "/process/memory_used_mb",
+        "type": "float"
+      },
+      "process_memory_perc": {
+        "pointer": "/process/memory_percent",
+        "type": "float"
+      },
+      "mqtt_connected": {
+        "pointer": "/mqtt/connected",
+        "type": "boolean"
+      },
+      "mqtt_queued": {
+        "pointer": "/mqtt/queued",
+        "type": "integer"
+      },
+      "mqtt_published": {
+        "pointer": "/mqtt/published",
+        "type": "integer"
+      },
+      "mqtt_received": {
+        "pointer": "/mqtt/received",
+        "type": "integer"
+      },
+      "device_0x54ef44100171342e_messages": {
+        "pointer": "/devices/0x54ef44100171342e/messages",
+        "type": "integer",
+        "optional": true
+      },
+      "device_0x54ef44100171342e_messages_per_sec": {
+        "pointer": "/devices/0x54ef44100171342e/messages_per_sec",
+        "type": "float",
+        "optional": true
+      },
+      "device_0x54ef44100171342e_leave_count": {
+        "pointer": "/devices/0x54ef44100171342e/leave_count",
+        "type": "integer",
+        "optional": true
+      },
+      "device_0x54ef44100171342e_network_address_changes": {
+        "pointer": "/devices/0x54ef44100171342e/network_address_changes",
+        "type": "integer",
+        "optional": true
+      },
+      "device_0x00124b0038a8eae2_messages": {
+        "pointer": "/devices/0x00124b0038a8eae2/messages",
+        "type": "integer",
+        "optional": true
+      },
+      "device_0x00124b0038a8eae2_messages_per_sec": {
+        "pointer": "/devices/0x00124b0038a8eae2/messages_per_sec",
+        "type": "float",
+        "optional": true
+      },
+      "device_0x00124b0038a8eae2_leave_count": {
+        "pointer": "/devices/0x00124b0038a8eae2/leave_count",
+        "type": "integer",
+        "optional": true
+      },
+      "device_0x00124b0038a8eae2_network_address_changes": {
+        "pointer": "/devices/0x00124b0038a8eae2/network_address_changes",
+        "type": "integer",
+        "optional": true
+      }
+    },
+    "timestamp": {
+      "source": "payload",
+      "pointer": "/response_time",
+      "format": "epoch_ms"
+    },
+    "cache": false
+  }
+}

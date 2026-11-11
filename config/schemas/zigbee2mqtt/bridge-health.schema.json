@@ -1,0 +1,133 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Zigbee2MQTT bridge health",
+  "type": "object",
+  "properties": {
+    "response_time": {
+      "$ref": "#/definitions/timestamp"
+    },
+    "os": {
+      "type": "object",
+      "properties": {
+        "load_average": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/nonnegative_number"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "memory_used_mb": {
+          "$ref": "#/definitions/nonnegative_number"
+        },
+        "memory_percent": {
+          "$ref": "#/definitions/percentage"
+        }
+      },
+      "required": [
+        "load_average",
+        "memory_used_mb",
+        "memory_percent"
+      ]
+    },
+    "process": {
+      "type": "object",
+      "properties": {
+        "uptime_sec": {
+          "$ref": "#/definitions/count"
+        },
+        "memory_used_mb": {
+          "$ref": "#/definitions/nonnegative_number"
+        },
+        "memory_percent": {
+          "$ref": "#/definitions/percentage"
+        }
+      },
+      "required": [
+        "uptime_sec",
+        "memory_used_mb",
+        "memory_percent"
+      ]
+    },
+    "mqtt": {
+      "type": "object",
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "queued": {
+          "$ref": "#/definitions/count"
+        },
+        "published": {
+          "$ref": "#/definitions/count"
+        },
+        "received": {
+          "$ref": "#/definitions/count"
+        }
+      },
+      "required": [
+        "connected",
+        "queued",
+        "published",
+        "received"
+      ]
+    },
+    "devices": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/device_stats"
+      }
+    }
+  },
+  "required": [
+    "response_time",
+    "os",
+    "process",
+    "mqtt",
+    "devices"
+  ],
+  "definitions": {
+    "nonnegative_number": {
+      "type": "number",
+      "minimum": 0
+    },
+    "percentage": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854
+    },
+    "device_stats": {
+      "type": "object",
+      "properties": {
+        "messages": {
+          "$ref": "#/definitions/count"
+        },
+        "messages_per_sec": {
+          "$ref": "#/definitions/nonnegative_number"
+        },
+        "leave_count": {
+          "$ref": "#/definitions/count"
+        },
+        "network_address_changes": {
+          "$ref": "#/definitions/count"
+        }
+      },
+      "required": [
+        "messages",
+        "messages_per_sec",
+        "leave_count",
+        "network_address_changes"
+      ]
+    }
+  }
+}

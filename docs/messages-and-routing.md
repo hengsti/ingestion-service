@@ -90,6 +90,35 @@ The shipped firmware examples are in [`config/routes.json`](../config/routes.jso
 cache; `firmware-status` subscribes to `smarthome/+/status`, writes `device_status`,
 and opts out. Their raw and output schemas live under `config/schemas/`.
 
+## Zigbee2MQTT bridge health
+
+[`zigbee2mqtt-bridge-health.json`](../config/routes/zigbee2mqtt-bridge-health.json)
+selects only `zigbee2mqtt/bridge/health` and writes `zigbee2mqtt_bridge_health` to the
+`metrics` bucket. Its fixed `device_id` and `device_class` are `zigbee2mqtt-bridge`;
+`cache: false` keeps this operational record out of the latest sensor-state cache.
+
+The mapping follows [Zigbee2MQTT health](https://www.zigbee2mqtt.io/guide/usage/health.html)
+and its [implementation](https://github.com/Koenkk/zigbee2mqtt/blob/master/lib/extension/health.ts):
+
+- `response_time` supplies the event timestamp in epoch milliseconds; it is not latency.
+  Retained MQTT delivery preserves that original time.
+- `os_load_1m`, `os_load_5m`, and `os_load_15m` are load averages, not CPU percentages.
+- `os_memory_used_mib` is total minus free host memory. `process_memory_rss_mib` is
+  Zigbee2MQTT's resident memory. The publisher divides bytes by 1024 twice despite its
+  `_mb` names. Both `*_memory_perc` fields are percentages of total host memory.
+- `process_uptime_sec` is Zigbee2MQTT process uptime. MQTT connection state is boolean;
+  queued, published, and received counts remain integers. Published/received counts
+  reset on restart, and also on each check when `health.reset_on_check` is enabled.
+- For the two configured IEEE addresses, `device_<address>_messages`,
+  `device_<address>_messages_per_sec`, `device_<address>_leave_count`, and
+  `device_<address>_network_address_changes` remain numeric fields. The rate is an
+  average since the first counted message in the statistics window. Device counters
+  also reset on restart or `reset_on_check`.
+
+An absent device contributes no fields; zero readings remain zero. Other device
+addresses pass raw validation but are not stored until their optional field mappings
+and output-schema properties are added. This route emits one bridge record per message.
+
 ## Route processing
 
 For each subscribed message, the service:
