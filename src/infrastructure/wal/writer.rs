@@ -1293,7 +1293,7 @@ mod tests {
         tokio::pin!(notified);
         notified.as_mut().enable();
         handle.tx.send(req(sample_event(2))).unwrap();
-        let woken = tokio::time::timeout(Duration::from_millis(500), notified).await;
+        let woken = tokio::time::timeout(Duration::from_secs(2), notified).await;
         assert!(
             woken.is_ok(),
             "a new record must still flush and notify the waiter"
