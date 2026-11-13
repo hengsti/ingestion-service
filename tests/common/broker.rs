@@ -171,6 +171,11 @@ pub fn write_routes(dir: &Path) -> Result<()> {
             .remove("sink_target");
         route["fields"]["test_id"] = json!({"pointer": "/test_id", "type": "string"});
     }
+    // Only the synthetic schema admits the scalar test oracle.
+    let shelly_schema_path = dir.join("schemas/shelly-plug.output.schema.json");
+    let mut shelly_schema = read_json(&shelly_schema_path)?;
+    shelly_schema["properties"]["fields"]["properties"]["test_id"] = json!({"type": "string"});
+    fs::write(shelly_schema_path, serde_json::to_vec(&shelly_schema)?)?;
     let mut zigbee = read_json(
         root()
             .join("tests")

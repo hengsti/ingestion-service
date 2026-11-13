@@ -22,6 +22,8 @@ enum Calculation {
     HumidityRatio,
     SurfaceTempAt80rh,
     DewPointDepression,
+    ApparentPower,
+    EstimatedPowerFactor,
     Iaq,
 }
 
@@ -34,6 +36,8 @@ impl Calculation {
             Self::HumidityRatio => &[("humidity_ratio_g_kg", FieldType::Float)],
             Self::SurfaceTempAt80rh => &[("surface_temp_at_80rh_c", FieldType::Float)],
             Self::DewPointDepression => &[("dew_point_depression_c", FieldType::Float)],
+            Self::ApparentPower => &[("apparent_power_va", FieldType::Float)],
+            Self::EstimatedPowerFactor => &[("estimated_power_factor", FieldType::Float)],
             Self::Iaq => &[
                 ("iaq_score", FieldType::Float),
                 ("iaq_text", FieldType::String),
@@ -43,6 +47,9 @@ impl Calculation {
 }
 
 pub(crate) fn output_can_be_omitted(field: &str, record: &TelemetryRecord) -> bool {
+    if field == "estimated_power_factor" {
+        return matches!(estimated_power_factor(record), Ok(None));
+    }
     if !matches!(
         record.fields.get(WARMED_UP_FIELD),
         Some(TelemetryValue::Boolean(false))
@@ -108,6 +115,16 @@ impl CalculationRegistry {
                     Calculation::DewPointDepression,
                     "dew_point_depression",
                     &[TEMPERATURE_FIELD, HUMIDITY_FIELD][..],
+                ),
+                CalculationName::ApparentPower => (
+                    Calculation::ApparentPower,
+                    "apparent_power",
+                    &["voltage_v", "current_a"][..],
+                ),
+                CalculationName::EstimatedPowerFactor => (
+                    Calculation::EstimatedPowerFactor,
+                    "estimated_power_factor",
+                    &["voltage_v", "current_a", "power_w"][..],
                 ),
                 CalculationName::Iaq => (Calculation::Iaq, "iaq", &[GAS_FIELD, HUMIDITY_FIELD][..]),
             };
@@ -229,6 +246,22 @@ impl CalculationRegistry {
                         TelemetryValue::Float(value),
                     );
                 }
+                Calculation::ApparentPower => {
+                    let value = apparent_power_va(&record)?;
+                    ensure_output_available(&record, "apparent_power_va")?;
+                    record
+                        .fields
+                        .insert("apparent_power_va".to_owned(), TelemetryValue::Float(value));
+                }
+                Calculation::EstimatedPowerFactor => {
+                    ensure_output_available(&record, "estimated_power_factor")?;
+                    if let Some(value) = estimated_power_factor(&record)? {
+                        record.fields.insert(
+                            "estimated_power_factor".to_owned(),
+                            TelemetryValue::Float(value),
+                        );
+                    }
+                }
                 Calculation::Iaq => {
                     let warmed_up = match record.fields.get(WARMED_UP_FIELD) {
                         Some(TelemetryValue::Boolean(warmed_up)) => *warmed_up,
@@ -285,6 +318,25 @@ fn required_float(record: &TelemetryRecord, key: &str) -> Result<f64> {
         Some(_) => bail!("calculation input '{key}' must be a float"),
         None => bail!("calculation input '{key}' is missing"),
     }
+}
+
+fn apparent_power_va(record: &TelemetryRecord) -> Result<f64> {
+    let voltage = required_float(record, "voltage_v")?;
+    let current = required_float(record, "current_a")?;
+    if voltage < 0.0 || current < 0.0 {
+        bail!("voltage_v and current_a must be nonnegative");
+    }
+    finite_result("apparent_power_va", voltage * current)
+}
+
+fn estimated_power_factor(record: &TelemetryRecord) -> Result<Option<f64>> {
+    let power = required_float(record, "power_w")?;
+    let apparent = apparent_power_va(record)?;
+    if apparent < 1.0 {
+        return Ok(None);
+    }
+    let ratio = power.abs() / apparent;
+    Ok((0.0..=1.0).contains(&ratio).then_some(ratio))
 }
 
 fn validate_humidity(rel_hum_perc: f64) -> Result<()> {
@@ -450,6 +502,162 @@ mod tests {
         }
     }
 
+    fn electrical_record(voltage: f64, current: f64, power: f64) -> TelemetryRecord {
+        let mut record = valid_record();
+        record.fields = BTreeMap::from([
+            ("voltage_v".to_owned(), TelemetryValue::Float(voltage)),
+            ("current_a".to_owned(), TelemetryValue::Float(current)),
+            ("power_w".to_owned(), TelemetryValue::Float(power)),
+        ]);
+        record
+    }
+
+    #[test]
+    fn test_calculation_electrical_names_work_independently() -> Result<()> {
+        for (name, output, expected) in [
+            ("apparent_power", "apparent_power_va", 115.0),
+            ("estimated_power_factor", "estimated_power_factor", 0.8),
+        ] {
+            let mut record = electrical_record(230.0, 0.5, 92.0);
+            if name == "apparent_power" {
+                record.fields.remove("power_w");
+            }
+            let fields =
+                float_fields(&record.fields.keys().map(String::as_str).collect::<Vec<_>>());
+            let registry = CalculationRegistry::resolve(&[calculation_name(name)?], &fields)?;
+            let before = record.fields.len();
+            let record = registry.apply(record)?;
+            assert_eq!(record.fields.len(), before + 1);
+            assert_eq!(record.fields[output], TelemetryValue::Float(expected));
+            assert!(!output_can_be_omitted(output, &record));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_electrical_zero_low_load_signed_and_inconsistent_readings() -> Result<()> {
+        let fields = float_fields(&["voltage_v", "current_a", "power_w"]);
+        let registry = CalculationRegistry::resolve(
+            &[
+                calculation_name("estimated_power_factor")?,
+                calculation_name("apparent_power")?,
+            ],
+            &fields,
+        )?;
+        for (voltage, current, power, apparent, factor) in [
+            (0.0, 0.5, 0.0, 0.0, None),
+            (230.0, 0.0, 0.0, 0.0, None),
+            (230.0, 0.001, 0.1, 0.23, None),
+            (0.999, 1.0, 0.5, 0.999, None),
+            (2.0, 0.5, 0.8, 1.0, Some(0.8)),
+            (230.0, 0.5, -92.0, 115.0, Some(0.8)),
+            (230.0, 0.5, 120.0, 115.0, None),
+            (230.0, 0.5, 0.0, 115.0, Some(0.0)),
+            (230.0, 0.5, 115.0, 115.0, Some(1.0)),
+        ] {
+            let input = electrical_record(voltage, current, power);
+            let record = registry.apply(input.clone())?;
+            assert_eq!(
+                record.fields["apparent_power_va"],
+                TelemetryValue::Float(apparent)
+            );
+            assert_eq!(
+                record.fields.get("estimated_power_factor"),
+                factor.map(TelemetryValue::Float).as_ref()
+            );
+            assert_eq!(
+                output_can_be_omitted("estimated_power_factor", &record),
+                factor.is_none()
+            );
+            assert!(!output_can_be_omitted("apparent_power_va", &record));
+            assert!(!output_can_be_omitted("dew_point_c", &record));
+            for (name, value) in input.fields {
+                assert_eq!(record.fields[&name], value);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_electrical_preflight_rejects_invalid_mappings_and_collisions() -> Result<()>
+    {
+        for (name, output) in [
+            ("apparent_power", "apparent_power_va"),
+            ("estimated_power_factor", "estimated_power_factor"),
+        ] {
+            let fields = float_fields(&["voltage_v", "current_a", "power_w"]);
+            assert!(CalculationRegistry::resolve(
+                &[calculation_name(name)?, calculation_name(name)?],
+                &fields
+            )
+            .is_err());
+            for key in ["voltage_v", "current_a", "power_w"] {
+                if key == "power_w" && name == "apparent_power" {
+                    continue;
+                }
+                let mut missing = float_fields(&["voltage_v", "current_a", "power_w"]);
+                missing.remove(key);
+                assert!(
+                    CalculationRegistry::resolve(&[calculation_name(name)?], &missing).is_err()
+                );
+                let mut wrong = float_fields(&["voltage_v", "current_a", "power_w"]);
+                wrong.insert(key.to_owned(), mapping(FieldType::Integer));
+                assert!(CalculationRegistry::resolve(&[calculation_name(name)?], &wrong).is_err());
+            }
+            let mut collision = fields;
+            collision.insert(output.to_owned(), mapping(FieldType::Float));
+            assert!(CalculationRegistry::resolve(&[calculation_name(name)?], &collision).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_electrical_rejects_invalid_inputs_and_product_overflow() -> Result<()> {
+        let fields = float_fields(&["voltage_v", "current_a", "power_w"]);
+        for name in ["apparent_power", "estimated_power_factor"] {
+            let registry = CalculationRegistry::resolve(&[calculation_name(name)?], &fields)?;
+            for key in ["voltage_v", "current_a", "power_w"] {
+                if key == "power_w" && name == "apparent_power" {
+                    continue;
+                }
+                let mut invalid_values = vec![
+                    TelemetryValue::Float(f64::NAN),
+                    TelemetryValue::Float(f64::INFINITY),
+                    TelemetryValue::Float(f64::NEG_INFINITY),
+                    TelemetryValue::Integer(1),
+                ];
+                if key != "power_w" {
+                    invalid_values.push(TelemetryValue::Float(-1.0));
+                }
+                for value in invalid_values {
+                    let mut record = electrical_record(0.0, 0.0, 0.0);
+                    record.fields.insert(key.to_owned(), value);
+                    assert!(registry.apply(record.clone()).is_err(), "{name}: {key}");
+                    assert!(!output_can_be_omitted("estimated_power_factor", &record));
+                }
+                let mut record = electrical_record(0.0, 0.0, 0.0);
+                record.fields.remove(key);
+                assert!(registry.apply(record.clone()).is_err());
+                assert!(!output_can_be_omitted("estimated_power_factor", &record));
+            }
+            let overflow = electrical_record(f64::MAX, 2.0, 0.0);
+            assert!(registry.apply(overflow.clone()).is_err());
+            assert!(!output_can_be_omitted("estimated_power_factor", &overflow));
+            let mut collision = electrical_record(230.0, 0.0, 0.0);
+            collision.fields.insert(
+                if name == "apparent_power" {
+                    "apparent_power_va"
+                } else {
+                    name
+                }
+                .to_owned(),
+                TelemetryValue::Float(1.0),
+            );
+            assert!(registry.apply(collision).is_err());
+        }
+        Ok(())
+    }
+
     const CLIMATE_CALCULATIONS: [(&str, &str, f64); 4] = [
         ("absolute_humidity", "absolute_humidity_g_m3", 8.63750),
         ("humidity_ratio", "humidity_ratio_g_kg", 7.25631),
@@ -457,7 +665,32 @@ mod tests {
         ("dew_point_depression", "dew_point_depression_c", 10.74571),
     ];
 
-    fn climate_name(name: &str) -> Result<CalculationName> {
+    #[test]
+    fn test_calculation_electrical_encoded_size_bound_covers_large_finite_outputs() -> Result<()> {
+        use crate::infrastructure::sink::{influx::InfluxEncoder, Encoder};
+
+        let fields = float_fields(&["voltage_v", "current_a", "power_w"]);
+        let registry = CalculationRegistry::resolve(
+            &[
+                calculation_name("apparent_power")?,
+                calculation_name("estimated_power_factor")?,
+            ],
+            &fields,
+        )?;
+        for input in [
+            electrical_record(230.0, 0.5, 92.0),
+            electrical_record(f64::MAX, 1.0, -f64::MAX),
+        ] {
+            let record = registry.apply(input)?;
+            let mut encoded = String::new();
+            InfluxEncoder.encode(&record, &mut encoded);
+            assert!(encoded.len() <= InfluxEncoder.encoded_size_upper_bound(&record));
+            assert!(!encoded.contains("NaN") && !encoded.contains("inf"));
+        }
+        Ok(())
+    }
+
+    fn calculation_name(name: &str) -> Result<CalculationName> {
         Ok(serde_json::from_value(serde_json::json!(name))?)
     }
 
@@ -469,7 +702,7 @@ mod tests {
                 inputs.push("pressure_hpa");
             }
             let registry =
-                CalculationRegistry::resolve(&[climate_name(name)?], &float_fields(&inputs))?;
+                CalculationRegistry::resolve(&[calculation_name(name)?], &float_fields(&inputs))?;
             let mut input = valid_record();
             input.fields.retain(|key, _| inputs.contains(&key.as_str()));
             input
@@ -513,19 +746,21 @@ mod tests {
                 }
                 let mut missing = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
                 missing.remove(input);
-                assert!(CalculationRegistry::resolve(&[climate_name(name)?], &missing).is_err());
+                assert!(
+                    CalculationRegistry::resolve(&[calculation_name(name)?], &missing).is_err()
+                );
                 let mut wrong = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
                 wrong.insert(input.to_owned(), mapping(FieldType::Integer));
-                assert!(CalculationRegistry::resolve(&[climate_name(name)?], &wrong).is_err());
+                assert!(CalculationRegistry::resolve(&[calculation_name(name)?], &wrong).is_err());
             }
             assert!(CalculationRegistry::resolve(
-                &[climate_name(name)?, climate_name(name)?],
+                &[calculation_name(name)?, calculation_name(name)?],
                 &fields
             )
             .is_err());
             let mut collision = fields;
             collision.insert(output.to_owned(), mapping(FieldType::Float));
-            assert!(CalculationRegistry::resolve(&[climate_name(name)?], &collision).is_err());
+            assert!(CalculationRegistry::resolve(&[calculation_name(name)?], &collision).is_err());
         }
         Ok(())
     }
@@ -534,7 +769,7 @@ mod tests {
     fn test_calculation_climate_rejects_invalid_domains_and_runtime_inputs() -> Result<()> {
         for (name, output, _) in CLIMATE_CALCULATIONS {
             let fields = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
-            let registry = CalculationRegistry::resolve(&[climate_name(name)?], &fields)?;
+            let registry = CalculationRegistry::resolve(&[calculation_name(name)?], &fields)?;
             for (field, value) in [
                 ("rel_hum_perc", 0.0),
                 ("rel_hum_perc", -1.0),
@@ -592,7 +827,8 @@ mod tests {
     #[test]
     fn test_calculation_humidity_ratio_requires_pressure_above_vapor_pressure() -> Result<()> {
         let fields = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
-        let registry = CalculationRegistry::resolve(&[climate_name("humidity_ratio")?], &fields)?;
+        let registry =
+            CalculationRegistry::resolve(&[calculation_name("humidity_ratio")?], &fields)?;
         // At 0 C and 50% RH, vapor pressure is exactly 6.112 / 2 hPa.
         for pressure in [-1.0, 0.0, 3.0, 3.056] {
             let mut record = valid_record();
@@ -611,7 +847,7 @@ mod tests {
     fn test_calculation_surface_temperature_rejects_inverse_singularity() -> Result<()> {
         let fields = float_fields(&["temp_c", "rel_hum_perc"]);
         let registry =
-            CalculationRegistry::resolve(&[climate_name("surface_temp_at_80rh")?], &fields)?;
+            CalculationRegistry::resolve(&[calculation_name("surface_temp_at_80rh")?], &fields)?;
         let mut record = valid_record();
         // At this temperature and 100% RH, ln(e / (0.8 * 6.112)) reaches 17.67.
         record.fields.insert(
@@ -631,7 +867,7 @@ mod tests {
 
         let names = CLIMATE_CALCULATIONS
             .iter()
-            .map(|(name, _, _)| climate_name(name))
+            .map(|(name, _, _)| calculation_name(name))
             .collect::<Result<Vec<_>>>()?;
         let fields = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
         let registry = CalculationRegistry::resolve(&names, &fields)?;

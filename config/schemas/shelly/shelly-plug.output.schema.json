@@ -43,6 +43,15 @@
         "power_w": {
           "type": "number"
         },
+        "apparent_power_va": {
+          "type": "number",
+          "minimum": 0
+        },
+        "estimated_power_factor": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
         "voltage_v": {
           "type": "number",
           "minimum": 0
@@ -73,6 +82,7 @@
       "required": [
         "output",
         "power_w",
+        "apparent_power_va",
         "voltage_v",
         "current_a",
         "energy_wh",

@@ -90,6 +90,44 @@ The shipped firmware examples are in [`config/routes.json`](../config/routes.jso
 cache; `firmware-status` subscribes to `smarthome/+/status`, writes `device_status`,
 and opts out. Their raw and output schemas live under `config/schemas/`.
 
+## Shelly electrical quantities
+
+The shared [`shelly-plug.json`](../config/routes/shelly-plug.json) mapping enables
+these calculations for both configured `status/switch:0` bindings and future
+bindings added to the same family:
+
+| Calculation | Required mapped float inputs | Float output | Formula |
+|---|---|---|---|
+| `apparent_power` | `voltage_v` (V), `current_a` (A) | `apparent_power_va` (VA) | `voltage_v * current_a` |
+| `estimated_power_factor` | `voltage_v`, `current_a`, `power_w` (W) | `estimated_power_factor` (dimensionless) | `abs(power_w) / (voltage_v * current_a)` |
+
+Each works independently from mapped inputs; the estimate does not depend on a
+previously calculated field. At `230 V`, `0.5 A`, `92 W`, outputs are `115 VA` and
+`0.8`. Negative active power uses its absolute value for the estimate; the original
+`power_w`, `energy_wh` and `returned_energy_wh` retain their values and meanings.
+
+Zero voltage or current emits `apparent_power_va=0` and omits the estimate. A fixed
+**1 VA** low-load floor also omits the estimate for positive loads below 1 VA.
+At or above 1 VA, only ratios in `[0,1]` are emitted. A ratio above 1 leaves the
+source fields and apparent power intact and omits the estimate, without clamping
+or quarantining an otherwise valid record. Exactly 1 VA is eligible. Missing,
+wrong-type or non-finite required inputs, negative voltage/current and non-finite
+multiplication results are rejected through normal validation, even at zero load.
+An unexpectedly missing calculated output still fails normalized validation.
+
+The ratio estimates a magnitude from device-reported readings; it is neither a
+phase angle nor a new calibrated power-quality measurement. The floor is a
+conservative numerical cutoff, not a verified meter-accuracy threshold. These
+message-local calculations use no history, appliance metadata or new publisher fields.
+
+Outputs are numeric fields, never tags, on `shelly_plug` in the existing `sensors`
+destination. Receive timestamps and `cache: false` remain in effect. Added fields
+increase encoded/WAL/storage size and are included in the existing encoded-size
+bound; no performance improvement is claimed. Existing WAL payloads replay as
+encoded and gain no fields retroactively. Older binaries need their previous
+route/schema directory. Daily energy, tariffs, dashboards and Advisor consumer
+changes require separate work.
+
 ## Zigbee2MQTT bridge health
 
 [`zigbee2mqtt-bridge-health.json`](../config/routes/zigbee2mqtt-bridge-health.json)

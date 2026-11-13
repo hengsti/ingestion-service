@@ -57,6 +57,7 @@
     "timestamp": {
       "source": "received_at"
     },
+    "calculations": ["apparent_power", "estimated_power_factor"],
     "cache": false
   }
 }

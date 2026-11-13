@@ -184,6 +184,79 @@ fn test_compose_stack_is_isolated_and_uses_deployment_images() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires the isolated EMQX/InfluxDB Compose stack"]
+async fn test_shelly_electrical_fields_and_omissions_persist_for_both_bindings() -> Result<()> {
+    let mut harness = broker::Harness::connect().await?;
+    let result = async {
+        harness.use_owned_bucket("shelly");
+        harness.create_bucket().await?;
+        harness.start(None)?;
+        harness.wait_ready().await?;
+        let mut sequence = 0;
+        for device in ["shellyplugmg3-907069671340", "shellyplugmg3-90706968bf88"] {
+            for (voltage, current, power, apparent, factor) in [
+                (230.0, 0.5, 92.0, "115", Some("0.8")),
+                (0.0, 0.5, 0.0, "0", None),
+                (230.0, 0.0, 0.0, "0", None),
+                (230.0, 0.001, 0.1, "0.23", None),
+                (2.0, 0.5, 0.8, "1", Some("0.8")),
+                (230.0, 0.5, -92.0, "115", Some("0.8")),
+                (230.0, 0.5, 120.0, "115", None),
+            ] {
+                sequence += 1;
+                let id = format!("shelly-{}-{sequence}", harness.client_id());
+                let mut payload: serde_json::Value =
+                    serde_json::from_slice(&common::valid_shelly_payload())?;
+                payload["voltage"] = serde_json::json!(voltage);
+                payload["current"] = serde_json::json!(current);
+                payload["apower"] = serde_json::json!(power);
+                payload["test_id"] = serde_json::json!(id);
+                harness
+                    .publish(
+                        &format!("{device}/status/switch:0"),
+                        serde_json::to_vec(&payload)?,
+                    )
+                    .await?;
+                harness.wait_subscriber_ack(sequence).await?;
+                let csv = harness.query_fields(&id).await?;
+                assert_field(&csv, "_measurement", "shelly_plug", "string")?;
+                assert_field(&csv, "device_id", device, "string")?;
+                assert_field(&csv, "apparent_power_va", apparent, "double")?;
+                assert_field(&csv, "power_w", &power.to_string(), "double")?;
+                assert_field(&csv, "energy_wh", "1234.5", "double")?;
+                assert_field(&csv, "returned_energy_wh", "12.5", "double")?;
+                if let Some(factor) = factor {
+                    assert_field(&csv, "estimated_power_factor", factor, "double")?;
+                } else {
+                    let headers: Vec<_> = csv
+                        .lines()
+                        .find(|line| line.starts_with(",result,table,"))
+                        .context("CSV header")?
+                        .split(',')
+                        .collect();
+                    if let Some(index) = headers
+                        .iter()
+                        .position(|header| *header == "estimated_power_factor")
+                    {
+                        let row: Vec<_> = csv
+                            .lines()
+                            .find(|line| line.contains(&id))
+                            .context("CSV point")?
+                            .split(',')
+                            .collect();
+                        assert_eq!(row[index], "", "undefined estimate must be absent");
+                    }
+                }
+            }
+        }
+        harness.wait_committed(sequence as u64).await?;
+        Ok(())
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated EMQX/InfluxDB Compose stack"]
 async fn test_firmware_sensor_happy_path_observes_subscriber_ack_and_written_fields() -> Result<()>
 {
     let mut harness = broker::Harness::connect().await?;
@@ -1079,15 +1152,20 @@ async fn test_broker_restart_preserves_queued_and_unacknowledged_qos1_ids() -> R
         harness.start(Some("after_sync"))?;
         harness.wait_ready().await?;
         let device = harness.device_id("broker-restart");
-        for sequence in 1..=2 {
+        let (topic, raw) = broker::sensor_payload(&device, 1)?;
+        harness.publish(&topic, raw).await?;
+        harness.wait_barrier("after_sync").await?;
+        harness.wait_inflight(1).await?;
+        assert!(!harness
+            .trace()?
+            .lines()
+            .any(|line| line.starts_with("puback ")));
+        harness.stop()?;
+        // Queue offline so the replay setup does not depend on concurrent durable deliveries.
+        for sequence in 2..=3 {
             let (topic, raw) = broker::sensor_payload(&device, sequence)?;
             harness.publish(&topic, raw).await?;
         }
-        harness.wait_barrier("after_sync").await?;
-        harness.wait_inflight(2).await?;
-        harness.stop()?;
-        let (topic, raw) = broker::sensor_payload(&device, 3)?;
-        harness.publish(&topic, raw).await?;
         let offset = harness.trace()?.len();
         harness.restart_broker()?;
         harness.start(None)?;

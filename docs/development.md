@@ -65,6 +65,8 @@ The current calculations use these canonical field names:
 | `surface_temp_at_80rh` | `temp_c`, `rel_hum_perc` floats | `surface_temp_at_80rh_c` float in °C | Same vapor-pressure domain; inverse must produce a finite output |
 | `dew_point_depression` | `temp_c`, `rel_hum_perc` floats | `dew_point_depression_c` float in °C | Temperature above absolute zero; RH in `(0, 100]`; existing dew-point helper and subtraction must produce a finite output |
 | `iaq` | `gas_ohm` float in ohms; `rel_hum_perc` float in percent | `iaq_score` float and `iaq_text` string | Gas must be positive; humidity must be in `(0, 100]`; output must be finite |
+| `apparent_power` | `voltage_v` float in V; `current_a` float in A | `apparent_power_va` float in VA | Finite, nonnegative voltage/current; finite product; zero is valid |
+| `estimated_power_factor` | `voltage_v`, `current_a`, `power_w` floats | Optional `estimated_power_factor` float, dimensionless | Same voltage/current domain; finite signed active power; omit below 1 VA or when the magnitude ratio exceeds 1 |
 
 Temperature inputs are in °C, RH in percent and pressure in hPa. Each calculation
 uses mapped inputs independently; none requires another calculated field. See
@@ -77,6 +79,13 @@ pipeline test check that it still covers encoded bytes.
 `warmed_up` boolean is `false`, the calculation still validates its inputs but omits
 both IAQ outputs; if the field is absent, IAQ is calculated. Calculations do not
 accept parameters or carry state between messages.
+
+`estimated_power_factor` calculates apparent power directly from mapped inputs,
+independently of `apparent_power`. It uses a fixed 1 VA diagnostic floor, with no
+configuration parameter. `output_can_be_omitted` recomputes the same checked rule:
+missing/invalid inputs are not an omission case. Missing calculated outputs still
+fail validation outside their explicit IAQ/power-factor cases. See the
+[Shelly equations and limits](messages-and-routing.md#shelly-electrical-quantities).
 
 The current focused tests include
 `test_calculation_resolve_requires_expected_mapping_types`,
@@ -118,11 +127,15 @@ docker compose -f .\tests\compose.integration.yaml -p ingest-it up -d --wait
 cargo test --all-features --locked --test broker_integration -- --ignored --test-threads=1
 ```
 
-The firmware baseline selector is `test_firmware_sensor_happy_path`. The suite also covers
+The firmware baseline selector is `test_firmware_sensor_happy_path`; the Shelly selector
+is `test_shelly_electrical_fields_and_omissions`. The latter verifies both shipped
+bindings, signed power, the 1 VA floor and omitted estimates in real InfluxDB float fields.
+The suite also covers
 typed status/Zigbee output, firmware SSE, arbitrary-topic contract changes, three crash
 windows repeated three times, stale receipts/queued ACKs with packet-ID reuse, tiny queues,
 journal capacity and write/sync failures, durable rejection, fail-closed reader gaps,
-resumed A-to-B subscriptions, broker backlog restart, and sink outage/auth/missing-bucket
+resumed A-to-B subscriptions, broker backlog restart (one synced but unacknowledged
+input plus two publications queued while ingest is offline), and sink outage/auth/missing-bucket
 recovery. A mixed type-conflict batch demonstrates partial Influx acceptance without cursor
 advance and replays the whole batch into a fresh scenario-owned bucket. No existing bucket,
 journal, or quarantine record is deleted to repair it.

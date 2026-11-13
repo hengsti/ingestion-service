@@ -234,6 +234,10 @@ pub enum CalculationName {
     SurfaceTempAt80rh,
     /// Calculate air temperature minus its dew point.
     DewPointDepression,
+    /// Calculate apparent power from voltage and current in volt-amperes.
+    ApparentPower,
+    /// Estimate power-factor magnitude, omitting low-load or inconsistent readings.
+    EstimatedPowerFactor,
     /// Calculate indoor air quality from gas resistance and humidity.
     Iaq,
 }

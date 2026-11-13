@@ -20,6 +20,78 @@ use smarthome_ingest::{
 const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
 
 #[tokio::test]
+async fn test_shelly_electrical_fields_persist_for_both_bindings_without_caching() -> Result<()> {
+    let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;
+    for device in ["shellyplugmg3-907069671340", "shellyplugmg3-90706968bf88"] {
+        for (voltage, current, power, apparent, factor) in [
+            (230.0, 0.5, 92.0, 115.0, Some(0.8)),
+            (0.0, 0.5, 0.0, 0.0, None),
+            (230.0, 0.0, 0.0, 0.0, None),
+            (230.0, 0.001, 0.1, 0.23, None),
+            (2.0, 0.5, 0.8, 1.0, Some(0.8)),
+            (230.0, 0.5, -92.0, 115.0, Some(0.8)),
+            (230.0, 0.5, 120.0, 115.0, None),
+        ] {
+            let mut payload: Value = serde_json::from_slice(&common::valid_shelly_payload())?;
+            payload["voltage"] = json!(voltage);
+            payload["current"] = json!(current);
+            payload["apower"] = json!(power);
+            let mut ctx = PipelineContext::new_with_metadata(
+                format!("{device}/status/switch:0"),
+                serde_json::to_vec(&payload)?,
+                1_700_000_000_456,
+                false,
+            );
+            assert_eq!(
+                pipeline.run(&mut ctx).await,
+                PipelineOutcome::OutputStored,
+                "{:?}",
+                ctx.rejection_reason()
+            );
+            let event = common::recv_event(&mut sub, 500)
+                .await
+                .context("durable Shelly output")?;
+            let record = ctx.telemetry_record()?;
+            assert_eq!(
+                record.fields["apparent_power_va"],
+                TelemetryValue::Float(apparent)
+            );
+            assert_eq!(
+                record.fields.get("estimated_power_factor"),
+                factor.map(TelemetryValue::Float).as_ref()
+            );
+            assert_eq!(record.fields["power_w"], TelemetryValue::Float(power));
+            assert_eq!(record.fields["energy_wh"], TelemetryValue::Float(1234.5));
+            assert_eq!(
+                record.fields["returned_energy_wh"],
+                TelemetryValue::Float(12.5)
+            );
+            assert_eq!(record.fields["output"], TelemetryValue::Boolean(true));
+            assert_eq!(record.timestamp_ms, 1_700_000_000_456);
+            assert_eq!(event.sink_target.as_deref(), Some("sensors"));
+            assert!(event
+                .payload
+                .starts_with(&format!("shelly_plug,device_id={device} ")));
+            assert!(event
+                .payload
+                .contains(&format!("apparent_power_va={apparent},")));
+            if let Some(factor) = factor {
+                assert!(event
+                    .payload
+                    .contains(&format!(",estimated_power_factor={factor},")));
+            } else {
+                assert!(!event.payload.contains("estimated_power_factor"));
+            }
+            assert!(
+                event.payload.len() <= common::influx_encoder().encoded_size_upper_bound(record)
+            );
+            assert!(cache.snapshot_all_devices().is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_climate_fields_survive_validation_encoding_and_durable_wal_during_warmup(
 ) -> Result<()> {
     let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;

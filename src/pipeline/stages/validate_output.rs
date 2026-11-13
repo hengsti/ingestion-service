@@ -456,6 +456,46 @@ mod tests {
     }
 
     #[test]
+    fn test_output_validation_only_allows_intended_power_factor_omissions() -> Result<()> {
+        let routes = RouteSet::compile(
+            crate::config::routes::load("config/routes.json")?,
+            "home/dlq",
+            "test_bucket",
+        )?;
+        let topic = "shellyplugmg3-907069671340/status/switch:0";
+        let route = routes.select(topic).context("Shelly route")?;
+        for (voltage, current, power, omission_allowed) in [
+            (230.0, 0.5, 92.0, false),
+            (0.0, 0.5, 0.0, true),
+            (230.0, 0.0, 0.0, true),
+            (230.0, 0.001, 0.1, true),
+            (2.0, 0.5, 0.8, false),
+            (230.0, 0.5, -92.0, false),
+            (230.0, 0.5, 120.0, true),
+        ] {
+            let payload = json!({"id":0, "output":true, "voltage":voltage, "current":current,
+                "apower":power, "aenergy":{"total":1.0}, "temperature":{"tC":35.0}});
+            let mapped = crate::pipeline::stages::telemetry_mapping::map_payload(
+                route.config(),
+                &payload,
+                topic,
+                1_700_000_000_000,
+                false,
+            )?;
+            let mut record = route.calculations().apply(mapped)?;
+            validate_record(&route, &record, topic, false)?;
+            record.fields.remove("estimated_power_factor");
+            assert_eq!(
+                validate_record(&route, &record, topic, false).is_ok(),
+                omission_allowed
+            );
+            record.fields.remove("apparent_power_va");
+            assert!(validate_record(&route, &record, topic, false).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_telemetry_output_validation_rejects_control_characters() -> Result<()> {
         let (_directory, _routes, route, mut record) = test_case()?;
 

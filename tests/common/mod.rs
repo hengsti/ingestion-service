@@ -205,6 +205,16 @@ pub fn valid_sensor_payload(device_id: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+pub fn valid_shelly_payload() -> Vec<u8> {
+    serde_json::json!({
+        "id": 0, "output": true, "apower": 92.0, "voltage": 230.0,
+        "freq": 50.0, "current": 0.5, "aenergy": {"total": 1234.5},
+        "ret_aenergy": {"total": 12.5}, "temperature": {"tC": 35.0}
+    })
+    .to_string()
+    .into_bytes()
+}
+
 pub fn valid_status_payload(device_id: &str) -> Vec<u8> {
     serde_json::json!({
         "device_id": device_id,

@@ -236,7 +236,11 @@
       "timestamp": {
         "source": "received_at"
       },
-      "cache": false
+      "cache": false,
+      "calculations": [
+        "apparent_power",
+        "estimated_power_factor"
+      ]
     },
     {
       "id": "shelly-plug-90706968bf88",
@@ -287,7 +291,11 @@
       "timestamp": {
         "source": "received_at"
       },
-      "cache": false
+      "cache": false,
+      "calculations": [
+        "apparent_power",
+        "estimated_power_factor"
+      ]
     },
     {
       "id": "aqara-p100-buero",
