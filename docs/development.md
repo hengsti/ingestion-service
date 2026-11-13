@@ -60,7 +60,18 @@ The current calculations use these canonical field names:
 |---|---|---|---|
 | `dew_point` | `temp_c` float in °C; `rel_hum_perc` float in percent | `dew_point_c` float in °C | Finite temperature; humidity must be in `(0, 100]`; output must be finite |
 | `heat_index` | `temp_c` float in °C; `rel_hum_perc` float in percent | `heat_index_c` float in °C | Finite temperature; humidity must be in `(0, 100]`; output must be finite |
+| `absolute_humidity` | `temp_c`, `rel_hum_perc` floats | `absolute_humidity_g_m3` float in g/m³ | Temperature above absolute zero; RH in `(0, 100]`; positive finite vapor pressure; finite output |
+| `humidity_ratio` | `temp_c`, `rel_hum_perc`, `pressure_hpa` floats | `humidity_ratio_g_kg` float in g/kg dry air | Same vapor-pressure domain; finite total pressure strictly above vapor pressure; finite output |
+| `surface_temp_at_80rh` | `temp_c`, `rel_hum_perc` floats | `surface_temp_at_80rh_c` float in °C | Same vapor-pressure domain; inverse must produce a finite output |
+| `dew_point_depression` | `temp_c`, `rel_hum_perc` floats | `dew_point_depression_c` float in °C | Temperature above absolute zero; RH in `(0, 100]`; existing dew-point helper and subtraction must produce a finite output |
 | `iaq` | `gas_ohm` float in ohms; `rel_hum_perc` float in percent | `iaq_score` float and `iaq_text` string | Gas must be positive; humidity must be in `(0, 100]`; output must be finite |
+
+Temperature inputs are in °C, RH in percent and pressure in hPa. Each calculation
+uses mapped inputs independently; none requires another calculated field. See
+[climate quantities](messages-and-routing.md#message-local-climate-quantities) for
+equations, temperature applicability and interpretation. The encoder's existing
+size bound includes the additional float fields; focused calculation tests and the
+pipeline test check that it still covers encoded bytes.
 
 `iaq` clamps its gas contribution to 5,000–50,000 ohms. If the optional mapped
 `warmed_up` boolean is `false`, the calculation still validates its inputs but omits

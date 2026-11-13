@@ -163,7 +163,7 @@ async fn shared_family_bindings_keep_targets_fallback_and_mapping_policies() -> 
 }
 
 #[test]
-fn shipped_v2_preserves_the_frozen_v1_routes() -> Result<()> {
+fn shipped_v2_matches_the_v1_counterpart() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let legacy = common::write_v1_shipped_bundle(directory.path())?;
     let mut baseline: Value = serde_json::from_slice(&fs::read(legacy)?)?;
@@ -182,7 +182,7 @@ fn shipped_v2_preserves_the_frozen_v1_routes() -> Result<()> {
     resolve_schema_contents(&mut manifest, Path::new("config"))?;
     resolve_schema_contents(&mut baseline, directory.path())?;
     let baseline_routes = baseline["routes"].as_array().context("legacy routes")?;
-    // The frozen fixture protects existing routes; new families have their own tests.
+    // The v1 counterpart covers existing routes; new families have their own tests.
     manifest["routes"]
         .as_array_mut()
         .context("expanded routes")?
