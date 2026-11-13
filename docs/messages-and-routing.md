@@ -155,13 +155,65 @@ Both routes use raw and output schemas from `config/schemas/`. Sensor fields map
 `data.*`; status fields map from the root payload. The status route's configured defaults
 remain `0` for missing `uptime`/`free_mem` and `""` for missing `ssid`. Optional fields
 remain absent if the publisher omits them. The firmware sensor route calculates dew point,
-heat index, and IAQ. It emits `iaq_score` and `iaq_text` together unless `warmed_up` is
-explicitly false.
+heat index, IAQ and the four climate quantities below. It emits `iaq_score` and `iaq_text`
+together unless `warmed_up` is explicitly false. Warm-up does not suppress other calculations.
 
 The same pipeline accepts routes for other device formats and topic layouts. A Zigbee or
 other JSON payload needs only a route entry with a filter, raw schema, identity, mappings,
 optional calculations/output schema, and measurement. There are no firmware-only runtime
 branches.
+
+### Message-local climate quantities
+
+The firmware sensor route enables these independently selectable calculations. All
+outputs are float **fields**, never tags, in the normalized record, `bme680` Influx
+output and opt-in cache/API/SSE `value` map. Measurements, identity, timestamps and
+HTTP/SSE envelopes keep their existing meaning; publisher payloads need no additions.
+
+| Calculation name | Output field | Meaning and unit |
+|---|---|---|
+| `absolute_humidity` | `absolute_humidity_g_m3` | Water-vapor mass per air volume, g/m³ |
+| `humidity_ratio` | `humidity_ratio_g_kg` | Water-vapor mass per dry-air mass, g/kg |
+| `surface_temp_at_80rh` | `surface_temp_at_80rh_c` | Hypothetical temperature at which this air's vapor pressure corresponds to 80% RH, °C |
+| `dew_point_depression` | `dew_point_depression_c` | Measured air temperature minus its existing dew point, °C |
+
+For mapped temperature `T = temp_c` in °C, `RH = rel_hum_perc` in percent and total
+pressure `p = pressure_hpa` in hPa:
+
+```text
+es = 6.112 * exp(17.67 * T / (T + 243.5))
+e = es * RH / 100
+absolute_humidity_g_m3 = 216.7 * e / (T + 273.15)
+humidity_ratio_g_kg = 621.98 * e / (p - e)
+x = ln(e / (0.8 * 6.112))
+surface_temp_at_80rh_c = 243.5 * x / (17.67 - x)
+dew_point_depression_c = T - dew_point_c(T, RH)
+```
+
+The existing dew-point formula is unchanged. Only humidity ratio needs pressure;
+each calculation works alone from mapped floats. All require finite inputs,
+`T > -273.15` and `0 < RH <= 100`. Vapor pressure must be positive and finite;
+the singularity at `T = -243.5`, underflow to zero, overflow and non-finite
+results are rejected. Humidity ratio also requires `p > e`; the surface inverse
+rejects a non-finite result at `x = 17.67`. Dew-point depression retains the
+existing dew-point singularity check through finite-result validation.
+
+These are approximations intended for ordinary indoor/ambient temperatures.
+The vapor-pressure approximation describes saturation over liquid water, not ice;
+below-freezing and extreme temperatures are outside the intended indoor use.
+Domain/finiteness checks do not certify accuracy over every accepted temperature.
+The surface threshold is neither a measured wall/window temperature nor a mould
+probability. Dew-point depression describes how close the measured air is to
+saturation; it is not a wall/window condensation margin.
+
+At `T=20`, `RH=50`, `p=1013.25`, the four outputs are approximately `8.63750 g/m³`,
+`7.25631 g/kg`, `12.62770 °C` and `10.74571 °C`. Calculation failures use the
+existing deterministic rejection/quarantine path. The extra fields increase
+record, cache, WAL and storage size; no throughput or latency improvement is claimed.
+Existing WAL payloads replay unchanged and do not acquire these fields retroactively.
+Older binaries cannot load the new calculation names; rollback needs its previous
+route/schema directory. Grafana, monitoring rollup allowlists and Advisor consumers
+need separate updates to use the new persisted fields.
 
 ## Firmware compatibility and migration
 

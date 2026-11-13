@@ -102,6 +102,22 @@ fn cache_record() -> TelemetryRecord {
             ("pressure_hpa".to_owned(), TelemetryValue::Float(1013.25)),
             ("gas_ohm".to_owned(), TelemetryValue::Float(50_000.0)),
             (
+                "absolute_humidity_g_m3".to_owned(),
+                TelemetryValue::Float(8.986530085547768),
+            ),
+            (
+                "humidity_ratio_g_kg".to_owned(),
+                TelemetryValue::Float(7.6182976599696985),
+            ),
+            (
+                "surface_temp_at_80rh_c".to_owned(),
+                TelemetryValue::Float(13.363267323528657),
+            ),
+            (
+                "dew_point_depression_c".to_owned(),
+                TelemetryValue::Float(12.535142237360022),
+            ),
+            (
                 "dew_point_c".to_owned(),
                 TelemetryValue::Float(9.964857762639978),
             ),

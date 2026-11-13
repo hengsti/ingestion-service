@@ -86,7 +86,11 @@
     "calculations": [
       "dew_point",
       "heat_index",
-      "iaq"
+      "iaq",
+      "absolute_humidity",
+      "humidity_ratio",
+      "surface_temp_at_80rh",
+      "dew_point_depression"
     ],
     "cache": true
   }

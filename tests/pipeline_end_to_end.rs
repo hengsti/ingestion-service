@@ -20,6 +20,57 @@ use smarthome_ingest::{
 const DRAFT_7: &str = "http://json-schema.org/draft-07/schema#";
 
 #[tokio::test]
+async fn test_climate_fields_survive_validation_encoding_and_durable_wal_during_warmup(
+) -> Result<()> {
+    let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;
+    let mut payload: Value = serde_json::from_slice(&common::valid_sensor_payload("climate-1"))?;
+    payload["data"]["temp_c"] = json!(20.0);
+    payload["data"]["rel_hum_perc"] = json!(50.0);
+    payload["warmed_up"] = json!(false);
+    let mut ctx = PipelineContext::new_with_metadata(
+        "smarthome/climate-1/bme680",
+        serde_json::to_vec(&payload)?,
+        1_700_000_000_456,
+        false,
+    );
+    assert_eq!(pipeline.run(&mut ctx).await, PipelineOutcome::OutputStored);
+    let event = common::recv_event(&mut sub, 500)
+        .await
+        .context("durable climate output")?;
+    assert_eq!(event.sink_target.as_deref(), Some("sensors"));
+    let record = ctx.telemetry_record()?;
+    assert!(event.payload.len() <= common::influx_encoder().encoded_size_upper_bound(record));
+    let (tags, fields) = event
+        .payload
+        .split_once(' ')
+        .context("line protocol fields")?;
+    let (state, _) = cache
+        .snapshot_device("climate-1")
+        .context("climate cache")?;
+    for (field, expected) in [
+        ("absolute_humidity_g_m3", 8.63750),
+        ("humidity_ratio_g_kg", 7.25631),
+        ("surface_temp_at_80rh_c", 12.62770),
+        ("dew_point_depression_c", 10.74571),
+    ] {
+        assert!(!tags.contains(field));
+        let value: f64 = fields
+            .split(',')
+            .find_map(|entry| entry.strip_prefix(&format!("{field}=")))
+            .with_context(|| format!("missing encoded float {field}"))?
+            .parse()?;
+        assert!((value - expected).abs() < 0.00001, "{field}={value}");
+        let TelemetryValue::Float(value) = state.value[field] else {
+            panic!("cached {field} must be a float");
+        };
+        assert!((value - expected).abs() < 0.00001);
+    }
+    assert!(!record.fields.contains_key("iaq_score"));
+    assert!(!record.fields.contains_key("iaq_text"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_pipeline_outcome_output_stored_for_configured_firmware_sensor() -> Result<()> {
     let (pipeline, mut sub, cache, _tmp) = common::build_pipeline().await;
     let topic = "smarthome/esp32-1/bme680";

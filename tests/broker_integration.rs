@@ -207,6 +207,15 @@ async fn test_firmware_sensor_happy_path_observes_subscriber_ack_and_written_fie
             assert_eq!(event["value"][name].as_f64(), Some(value));
         }
         assert_eq!(event["value"]["iaq_text"], "Air quality is Good");
+        for (name, expected) in [
+            ("absolute_humidity_g_m3", 8.98653),
+            ("humidity_ratio_g_kg", 7.61830),
+            ("surface_temp_at_80rh_c", 13.36327),
+            ("dew_point_depression_c", 12.53514),
+        ] {
+            let value = event["value"][name].as_f64().context("SSE climate field")?;
+            assert!((value - expected).abs() < 0.00001, "{name}={value}");
+        }
         harness.wait_subscriber_ack(1).await?;
         let fields = harness.query_fields(&test_id).await?;
         // This synthetic baseline has no CSV-escaped commas; values match the #42 default golden.
@@ -244,6 +253,20 @@ async fn test_firmware_sensor_happy_path_observes_subscriber_ack_and_written_fie
                 .context("expected numeric field")?;
             assert_eq!(types[index], "double", "{name} field type");
             assert_eq!(row[index].parse::<f64>()?, value, "{name} field value");
+        }
+        for (name, expected) in [
+            ("absolute_humidity_g_m3", 8.98653),
+            ("humidity_ratio_g_kg", 7.61830),
+            ("surface_temp_at_80rh_c", 13.36327),
+            ("dew_point_depression_c", 12.53514),
+        ] {
+            let index = headers
+                .iter()
+                .position(|header| *header == name)
+                .context("persisted climate field")?;
+            assert_eq!(types[index], "double", "{name} must be a float field");
+            let value = row[index].parse::<f64>()?;
+            assert!((value - expected).abs() < 0.00001, "{name}={value}");
         }
         for (name, value, datatype) in [
             ("_measurement", "bme680", "string"),

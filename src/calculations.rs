@@ -18,6 +18,10 @@ const WARMED_UP_FIELD: &str = "warmed_up";
 enum Calculation {
     DewPoint,
     HeatIndex,
+    AbsoluteHumidity,
+    HumidityRatio,
+    SurfaceTempAt80rh,
+    DewPointDepression,
     Iaq,
 }
 
@@ -26,6 +30,10 @@ impl Calculation {
         match self {
             Self::DewPoint => &[("dew_point_c", FieldType::Float)],
             Self::HeatIndex => &[("heat_index_c", FieldType::Float)],
+            Self::AbsoluteHumidity => &[("absolute_humidity_g_m3", FieldType::Float)],
+            Self::HumidityRatio => &[("humidity_ratio_g_kg", FieldType::Float)],
+            Self::SurfaceTempAt80rh => &[("surface_temp_at_80rh_c", FieldType::Float)],
+            Self::DewPointDepression => &[("dew_point_depression_c", FieldType::Float)],
             Self::Iaq => &[
                 ("iaq_score", FieldType::Float),
                 ("iaq_text", FieldType::String),
@@ -79,6 +87,26 @@ impl CalculationRegistry {
                 CalculationName::HeatIndex => (
                     Calculation::HeatIndex,
                     "heat_index",
+                    &[TEMPERATURE_FIELD, HUMIDITY_FIELD][..],
+                ),
+                CalculationName::AbsoluteHumidity => (
+                    Calculation::AbsoluteHumidity,
+                    "absolute_humidity",
+                    &[TEMPERATURE_FIELD, HUMIDITY_FIELD][..],
+                ),
+                CalculationName::HumidityRatio => (
+                    Calculation::HumidityRatio,
+                    "humidity_ratio",
+                    &[TEMPERATURE_FIELD, HUMIDITY_FIELD, "pressure_hpa"][..],
+                ),
+                CalculationName::SurfaceTempAt80rh => (
+                    Calculation::SurfaceTempAt80rh,
+                    "surface_temp_at_80rh",
+                    &[TEMPERATURE_FIELD, HUMIDITY_FIELD][..],
+                ),
+                CalculationName::DewPointDepression => (
+                    Calculation::DewPointDepression,
+                    "dew_point_depression",
                     &[TEMPERATURE_FIELD, HUMIDITY_FIELD][..],
                 ),
                 CalculationName::Iaq => (Calculation::Iaq, "iaq", &[GAS_FIELD, HUMIDITY_FIELD][..]),
@@ -148,6 +176,59 @@ impl CalculationRegistry {
                         .fields
                         .insert("heat_index_c".to_owned(), TelemetryValue::Float(value));
                 }
+                Calculation::AbsoluteHumidity => {
+                    let (temp_c, rel_hum_perc) = climate_inputs(&record)?;
+                    let vapor_pressure = vapor_pressure_hpa(temp_c, rel_hum_perc)?;
+                    let value = finite_result(
+                        "absolute_humidity_g_m3",
+                        216.7 * vapor_pressure / (temp_c + 273.15),
+                    )?;
+                    ensure_output_available(&record, "absolute_humidity_g_m3")?;
+                    record.fields.insert(
+                        "absolute_humidity_g_m3".to_owned(),
+                        TelemetryValue::Float(value),
+                    );
+                }
+                Calculation::HumidityRatio => {
+                    let (temp_c, rel_hum_perc) = climate_inputs(&record)?;
+                    let vapor_pressure = vapor_pressure_hpa(temp_c, rel_hum_perc)?;
+                    let pressure = required_float(&record, "pressure_hpa")?;
+                    if pressure <= vapor_pressure {
+                        bail!("field 'pressure_hpa' must exceed vapor pressure");
+                    }
+                    let value = finite_result(
+                        "humidity_ratio_g_kg",
+                        621.98 * vapor_pressure / (pressure - vapor_pressure),
+                    )?;
+                    ensure_output_available(&record, "humidity_ratio_g_kg")?;
+                    record.fields.insert(
+                        "humidity_ratio_g_kg".to_owned(),
+                        TelemetryValue::Float(value),
+                    );
+                }
+                Calculation::SurfaceTempAt80rh => {
+                    let (temp_c, rel_hum_perc) = climate_inputs(&record)?;
+                    let vapor_pressure = vapor_pressure_hpa(temp_c, rel_hum_perc)?;
+                    let x = (vapor_pressure / (0.8 * 6.112)).ln();
+                    let value = finite_result("surface_temp_at_80rh_c", 243.5 * x / (17.67 - x))?;
+                    ensure_output_available(&record, "surface_temp_at_80rh_c")?;
+                    record.fields.insert(
+                        "surface_temp_at_80rh_c".to_owned(),
+                        TelemetryValue::Float(value),
+                    );
+                }
+                Calculation::DewPointDepression => {
+                    let (temp_c, rel_hum_perc) = climate_inputs(&record)?;
+                    let value = finite_result(
+                        "dew_point_depression_c",
+                        temp_c - dew_point_c(temp_c, rel_hum_perc),
+                    )?;
+                    ensure_output_available(&record, "dew_point_depression_c")?;
+                    record.fields.insert(
+                        "dew_point_depression_c".to_owned(),
+                        TelemetryValue::Float(value),
+                    );
+                }
                 Calculation::Iaq => {
                     let warmed_up = match record.fields.get(WARMED_UP_FIELD) {
                         Some(TelemetryValue::Boolean(warmed_up)) => *warmed_up,
@@ -211,6 +292,24 @@ fn validate_humidity(rel_hum_perc: f64) -> Result<()> {
         bail!("field '{HUMIDITY_FIELD}' must be in (0,100]");
     }
     Ok(())
+}
+
+fn climate_inputs(record: &TelemetryRecord) -> Result<(f64, f64)> {
+    let temp_c = required_float(record, TEMPERATURE_FIELD)?;
+    let rel_hum_perc = required_float(record, HUMIDITY_FIELD)?;
+    validate_humidity(rel_hum_perc)?;
+    if temp_c <= -273.15 {
+        bail!("field '{TEMPERATURE_FIELD}' must be above absolute zero");
+    }
+    Ok((temp_c, rel_hum_perc))
+}
+
+fn vapor_pressure_hpa(temp_c: f64, rel_hum_perc: f64) -> Result<f64> {
+    let vapor_pressure = 6.112 * (17.67 * temp_c / (temp_c + 243.5)).exp() * rel_hum_perc / 100.0;
+    if !vapor_pressure.is_finite() || vapor_pressure <= 0.0 {
+        bail!("vapor pressure must be positive and finite");
+    }
+    Ok(vapor_pressure)
 }
 
 fn finite_result(field: &str, value: f64) -> Result<f64> {
@@ -344,10 +443,210 @@ mod tests {
                 ("temp_c".to_owned(), TelemetryValue::Float(20.0)),
                 ("rel_hum_perc".to_owned(), TelemetryValue::Float(50.0)),
                 ("gas_ohm".to_owned(), TelemetryValue::Float(50_000.0)),
+                ("pressure_hpa".to_owned(), TelemetryValue::Float(1013.25)),
             ]),
             source_topic: "test/topic".to_owned(),
             retained: false,
         }
+    }
+
+    const CLIMATE_CALCULATIONS: [(&str, &str, f64); 4] = [
+        ("absolute_humidity", "absolute_humidity_g_m3", 8.63750),
+        ("humidity_ratio", "humidity_ratio_g_kg", 7.25631),
+        ("surface_temp_at_80rh", "surface_temp_at_80rh_c", 12.62770),
+        ("dew_point_depression", "dew_point_depression_c", 10.74571),
+    ];
+
+    fn climate_name(name: &str) -> Result<CalculationName> {
+        Ok(serde_json::from_value(serde_json::json!(name))?)
+    }
+
+    #[test]
+    fn test_calculation_climate_reference_values_work_independently() -> Result<()> {
+        for (name, output, expected) in CLIMATE_CALCULATIONS {
+            let mut inputs = vec!["temp_c", "rel_hum_perc"];
+            if name == "humidity_ratio" {
+                inputs.push("pressure_hpa");
+            }
+            let registry =
+                CalculationRegistry::resolve(&[climate_name(name)?], &float_fields(&inputs))?;
+            let mut input = valid_record();
+            input.fields.retain(|key, _| inputs.contains(&key.as_str()));
+            input
+                .fields
+                .insert("warmed_up".to_owned(), TelemetryValue::Boolean(false));
+            let record = registry.apply(input.clone())?;
+            assert_eq!(record.fields.len(), input.fields.len() + 1);
+            let TelemetryValue::Float(value) = record.fields[output] else {
+                panic!("{output} must be a float");
+            };
+            assert!((value - expected).abs() < 0.00001, "{name}: {value}");
+            assert!(record.tags.is_empty());
+
+            let mut saturated = input;
+            saturated
+                .fields
+                .insert("rel_hum_perc".to_owned(), TelemetryValue::Float(100.0));
+            let saturated = registry.apply(saturated)?;
+            let TelemetryValue::Float(value) = saturated.fields[output] else {
+                panic!("{output} must be a float");
+            };
+            assert!(value.is_finite());
+            match name {
+                "absolute_humidity" => assert!((value - 17.27500).abs() < 0.00001),
+                "humidity_ratio" => assert!((value - 14.68394).abs() < 0.00001),
+                "surface_temp_at_80rh" => assert!(value > 20.0),
+                "dew_point_depression" => assert!(value.abs() < 1e-12),
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_climate_preflight_rejects_invalid_mappings_and_collisions() -> Result<()> {
+        for (name, output, _) in CLIMATE_CALCULATIONS {
+            let fields = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
+            for input in ["temp_c", "rel_hum_perc", "pressure_hpa"] {
+                if input == "pressure_hpa" && name != "humidity_ratio" {
+                    continue;
+                }
+                let mut missing = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
+                missing.remove(input);
+                assert!(CalculationRegistry::resolve(&[climate_name(name)?], &missing).is_err());
+                let mut wrong = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
+                wrong.insert(input.to_owned(), mapping(FieldType::Integer));
+                assert!(CalculationRegistry::resolve(&[climate_name(name)?], &wrong).is_err());
+            }
+            assert!(CalculationRegistry::resolve(
+                &[climate_name(name)?, climate_name(name)?],
+                &fields
+            )
+            .is_err());
+            let mut collision = fields;
+            collision.insert(output.to_owned(), mapping(FieldType::Float));
+            assert!(CalculationRegistry::resolve(&[climate_name(name)?], &collision).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_climate_rejects_invalid_domains_and_runtime_inputs() -> Result<()> {
+        for (name, output, _) in CLIMATE_CALCULATIONS {
+            let fields = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
+            let registry = CalculationRegistry::resolve(&[climate_name(name)?], &fields)?;
+            for (field, value) in [
+                ("rel_hum_perc", 0.0),
+                ("rel_hum_perc", -1.0),
+                ("rel_hum_perc", 100.1),
+                ("temp_c", -273.15),
+                ("temp_c", -300.0),
+            ] {
+                let mut record = valid_record();
+                record
+                    .fields
+                    .insert(field.to_owned(), TelemetryValue::Float(value));
+                assert!(registry.apply(record).is_err(), "{name}: {field}={value}");
+            }
+            for field in ["temp_c", "rel_hum_perc", "pressure_hpa"] {
+                if field == "pressure_hpa" && name != "humidity_ratio" {
+                    continue;
+                }
+                for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                    let mut record = valid_record();
+                    record
+                        .fields
+                        .insert(field.to_owned(), TelemetryValue::Float(value));
+                    assert!(registry.apply(record).is_err(), "{name}: {field}={value}");
+                }
+                let mut missing = valid_record();
+                missing.fields.remove(field);
+                assert!(registry.apply(missing).is_err());
+                let mut wrong = valid_record();
+                wrong
+                    .fields
+                    .insert(field.to_owned(), TelemetryValue::Integer(20));
+                assert!(registry.apply(wrong).is_err());
+            }
+            let mut collision = valid_record();
+            collision
+                .fields
+                .insert(output.to_owned(), TelemetryValue::Float(1.0));
+            assert!(registry.apply(collision).is_err());
+            let singular_temperatures: &[f64] = if name == "dew_point_depression" {
+                &[-237.7, f64::MAX]
+            } else {
+                &[-243.5, -243.50001, -243.49999, f64::MAX]
+            };
+            for &temperature in singular_temperatures {
+                let mut record = valid_record();
+                record
+                    .fields
+                    .insert("temp_c".to_owned(), TelemetryValue::Float(temperature));
+                assert!(registry.apply(record).is_err(), "{name}: T={temperature}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_humidity_ratio_requires_pressure_above_vapor_pressure() -> Result<()> {
+        let fields = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
+        let registry = CalculationRegistry::resolve(&[climate_name("humidity_ratio")?], &fields)?;
+        // At 0 C and 50% RH, vapor pressure is exactly 6.112 / 2 hPa.
+        for pressure in [-1.0, 0.0, 3.0, 3.056] {
+            let mut record = valid_record();
+            record
+                .fields
+                .insert("temp_c".to_owned(), TelemetryValue::Float(0.0));
+            record
+                .fields
+                .insert("pressure_hpa".to_owned(), TelemetryValue::Float(pressure));
+            assert!(registry.apply(record).is_err(), "p={pressure}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_surface_temperature_rejects_inverse_singularity() -> Result<()> {
+        let fields = float_fields(&["temp_c", "rel_hum_perc"]);
+        let registry =
+            CalculationRegistry::resolve(&[climate_name("surface_temp_at_80rh")?], &fields)?;
+        let mut record = valid_record();
+        // At this temperature and 100% RH, ln(e / (0.8 * 6.112)) reaches 17.67.
+        record.fields.insert(
+            "temp_c".to_owned(),
+            TelemetryValue::Float(19_038.459_862_426_946),
+        );
+        record
+            .fields
+            .insert("rel_hum_perc".to_owned(), TelemetryValue::Float(100.0));
+        assert!(registry.apply(record).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculation_climate_encoded_size_bound_covers_finite_outputs() -> Result<()> {
+        use crate::infrastructure::sink::{influx::InfluxEncoder, Encoder};
+
+        let names = CLIMATE_CALCULATIONS
+            .iter()
+            .map(|(name, _, _)| climate_name(name))
+            .collect::<Result<Vec<_>>>()?;
+        let fields = float_fields(&["temp_c", "rel_hum_perc", "pressure_hpa"]);
+        let registry = CalculationRegistry::resolve(&names, &fields)?;
+        for humidity in [50.0, 100.0, 1e-200] {
+            let mut record = valid_record();
+            record
+                .fields
+                .insert("rel_hum_perc".to_owned(), TelemetryValue::Float(humidity));
+            let record = registry.apply(record)?;
+            let mut encoded = String::new();
+            InfluxEncoder.encode(&record, &mut encoded);
+            assert!(encoded.len() <= InfluxEncoder.encoded_size_upper_bound(&record));
+            assert!(!encoded.contains("NaN") && !encoded.contains("inf"));
+        }
+        Ok(())
     }
 
     #[test]

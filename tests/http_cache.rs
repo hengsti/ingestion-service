@@ -305,6 +305,54 @@ async fn list_state_returns_cached_typed_telemetry() {
 // ── /v1/state/{device_id} ────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn firmware_climate_values_are_available_in_list_and_device_state() -> anyhow::Result<()> {
+    let (pipeline, _subscription, cache, _directory) = common::build_pipeline().await;
+    let mut context = smarthome_ingest::pipeline::context::PipelineContext::new_with_metadata(
+        "smarthome/climate-1/bme680",
+        common::valid_sensor_payload("climate-1"),
+        1_700_000_000_456,
+        false,
+    );
+    assert_eq!(
+        pipeline.run(&mut context).await,
+        smarthome_ingest::pipeline::outcome::PipelineOutcome::OutputStored
+    );
+    let (app, _wal, _sub, _dir) = make_app_with_cache(cache, true).await;
+    for uri in ["/v1/state", "/v1/state/climate-1"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let sensor = if uri == "/v1/state" {
+            &json["sensors"][0]
+        } else {
+            &json["sensor"]
+        };
+        assert_eq!(json["ttl_ms"], 60_000);
+        assert_eq!(sensor["last_seen_ms"], 1_700_000_000_456u64);
+        assert_eq!(sensor["stale"], true);
+        assert_eq!(
+            sensor.as_object().unwrap().len(),
+            if uri == "/v1/state" { 4 } else { 3 }
+        );
+        for (field, expected) in [
+            ("absolute_humidity_g_m3", 8.98653),
+            ("humidity_ratio_g_kg", 7.61830),
+            ("surface_temp_at_80rh_c", 13.36327),
+            ("dew_point_depression_c", 12.53514),
+        ] {
+            let value = sensor["value"][field]
+                .as_f64()
+                .expect("cached climate number");
+            assert!((value - expected).abs() < 0.00001, "{uri}: {field}={value}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_state_returns_null_sensor_for_unknown_device() {
     let (app, _wal, _subscription, _directory) = make_app(false).await;
 

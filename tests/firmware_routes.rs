@@ -19,6 +19,10 @@ fn test_firmware_routes_loads_and_compiles_two_routes() -> anyhow::Result<()> {
             CalculationName::DewPoint,
             CalculationName::HeatIndex,
             CalculationName::Iaq,
+            CalculationName::AbsoluteHumidity,
+            CalculationName::HumidityRatio,
+            CalculationName::SurfaceTempAt80rh,
+            CalculationName::DewPointDepression,
         ];
     let sensor_has_receive_time_fallback = matches!(
         &bundle.routes[0].timestamp.fallback,
@@ -104,6 +108,10 @@ fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> any
             "time_valid": true,
             "dew_point_c": 9.5,
             "heat_index_c": 22.5,
+            "absolute_humidity_g_m3": 8.98653,
+            "humidity_ratio_g_kg": 7.61830,
+            "surface_temp_at_80rh_c": 13.36327,
+            "dew_point_depression_c": 12.53514,
             "iaq_score": 85.0,
             "iaq_text": "Good",
             "mqtt_retained": false
@@ -113,6 +121,18 @@ fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> any
     });
 
     schema.validate(&record)?;
+    for field in [
+        "absolute_humidity_g_m3",
+        "humidity_ratio_g_kg",
+        "surface_temp_at_80rh_c",
+        "dew_point_depression_c",
+    ] {
+        let mut invalid = record.clone();
+        invalid["fields"].as_object_mut().unwrap().remove(field);
+        assert!(schema.validate(&invalid).is_err(), "missing {field}");
+        invalid["fields"][field] = json!("not a number");
+        assert!(schema.validate(&invalid).is_err(), "wrong type for {field}");
+    }
     record["fields"]["battery"] = json!(90);
     schema.validate(&record)?;
     record["fields"]["battery"] = json!(90.5);

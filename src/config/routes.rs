@@ -225,6 +225,15 @@ pub enum CalculationName {
     DewPoint,
     /// Calculate heat index from temperature and relative humidity.
     HeatIndex,
+    /// Calculate absolute humidity in grams per cubic metre.
+    AbsoluteHumidity,
+    /// Calculate water mass per dry-air mass in grams per kilogram.
+    HumidityRatio,
+    /// Calculate the hypothetical surface temperature at 80% relative humidity.
+    #[serde(rename = "surface_temp_at_80rh")]
+    SurfaceTempAt80rh,
+    /// Calculate air temperature minus its dew point.
+    DewPointDepression,
     /// Calculate indoor air quality from gas resistance and humidity.
     Iaq,
 }

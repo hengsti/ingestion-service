@@ -26,7 +26,11 @@
           "iaq_score": 97.91666666666666,
           "iaq_text": "Air quality is Good",
           "altitude_m": 500.0,
-          "mqtt_retained": false
+          "mqtt_retained": false,
+          "absolute_humidity_g_m3": 8.986530085547768,
+          "humidity_ratio_g_kg": 7.6182976599696985,
+          "surface_temp_at_80rh_c": 13.363267323528657,
+          "dew_point_depression_c": 12.535142237360022
         }
       }
     ]
@@ -47,7 +51,11 @@
         "iaq_score": 97.91666666666666,
         "iaq_text": "Air quality is Good",
         "altitude_m": 500.0,
-        "mqtt_retained": false
+        "mqtt_retained": false,
+        "absolute_humidity_g_m3": 8.986530085547768,
+        "humidity_ratio_g_kg": 7.6182976599696985,
+        "surface_temp_at_80rh_c": 13.363267323528657,
+        "dew_point_depression_c": 12.535142237360022
       }
     }
   },
@@ -67,7 +75,11 @@
         "iaq_score": 97.91666666666666,
         "iaq_text": "Air quality is Good",
         "altitude_m": 500.0,
-        "mqtt_retained": false
+        "mqtt_retained": false,
+        "absolute_humidity_g_m3": 8.986530085547768,
+        "humidity_ratio_g_kg": 7.6182976599696985,
+        "surface_temp_at_80rh_c": 13.363267323528657,
+        "dew_point_depression_c": 12.535142237360022
       }
     }
   }

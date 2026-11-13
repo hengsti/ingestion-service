@@ -98,6 +98,20 @@
         "heat_index_c": {
           "type": "number"
         },
+        "absolute_humidity_g_m3": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "humidity_ratio_g_kg": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "surface_temp_at_80rh_c": {
+          "type": "number"
+        },
+        "dew_point_depression_c": {
+          "type": "number"
+        },
         "iaq_score": {
           "type": "number",
           "minimum": 0,
@@ -121,6 +135,10 @@
         "time_valid",
         "dew_point_c",
         "heat_index_c",
+        "absolute_humidity_g_m3",
+        "humidity_ratio_g_kg",
+        "surface_temp_at_80rh_c",
+        "dew_point_depression_c",
         "mqtt_retained"
       ],
       "anyOf": [

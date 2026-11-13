@@ -84,7 +84,7 @@ pub fn influx_encoder() -> Arc<dyn Encoder> {
     Arc::new(InfluxEncoder)
 }
 
-/// Writes the frozen v1 bundle with its schemas for compatibility tests.
+/// Writes the shipped routes' v1 counterpart with its schemas for compatibility tests.
 pub fn write_v1_shipped_bundle(directory: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let schemas = directory.join("schemas");
     std::fs::create_dir_all(&schemas)?;
