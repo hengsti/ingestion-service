@@ -4,6 +4,19 @@
       "id": "aqara-p100-buero",
       "topic": "zigbee2mqtt/Buero-Aqara-P100",
       "sink_target": "sensors"
+    },
+    {
+      "id": "aqara-p100-kitchen",
+      "topic": "zigbee2mqtt/Kitchen-Aqara-P100",
+      "sink_target": "sensors"
+    },{
+      "id": "aqara-p100-livingroom",
+      "topic": "zigbee2mqtt/Livingroom-Aqara-P100",
+      "sink_target": "sensors"
+    },{
+      "id": "aqara-p100-bedroom",
+      "topic": "zigbee2mqtt/Bedroom-Aqara-P100",
+      "sink_target": "sensors"
     }
   ],
   "mapping": {
