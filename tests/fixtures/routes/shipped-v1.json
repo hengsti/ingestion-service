@@ -16,9 +16,6 @@
       "sink_target": "sensors",
       "measurement": "bme680",
       "tags": {
-        "room": {
-          "pointer": "/room"
-        },
         "device_class": {
           "pointer": "/device_class"
         }
@@ -383,7 +380,7 @@
       "timestamp": {
         "source": "received_at"
       },
-      "cache": false
+      "cache": true
     }
   ]
 }

@@ -69,6 +69,48 @@ selecting its compatible v1 directory as well as its image; CD never rewrites op
 from a snapshot. Pending WAL records keep their encoded payload and destination. The separate
 [WAL downgrade restrictions](wal-and-reliability.md#sink-target-migration) still apply.
 
+## House and room tags
+
+For a topic such as `zigbee2mqtt/main-house/kitchen/aqara-p100`, select
+`zigbee2mqtt/+/+/+` and use these mapping properties:
+
+```json
+{
+  "device_id": { "topic_segment": 3 },
+  "tags": { "house": { "topic_segment": 1 }, "room": { "topic_segment": 2 } }
+}
+```
+
+For `<house>/<room>/<deviceId>`, use the filter `+/+/+` and indices 0 for house,
+1 for room and 2 for device ID. Narrow the filter with literal houses where needed:
+`+/+/+` matches **every** three-level topic, including unrelated publishers or the
+DLQ if it has three levels. Route compilation rejects overlapping filters and DLQ matches.
+
+Indices start at zero. A reference must identify a literal or single-level wildcard
+in the filter. An empty selected level rejects the input. To accept only one house,
+use a literal in the filter, e.g. `zigbee2mqtt/main-house/+/+`.
+
+For `zigbee2mqtt/<room>/<deviceId>` with a known house, use
+`"tags": {"house": "main-house", "room": {"topic_segment": 1}}`.
+Each omitted location independently becomes the literal tag value `undefined`.
+Explicit pointers still require nonempty strings. In v2, bindings share their family's
+mapping. Use separate families for different fixed houses.
+
+Existing publishers can keep their topics. The shipped firmware sensor and status, Shelly, Aqara
+and bridge health topics have no separate location levels. Their mappings default both
+locations to `undefined`. Aqara friendly names
+identify devices and are kept whole. The latest-state cache keys by device ID alone.
+Each cached publisher needs an ID unique across houses and rooms. Check publisher IDs
+before enabling caching on a multi-house route.
+
+For Server-owned bundles, update strict output schemas to allow both string tags
+before switching binaries. Startup and `--check-config` reject the previous Shelly
+schema because its tag allowlist admits only `device_id`. Rename mapped fields named
+`house` or `room` to avoid tag collisions. Configure known locations and coordinate any filter changes with
+publishers. New writes start new InfluxDB series. Pending WAL entries replay their
+original encoded tags. Queries spanning rollout must include older series with absent
+tags as well as new series with explicit location values.
+
 ## Synthetic climate walkthrough
 
 The tracked [`config/examples/climate`](../config/examples/climate/README.md) bundle is the

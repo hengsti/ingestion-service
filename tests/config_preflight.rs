@@ -193,6 +193,34 @@ fn test_check_config_accepts_production_bundle_without_journal_side_effects() ->
 }
 
 #[test]
+fn test_check_config_rejects_previous_strict_shelly_tags() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = directory.path().join("config");
+    copy_fixture_tree(Path::new("config"), &config)?;
+    let path = config.join("schemas/shelly/shelly-plug.output.schema.json");
+    let mut schema: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    schema["properties"]["tags"] = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {"device_id": {"type": "string", "minLength": 1}},
+        "required": ["device_id"]
+    });
+    fs::write(path, serde_json::to_vec(&schema)?)?;
+
+    let output = preflight_command(&directory, &config.join("routes.json"))
+        .arg("--check-config")
+        .output()?;
+    let message = combined_output(&output);
+    assert!(!output.status.success(), "{message}");
+    for expected in ["shelly-plug", "output schema", "allow", "house", "room"] {
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(!directory.path().join("wal").exists());
+    assert!(!directory.path().join("quarantine").exists());
+    Ok(())
+}
+
+#[test]
 fn test_check_config_rejects_invalid_fallback_bucket_with_bounded_diagnostic() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let output = preflight_command(&directory, &climate_routes())

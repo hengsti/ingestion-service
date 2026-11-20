@@ -344,7 +344,8 @@ async fn test_firmware_sensor_happy_path_observes_subscriber_ack_and_written_fie
         for (name, value, datatype) in [
             ("_measurement", "bme680", "string"),
             ("device_id", device.as_str(), "string"),
-            ("room", "living_room", "string"),
+            ("house", "undefined", "string"),
+            ("room", "undefined", "string"),
             ("device_class", "esp32p4-bme680", "string"),
             ("firmware_version", "1.0.0", "string"),
             ("iaq_text", "Air quality is Good", "string"),
@@ -496,10 +497,13 @@ async fn test_arbitrary_topic_contract_changes_without_rebuilding_binary() -> Re
     let mut harness = broker::Harness::connect().await?;
     let result = async {
         let device = harness.device_id("configured");
-        let topic = format!("laboratory/{device}/telemetry");
+        let topic = format!("laboratory/main-house/kitchen/{device}");
         let path = harness.dir.join("routes.json");
         let mut bundle: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        bundle["routes"][0]["topic"] = json!(topic);
+        bundle["routes"][0]["topic"] = json!("laboratory/+/+/+");
+        bundle["routes"][0]["device_id"] = json!({"topic_segment": 3});
+        bundle["routes"][0]["tags"]["house"] = json!({"topic_segment": 1});
+        bundle["routes"][0]["tags"]["room"] = json!({"topic_segment": 2});
         bundle["routes"][0]["measurement"] = json!("contract_a");
         bundle["routes"][0]
             .as_object_mut()
@@ -512,6 +516,8 @@ async fn test_arbitrary_topic_contract_changes_without_rebuilding_binary() -> Re
         harness.publish(&topic, payload).await?;
         harness.wait_subscriber_ack(1).await?;
         let fields = harness.query_fields(&format!("{device}-1")).await?;
+        assert_field(&fields, "house", "main-house", "string")?;
+        assert_field(&fields, "room", "kitchen", "string")?;
         assert_field(&fields, "_measurement", "contract_a", "string")?;
         assert_field(&fields, "temp_c", "22.5", "double")?;
         harness.stop()?;

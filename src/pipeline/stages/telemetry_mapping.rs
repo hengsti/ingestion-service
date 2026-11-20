@@ -108,6 +108,7 @@ pub fn map_payload(
             bail!("tag '{key}' collides with a reserved telemetry tag");
         }
         let value = match value {
+            TagValue::TopicSegment(config) => topic_segment(topic, config.topic_segment)?,
             TagValue::Static(value) => value.as_str(),
             TagValue::Pointer(pointer) => {
                 let value = payload

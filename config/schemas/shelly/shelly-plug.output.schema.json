@@ -24,12 +24,22 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "house": {
+          "type": "string",
+          "minLength": 1
+        },
+        "room": {
+          "type": "string",
+          "minLength": 1
+        },
         "device_id": {
           "type": "string",
           "minLength": 1
         }
       },
       "required": [
+        "house",
+        "room",
         "device_id"
       ]
     },

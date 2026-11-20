@@ -94,6 +94,7 @@ fn test_firmware_routes_sensor_output_schema_enforces_warmup_and_bounds() -> any
         "measurement": "bme680",
         "timestamp_ms": 1_700_000_000_000i64,
         "tags": {
+            "house": "undefined",
             "device_id": "test-sensor",
             "room": "test-room",
             "device_class": "test-class"
@@ -174,7 +175,9 @@ fn test_firmware_routes_status_output_schema_requires_nonempty_ip_and_valid_time
         "measurement": "device_status",
         "timestamp_ms": 1_700_000_000_000i64,
         "tags": {
+            "house": "undefined",
             "device_id": "test-sensor",
+            "room": "undefined",
             "device_class": "test-class"
         },
         "fields": {

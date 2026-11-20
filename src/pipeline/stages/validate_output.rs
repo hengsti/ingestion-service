@@ -288,6 +288,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             tags: BTreeMap::from([
                 ("device_id".to_owned(), "device-1".to_owned()),
+                ("house".to_owned(), "undefined".to_owned()),
                 ("room".to_owned(), "lab".to_owned()),
             ]),
             fields: BTreeMap::from([
@@ -413,7 +414,11 @@ mod tests {
             device_id: "device-1".to_owned(),
             measurement: "air".to_owned(),
             timestamp_ms: 1_700_000_000_000,
-            tags: BTreeMap::from([("device_id".to_owned(), "device-1".to_owned())]),
+            tags: BTreeMap::from([
+                ("device_id".to_owned(), "device-1".to_owned()),
+                ("house".to_owned(), "undefined".to_owned()),
+                ("room".to_owned(), "undefined".to_owned()),
+            ]),
             fields: BTreeMap::from([
                 ("gas_ohm".to_owned(), TelemetryValue::Float(100.0)),
                 ("rel_hum_perc".to_owned(), TelemetryValue::Float(40.0)),

@@ -55,6 +55,9 @@ dispatch does not guarantee per-device processing order across workers.
 - **Validate before parsing:** enforce the 64 KiB input limit before UTF-8/JSON decoding.
   The selected route's raw schema validates publisher input; its optional output schema
   validates the normalized typed record. Schema paths are loaded from `INGEST_ROUTES_FILE`.
+- **Location tags:** Compiled routes supply independent `undefined` defaults for omitted
+  house and room tags. Topic tag indices must reference fixed-position levels.
+  Route compilation rejects a direct output-schema tag allowlist that excludes either location key.
 - **Keep output bounded:** reject invalid static output names and collisions at route
   compilation, and bound copied mapping data before repeated pointers amplify it. Every
   encoder's allocation-free size bound must cover its encoded bytes and saturate on

@@ -126,12 +126,14 @@ pub struct PointerTopicSegmentConfig {
     pub topic_segment: usize,
 }
 
-/// A static tag value or a JSON Pointer to a payload string.
+/// A static string, payload string pointer, or fixed-position topic level.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TagValue {
     /// A static tag value.
     Static(String),
+    /// A zero-based topic level.
+    TopicSegment(TopicSegmentConfig),
     /// A pointer to a tag value in the payload.
     Pointer(PointerConfig),
 }
@@ -402,6 +404,7 @@ fn validate_tag_value(value: &TagValue) -> Result<()> {
             }
             validate_line_text(value, "tag value")?;
         }
+        TagValue::TopicSegment(_) => {}
         TagValue::Pointer(config) => validate_pointer(&config.pointer, "tag pointer")?,
     }
     Ok(())

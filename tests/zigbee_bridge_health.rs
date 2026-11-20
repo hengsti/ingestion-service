@@ -31,7 +31,7 @@ async fn bridge_health_persists_typed_metrics_with_publisher_time_without_cachin
     assert_eq!(
         event.payload,
         concat!(
-            "zigbee2mqtt_bridge_health,device_class=zigbee2mqtt-bridge,device_id=zigbee2mqtt-bridge ",
+            "zigbee2mqtt_bridge_health,device_class=zigbee2mqtt-bridge,device_id=zigbee2mqtt-bridge,house=undefined,room=undefined ",
             "device_0x00124b0038a8eae2_leave_count=0i,",
             "device_0x00124b0038a8eae2_messages=1i,",
             "device_0x00124b0038a8eae2_messages_per_sec=0,",

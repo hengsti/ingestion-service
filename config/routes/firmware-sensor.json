@@ -15,9 +15,6 @@
     },
     "measurement": "bme680",
     "tags": {
-      "room": {
-        "pointer": "/room"
-      },
       "device_class": {
         "pointer": "/device_class"
       }

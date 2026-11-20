@@ -54,6 +54,24 @@ impl CompiledSchema {
         })
     }
 
+    pub(crate) fn check_location_tag_keys(&self) -> Result<()> {
+        let probe = serde_json::json!({"tags": {"house": "undefined", "room": "undefined"}});
+        // Only the unconditional tags allowlist can prove this incompatibility on a partial record.
+        if self.schema.iter_errors(&probe).any(|error| {
+            error.evaluation_path().as_str() == "/properties/tags/additionalProperties"
+                && matches!(
+                    error.kind(),
+                    jsonschema::error::ValidationErrorKind::AdditionalProperties { .. }
+                )
+        }) {
+            bail!(
+                "route '{}' output schema rejects location tags: update the mounted output schema to allow both house and room as string tags",
+                self.route_id
+            );
+        }
+        Ok(())
+    }
+
     /// Validates an instance without including rejected values in diagnostics.
     ///
     /// # Errors

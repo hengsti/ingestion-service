@@ -25,6 +25,10 @@
         "type": "string"
       },
       "properties": {
+        "house": {
+          "type": "string",
+          "minLength": 1
+        },
         "device_id": {
           "type": "string",
           "minLength": 1
@@ -39,6 +43,7 @@
         }
       },
       "required": [
+        "house",
         "device_id",
         "room",
         "device_class"

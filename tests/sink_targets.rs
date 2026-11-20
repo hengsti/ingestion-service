@@ -92,11 +92,12 @@ fn options(path: &std::path::Path) -> WalOptions {
 async fn synthetic_routes_keep_types_timestamps_and_buckets_on_replay_after_route_edits(
 ) -> Result<()> {
     let bundle_path = "config/examples/sink-targets/routes.json";
-    let routes = Arc::new(RouteSet::compile(
-        routes::load(bundle_path)?,
-        "example/dlq",
-        "old-default",
-    )?);
+    let mut bundle = routes::load(bundle_path)?;
+    bundle.routes[0].tags.insert(
+        "room".to_owned(),
+        serde_json::from_value(json!({"pointer": "/label"}))?,
+    );
+    let routes = Arc::new(RouteSet::compile(bundle, "example/dlq", "old-default")?);
     let (pipeline, mut sub, _cache, directory) = common::build_pipeline_with_routes(routes).await;
     let mut expected = Vec::new();
     for kind in ["samples", "samples", "health", "samples", "health"] {
@@ -119,11 +120,11 @@ async fn synthetic_routes_keep_types_timestamps_and_buckets_on_replay_after_rout
             .await
             .context("persisted output")?;
         let (target, line) = if kind == "samples" {
-            ("example-sensors", "sample,device_id=unit active=false,count=7u,label=\"lab\",mqtt_retained=false,temperature=21.5 1700000000123")
+            ("example-sensors", "sample,device_id=unit,house=undefined,room=lab active=false,count=7u,label=\"lab\",mqtt_retained=false,temperature=21.5 1700000000123")
         } else {
             (
                 "example-metrics",
-                "health,device_id=unit active=true,code=-2i,mqtt_retained=false 1700000000124",
+                "health,device_id=unit,house=undefined,room=undefined active=true,code=-2i,mqtt_retained=false 1700000000124",
             )
         };
         assert_eq!(event.sink_target.as_deref(), Some(target));

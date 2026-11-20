@@ -187,7 +187,6 @@ pub async fn recv_event(sub: &mut WalSubscription, ms: u64) -> Option<WalEvent> 
 pub fn valid_sensor_payload(device_id: &str) -> Vec<u8> {
     serde_json::json!({
         "device_id": device_id,
-        "room": "living_room",
         "device_class": "esp32p4-bme680",
         "fw_version": "1.0.0",
         "time_ms": 1_700_000_000_000_i64,

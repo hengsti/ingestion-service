@@ -97,7 +97,6 @@ Publish this JSON at MQTT QoS 1 to `smarthome/esp32-1/bme680` (for example, use 
 ```json
 {
   "device_id": "esp32-1",
-  "room": "living_room",
   "device_class": "esp32p4-bme680",
   "fw_version": "1.0.0",
   "time_ms": 1700000000000,

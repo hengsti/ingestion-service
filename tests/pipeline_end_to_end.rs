@@ -69,9 +69,9 @@ async fn test_shelly_electrical_fields_persist_for_both_bindings_without_caching
             assert_eq!(record.fields["output"], TelemetryValue::Boolean(true));
             assert_eq!(record.timestamp_ms, 1_700_000_000_456);
             assert_eq!(event.sink_target.as_deref(), Some("sensors"));
-            assert!(event
-                .payload
-                .starts_with(&format!("shelly_plug,device_id={device} ")));
+            assert!(event.payload.starts_with(&format!(
+                "shelly_plug,device_id={device},house=undefined,room=undefined "
+            )));
             assert!(event
                 .payload
                 .contains(&format!("apparent_power_va={apparent},")));
@@ -242,7 +242,7 @@ fn synthetic_zigbee_routes(
                 "output_schema": output_schema_path,
                 "device_id": {"pointer": "/device_id", "topic_segment": 1},
                 "measurement": "zigbee_room_alternate",
-                "tags": {"source": "zigbee"},
+                "tags": {"house": "main-house", "source": "zigbee"},
                 "fields": {
                     "temp_c": {"pointer": "/temperature", "type": "float"},
                     "rel_hum_perc": {"pointer": "/humidity", "type": "float"},
@@ -283,12 +283,12 @@ fn synthetic_zigbee_routes(
             }),
             json!({
                 "id": "zigbee-room",
-                "topic": "zigbee/+/telemetry",
+                "topic": "zigbee/+/+/+",
                 "schema": raw_schema_path,
                 "output_schema": output_schema_path,
-                "device_id": {"pointer": "/device_id", "topic_segment": 1},
+                "device_id": {"pointer": "/device_id", "topic_segment": 3},
                 "measurement": "zigbee_room",
-                "tags": {"source": "zigbee"},
+                "tags": {"house": {"topic_segment": 1}, "room": {"topic_segment": 2}, "source": "zigbee"},
                 "fields": {
                     "temp_c": {"pointer": "/temp_c", "type": "float"},
                     "rel_hum_perc": {"pointer": "/rel_hum_perc", "type": "float"},
@@ -302,10 +302,20 @@ fn synthetic_zigbee_routes(
     };
     fs::write(&raw_schema_path, serde_json::to_vec(&raw_schema)?)?;
     fs::write(&output_schema_path, serde_json::to_vec(&output_schema)?)?;
+    let mut routes = vec![route];
+    if !alternate_config {
+        let mut direct = routes[0].clone();
+        direct["id"] = json!("direct-room");
+        direct["topic"] = json!("+/+/+");
+        direct["device_id"]["topic_segment"] = json!(2);
+        direct["tags"]["house"]["topic_segment"] = json!(0);
+        direct["tags"]["room"]["topic_segment"] = json!(1);
+        routes.push(direct);
+    }
     let bundle: RouteBundle = serde_json::from_value(json!({
         "version": 1,
         "schema_resources": {},
-        "routes": [route]
+        "routes": routes
     }))?;
     Ok(Arc::new(RouteSet::compile(
         bundle,
@@ -319,7 +329,6 @@ async fn arbitrary_topic_uses_configured_mapping_calculation_and_output_schema()
     let config_dir = tempfile::tempdir()?;
     let routes = synthetic_zigbee_routes(config_dir.path(), false)?;
     let (pipeline, mut sub, cache, _wal_dir) = common::build_pipeline_with_routes(routes).await;
-    let topic = "zigbee/room-1/telemetry";
     let received_at_ms = 1_700_000_000_456;
     let payload: Value = json!({
         "device_id": "room-1",
@@ -327,41 +336,58 @@ async fn arbitrary_topic_uses_configured_mapping_calculation_and_output_schema()
         "rel_hum_perc": 50.0,
         "online": true
     });
-    let mut ctx = PipelineContext::new_with_metadata(
-        topic,
-        serde_json::to_vec(&payload)?,
-        received_at_ms,
-        true,
-    );
+    for empty_location in ["zigbee//kitchen/room-1", "zigbee/main-house//room-1"] {
+        let mut ctx = PipelineContext::new_with_metadata(
+            empty_location,
+            serde_json::to_vec(&payload)?,
+            received_at_ms,
+            true,
+        );
+        assert_eq!(
+            pipeline.run(&mut ctx).await,
+            PipelineOutcome::RejectionStored
+        );
+    }
+    for topic in [
+        "main-house/kitchen/room-1",
+        "zigbee/main-house/kitchen/room-1",
+    ] {
+        let mut ctx = PipelineContext::new_with_metadata(
+            topic,
+            serde_json::to_vec(&payload)?,
+            received_at_ms,
+            true,
+        );
 
-    assert_eq!(pipeline.run(&mut ctx).await, PipelineOutcome::OutputStored);
+        assert_eq!(pipeline.run(&mut ctx).await, PipelineOutcome::OutputStored);
 
-    assert!(!ctx.should_quarantine(), "{:?}", ctx.rejection_reason());
-    let event = common::recv_event(&mut sub, 500)
-        .await
-        .expect("arbitrary-topic configured route should persist to WAL");
-    assert!(
-        event
-            .payload
-            .starts_with("zigbee_room,device_id=room-1,source=zigbee "),
-        "{}",
-        event.payload
-    );
-    assert!(
-        event.payload.contains("dew_point_c=9.254294282076941"),
-        "{}",
-        event.payload
-    );
-    assert!(
-        event.payload.contains("mqtt_retained=true"),
-        "{}",
-        event.payload
-    );
-    assert!(
-        event.payload.ends_with(" 1700000000456"),
-        "{}",
-        event.payload
-    );
+        assert!(!ctx.should_quarantine(), "{:?}", ctx.rejection_reason());
+        let event = common::recv_event(&mut sub, 500)
+            .await
+            .expect("arbitrary-topic configured route should persist to WAL");
+        assert!(
+            event.payload.starts_with(
+                "zigbee_room,device_id=room-1,house=main-house,room=kitchen,source=zigbee "
+            ),
+            "{}",
+            event.payload
+        );
+        assert!(
+            event.payload.contains("dew_point_c=9.254294282076941"),
+            "{}",
+            event.payload
+        );
+        assert!(
+            event.payload.contains("mqtt_retained=true"),
+            "{}",
+            event.payload
+        );
+        assert!(
+            event.payload.ends_with(" 1700000000456"),
+            "{}",
+            event.payload
+        );
+    }
     assert!(
         cache.snapshot_all_devices().is_empty(),
         "cache-disabled route must not update state"
@@ -439,9 +465,9 @@ async fn alternate_route_config_changes_schema_mapping_calculation_and_output() 
         .await
         .context("alternate configured route should persist to WAL")?;
     assert!(
-        event
-            .payload
-            .starts_with("zigbee_room_alternate,device_id=room-1,source=zigbee "),
+        event.payload.starts_with(
+            "zigbee_room_alternate,device_id=room-1,house=main-house,room=undefined,source=zigbee "
+        ),
         "{}",
         event.payload
     );

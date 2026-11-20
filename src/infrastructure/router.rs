@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::calculations::CalculationRegistry;
-use crate::config::routes::{DeviceIdSource, FieldType, RouteBundle, RouteConfig};
+use crate::config::routes::{DeviceIdSource, FieldType, RouteBundle, RouteConfig, TagValue};
 use crate::infrastructure::schema::{load_schema_resources, CompiledSchema};
 use crate::model::topic::MqttTopicFilter;
 
@@ -88,6 +88,12 @@ impl RouteSet {
         crate::config::routes::validate_sink_target(default_target)
             .context("invalid INFLUX_BUCKET fallback")?;
         for route in &mut bundle.routes {
+            for key in ["house", "room"] {
+                route
+                    .tags
+                    .entry(key.to_owned())
+                    .or_insert_with(|| TagValue::Static("undefined".to_owned()));
+            }
             route
                 .sink_target
                 .get_or_insert_with(|| default_target.to_owned());
@@ -127,6 +133,16 @@ impl RouteSet {
                     "route '{}' device identity topic_segment must reference a fixed topic level",
                     route.id
                 );
+            }
+            for (key, value) in &route.tags {
+                if let TagValue::TopicSegment(segment) = value {
+                    if !filter.has_fixed_segment(segment.topic_segment) {
+                        bail!(
+                            "route '{}' tag '{key}' must reference a fixed topic level",
+                            route.id
+                        );
+                    }
+                }
             }
             if filter.matches(dlq_topic) {
                 bail!("route '{}' subscribes to the DLQ destination", route.id);
@@ -184,6 +200,9 @@ impl RouteSet {
                         CompiledSchema::compile_with_resources(&route.id, path, &schema_resources)
                     })
                     .transpose()?;
+                if let Some(schema) = &output_schema {
+                    schema.check_location_tag_keys()?;
+                }
                 // metrics-exporter-prometheus 0.18.1 treats backslash pairs as already escaped.
                 let metric_label = if route.id.contains('\\') {
                     Arc::from(route.id.replace('\\', "\\\\"))
@@ -531,6 +550,14 @@ mod configured_route_tests {
 
         let variable_suffix = bundle(vec![route("suffix", "example/#", &schema_path)])?;
         assert!(RouteSet::compile(variable_suffix, "dlq/topic", "test_bucket").is_err());
+
+        for topic in ["example/+/#", "example/+"] {
+            let mut configured = route("bad-tag", topic, &schema_path);
+            configured["tags"] = json!({"house": {"topic_segment": 2}});
+            assert!(
+                RouteSet::compile(bundle(vec![configured])?, "other/dlq", "test_bucket").is_err()
+            );
+        }
 
         let fixed_segment = bundle(vec![route("fixed", "example/+/status/#", &schema_path)])?;
         assert!(RouteSet::compile(fixed_segment, "other/dlq", "test_bucket").is_ok());
