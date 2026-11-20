@@ -102,6 +102,6 @@
     "timestamp": {
       "source": "received_at"
     },
-    "cache": false
+    "cache": true
   }
 }
